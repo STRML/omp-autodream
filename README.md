@@ -1,30 +1,46 @@
-# cc-autodream
+# omp-autodream
 
-Nightly memory consolidation for Claude Code. While you sleep it reads yesterday's
-session transcripts and leaves you one short report: the mistakes you keep making,
-where you lost time, and what's worth remembering.
+Nightly memory consolidation for the **OMP** harness (Oh My Pi). While you sleep it
+reads yesterday's session transcripts and leaves you one short report: the mistakes
+you keep making, where you lost time, and what's worth remembering.
+
+This is a port of
+[cc-autodream](https://github.com/STRML/cc-autodream) that runs the nightly pipeline
+on OMP: it reads OMP session transcripts with OMP's models and writes reports to
+OMP's own data directory. The interactive triage tool (`review.sh`) is inherited
+from cc-autodream and still runs on the Claude Code CLI — see
+[review.sh below](#interactive-triage-reviewsh).
 
 ## Why
 
-You have dozens of Claude Code sessions a week. The useful lessons — a wrong
-assumption you made twice, a flag that always trips you up, a fix worth pinning to
-memory — are buried in transcripts you'll never reread. Claude starts each session
-fresh and rediscovers the same friction.
+You have dozens of OMP sessions a week. The useful lessons — a wrong assumption you
+made twice, a flag that always trips you up, a fix worth pinning to memory — are
+buried in transcripts you'll never reread. OMP starts each session fresh and
+rediscovers the same friction.
 
-cc-autodream does the rereading for you. Every night it looks across **all** of
+omp-autodream does the rereading for you. Every night it looks across **all** of
 yesterday's sessions, ranks what recurs by frequency × severity (so you see the
 patterns, not the one-offs), and writes a dated digest you can skim in a minute. The
 highest-confidence, highest-severity findings get pinned into the relevant project's
 `MEMORY.md`, so the next session already knows.
 
-This is the cross-session view the built-in per-project auto-memory doesn't give you.
-Anthropic's built-in auto-dream is a memory *janitor* — it grooms your `MEMORY.md`.
-cc-autodream is a *signal extractor* — it reads full transcripts and tells you what
-happened. They compose: cc-autodream adds the 📌 pins, the janitor grooms around them.
+## What it uses
+
+- **Session source:** OMP's session store, `~/.omp/agent/sessions/<project>/<ts>_<uuid>.jsonl`.
+  OMP's transcripts carry the same substance Claude's do — user/assistant `message`
+  records, `custom` records for tool calls, `model_change` provenance — so the triage
+  reads full conversation + tool activity, not just prompts.
+- **Layer 1 (per-session triage):** `runinfra/deepseek-v4-flash` — cheap, fast.
+  Every L1 worker runs with the **advisor disabled** (`--config l1-no-advisor.yml`),
+  so a nightly fan-out doesn't boot the expensive advisor model on every session.
+- **Layer 2 (aggregation):** `anthropic/claude-opus-5` on the Anthropic subscription
+  (file-based `agent.db` OAuth — safe unattended at 3am; no keychain dependency).
+- **Changelog window:** still diffs the upstream `anthropics/claude-code` repo, since
+  OMP tracks Claude Code releases.
 
 ## What you get
 
-A report at `~/.claude/dreams/YYYY-MM-DD.md`. See
+A report at `~/.omp/agent/dreams/YYYY-MM-DD.md`. See
 [`example/2026-05-25.md`](example/2026-05-25.md) for a real one (60 sessions, seven
 ranked patterns, five open questions). The shape:
 
@@ -66,23 +82,19 @@ Three ways you actually interact with it:
 ## Install
 
 ```bash
-git clone https://github.com/STRML/cc-autodream ~/git/cc-autodream
-cd ~/git/cc-autodream
+git clone https://github.com/STRML/omp-autodream ~/git/omp-autodream
+cd ~/git/omp-autodream
 ./install.sh
 ```
 
-This symlinks `bin/*.sh` and `prompts/*.md` into `~/.claude/autodream/`, creates
-`~/.claude/dreams/`, and on macOS installs and bootstraps the nightly launchd
-schedule for you (auto-detecting your username, paths, and `claude`/`git` location —
-no plist editing). Because the scripts are symlinks, editing the repo copy takes
-effect immediately. Requires the `claude` CLI on PATH (override with `CLAUDE_BIN`).
+This symlinks `bin/*.sh` and `prompts/*.md` into `~/.omp/agent/autodream/`, creates
+`~/.omp/agent/dreams/`, and on macOS installs and bootstraps the nightly launchd
+schedule for you (auto-detecting your username, paths, and the `omp` binary — no
+plist editing). Because the scripts are symlinks, editing the repo copy takes effect
+immediately.
 
-Install also detects every Claude config dir on the machine — `~/.claude-nous`,
-`~/.claude-ds4`, `~/.claude-sigint`, and any other `~/.claude*/projects` bucket — and
-asks whether to index each one (on a non-interactive install it indexes them all and
-says so). The choices land in `~/.claude/autodream/root-choices.conf`, and the enabled
-set is written to `config` as `SESSION_ROOTS`. You can add or remove a folder later by
-editing that file and re-running `./install.sh`.
+Install writes the advisor-off overlay (`l1-no-advisor.yml`) into `AUTODREAM_DIR`; the
+nightly runners pass it as `--config` so no headless worker boots the advisor.
 
 The schedule fires `run.sh` at 03:15 with morning catch-up triggers (06:15/09:15/12:15)
 in case the Mac was asleep; the idempotency guard makes all but the first a one-second
@@ -105,25 +117,32 @@ rather install the job yourself.
 ## Running it by hand
 
 ```bash
-~/.claude/autodream/run.sh $(date -v-1d +%Y-%m-%d)       # process yesterday
-AUTODREAM_FORCE=1 ~/.claude/autodream/run.sh 2026-05-29  # rebuild a date
-~/.claude/autodream/review.sh                            # solve the latest report's questions
-~/.claude/autodream/review.sh 2026-05-29                 # triage a specific report
-~/.claude/autodream/review.sh --force 2026-05-29         # open it even if there's nothing to triage
+~/.omp/agent/autodream/run.sh $(date -v-1d +%Y-%m-%d)       # process yesterday
+AUTODREAM_FORCE=1 ~/.omp/agent/autodream/run.sh 2026-05-29  # rebuild a date
+~/.omp/agent/autodream/review.sh                            # solve the latest report's questions
+~/.omp/agent/autodream/review.sh 2026-05-29                 # triage a specific report
+~/.omp/agent/autodream/review.sh --force 2026-05-29         # open it even if there's nothing to triage
 ```
 
-`review.sh` exits without opening a session when the report has no open questions
-or already carries a `## Triage decisions` section, printing where the report is
-and the `--force` line to open it anyway. It reads the
-`<!-- autodream:open-questions=N -->` marker that `PROMPT.md` makes the nightly run
-emit; reports written before that marker existed fall back to a prose check, and
-anything ambiguous opens the session as before.
+> **$OMP_BIN** overrides the `omp` binary location (default `/opt/homebrew/bin/omp`).
+> The L1 runner model is `AUTODREAM_L1_MODEL` (default `runinfra/deepseek-v4-flash`);
+> the L2 aggregator model is `AUTODREAM_L2_MODEL` (default
+> `anthropic/claude-opus-5`). All knobs are documented in `bin/run.sh`'s header.
 
-By default `review.sh` runs the triage session inline in the current terminal —
-and if you launch it as a shell script, macOS hands it to whatever app is the
-default handler for shell scripts (often iTerm2). To make it open in its own
-cmux workspace instead, drop a config file at `~/.claude/autodream/config`
-(see `example/config.example`):
+## Interactive triage (review.sh)
+
+`review.sh` is inherited from cc-autodream and still shells out to the **Claude Code
+CLI** (`claude`, override with `CLAUDE_BIN`): it runs an interactive session to walk
+the report's open questions. The nightly pipeline (L1/L2) is fully on `omp`; only the
+interactive solver uses `claude`, so it needs the Claude CLI installed.
+
+`review.sh` exits without opening a session when the report has no open questions
+or already carries a `## Triage decisions` section, printing where the report is.
+It reads the `<!-- autodream:open-questions=N -->` marker that `PROMPT.md` makes the
+nightly run emit; anything ambiguous opens the session as before.
+
+To make it open in its own cmux workspace instead of the current terminal, drop a
+config at `~/.omp/agent/autodream/config` (see `example/config.example`):
 
 ```bash
 AUTODREAM_TRIAGE_SURFACE=cmux    # inline (default) | cmux
@@ -138,15 +157,15 @@ comes back as a count and a verdict, not a guess.
 From a terminal:
 
 ```bash
-~/.claude/autodream/autodream-note.sh "evaluate how often /graphify is used"
-~/.claude/autodream/autodream-note.sh --expires 2026-10-01 "check the codemaps hook overhead"
+~/.omp/agent/autodream/autodream-note.sh "evaluate how often /graphify is used"
+~/.omp/agent/autodream/autodream-note.sh --expires 2026-10-01 "check the codemaps hook overhead"
 ```
 
 From anywhere else, including your phone, point autodream at a folder in a synced
 vault and drop a markdown file in its inbox:
 
 ```bash
-# in ~/.claude/autodream/config — quote it, the iCloud path has spaces
+# in ~/.omp/agent/autodream/config — quote it, the iCloud path has spaces
 AUTODREAM_VAULT_DIR="$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documents/vault/autodream"
 ```
 
@@ -174,7 +193,7 @@ so this reads the same web endpoint your browser does, with your session cookies
 
 1. Open x.com in a browser, logged in. DevTools → Application → Cookies → `https://x.com`.
 2. Copy the values of `auth_token` and `ct0`.
-3. Put them in `~/.claude/autodream/x-credentials`:
+3. Put them in `~/.omp/agent/autodream/x-credentials`:
 
 ```bash
 X_AUTH_TOKEN=paste_auth_token_here
@@ -182,8 +201,8 @@ X_CT0=paste_ct0_here
 ```
 
 ```bash
-chmod 600 ~/.claude/autodream/x-credentials
-~/.claude/autodream/x-bookmarks.sh status   # check it took
+chmod 600 ~/.omp/agent/autodream/x-credentials
+~/.omp/agent/autodream/x-bookmarks.sh status   # check it took
 ```
 
 Bookmarks are marked read once a report has covered them, so each one gives you an
@@ -198,25 +217,27 @@ use `autodream-now.sh` — it hands the run to launchd, which has no time cap an
 going after you disconnect:
 
 ```bash
-~/.claude/autodream/autodream-now.sh                    # yesterday, right now
-~/.claude/autodream/autodream-now.sh 2026-05-29 --force # a specific date, rebuild
-~/.claude/autodream/autodream-now.sh 2026-05-29 --watch # follow the log until the report lands
+~/.omp/agent/autodream/autodream-now.sh                    # yesterday, right now
+~/.omp/agent/autodream/autodream-now.sh 2026-05-29 --force # a specific date, rebuild
+~/.omp/agent/autodream/autodream-now.sh 2026-05-29 --watch # follow the log until the report lands
 ```
 
 ## How it works (short version)
 
-Two layers: a cheap per-session pass (`haiku`) extracts structured findings from each
-transcript, then a single smarter pass (`opus`) ranks them across the whole day and
-writes the report. It also diffs the upstream Claude Code changelog over the day so
-the report can flag releases that change how you work.
+Two layers: a cheap per-session pass (Layer 1, `runinfra/deepseek-v4-flash`) extracts
+structured findings from each transcript, then a single smarter pass (Layer 2,
+`anthropic/claude-opus-5`) ranks them across the whole day and writes the report.
+Layer 1 workers invoke `omp -p` headless with the advisor disabled; Layer 2 invokes
+`omp -p` on the subscription model. It also diffs the upstream Claude Code changelog
+over the day so the report can flag releases that change how you work.
 
 Everything lives on disk (findings JSON, the report, run logs, stats) and every step
 is idempotent, so you can rerun any date. Configuration knobs are documented in
 `bin/run.sh`'s header.
 
 For the internals — data flow, file map, state layout, environment overrides, the
-lean-query pattern, and the "don't eat your own tail" self-pollution defenses — see
-**`codemaps/architecture.md`** and **`CLAUDE.md`**.
+headless-worker pattern, and the "don't eat your own tail" self-pollution defenses —
+see **`codemaps/architecture.md`** and **`CLAUDE.md`**.
 
 ## Caveats
 
@@ -224,8 +245,14 @@ lean-query pattern, and the "don't eat your own tail" self-pollution defenses �
   is portable; the scheduling and notify bits are mac-specific. The morning
   open-questions file opens with your default `.md` app; set `AUTODREAM_OPEN`
   (e.g. `subl`, `code -g`, `open -a Obsidian`) to pick a specific editor.
-- Runs in `bypassPermissions` mode (workers Write findings; the aggregator Edits
-  project `MEMORY.md`). Don't run it in a shared environment.
+- The nightly pipeline runs headless `omp -p` workers in `--approval-mode yolo` (Layer 1
+  workers write findings; the Layer 2 aggregator edits project `MEMORY.md`). Don't run
+  it in a shared environment.
+- **L1 auth:** the `runinfra` key normally lives in the macOS login keychain (via the
+  `!security` escape in `~/.omp/agent/models.yml`). At 3am a locked keychain could kill
+  the fan-out; `run.sh` sources `RUNINFRA_API_KEY` from
+  `~/.omp/agent/autodream/x-credentials` (chmod 600) when present, else falls back to
+  the keychain. Layer 2 needs no key (subscription OAuth via `agent.db`).
 - The first run clones `anthropics/claude-code` (small) for the changelog window; it
   degrades gracefully with no git/network.
 
