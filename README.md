@@ -1,6 +1,6 @@
 # omp-autodream
 
-Nightly memory consolidation for the **OMP** harness (Oh My Pi). While you sleep it
+Nightly session review for the **OMP** harness (Oh My Pi). While you sleep it
 reads yesterday's session transcripts and leaves you one short report: the mistakes
 you keep making, where you lost time, and what's worth remembering.
 
@@ -14,7 +14,7 @@ from cc-autodream and still runs on the Claude Code CLI — see
 ## Why
 
 You have dozens of OMP sessions a week. The useful lessons — a wrong assumption you
-made twice, a flag that always trips you up, a fix worth pinning to memory — are
+made twice, a flag that always trips you up, a fix worth keeping — are
 buried in transcripts you'll never reread. OMP starts each session fresh and
 rediscovers the same friction.
 

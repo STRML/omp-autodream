@@ -15,6 +15,13 @@
 #                            aggregator dying to a mid-run sleep). L1 is unaffected.
 #                            Pair with AUTODREAM_L2_ATTEMPTS=1 so the test doesn't
 #                            sit through the retry loop.
+#   MOCK_MODE=l2_partial_marker  L2 emits a COMPLETE-LOOKING report — it carries the
+#                            autodream:open-questions marker — but NO
+#                            AUTODREAM_REPORT_END sentinel, then exits 0. This is the
+#                            P1 bug shape: any completion test that trusts only the
+#                            marker would call this delivered. run.sh must treat the
+#                            missing sentinel as non-delivery (retry, move the
+#                            capture aside, never consume against it).
 #   MOCK_CAPTURE_DIR=<dir>   dump each layer's stdin + argv to <dir>/l{1,2}-*.txt
 #                            so tests can assert on the exact prompt framing.
 #   MOCK_CALL_LOG=<file>     append the L1 output path for every invocation of
@@ -65,6 +72,13 @@ else
   if [ "$mode" = "l2_partial" ]; then
     printf '# Autodream — mock\n\n## Top patterns\n\n1. truncated mid-w'
     echo "mock: partial stdout, no sentinel" >&2
+    exit 0
+  fi
+  # l2_partial_marker: an otherwise complete report (it carries the open-questions
+  # marker report_complete() checks) but no AUTODREAM_REPORT_END sentinel. Report
+  # marker alone must not count as delivery — the sentinel is the completion proof.
+  if [ "$mode" = "l2_partial_marker" ]; then
+    printf '# Autodream — mock\n\nmock aggregate report\n\n<!-- autodream:open-questions=0 -->\n'
     exit 0
   fi
   # The open-questions marker is part of the real contract (PROMPT.md mandates it) and

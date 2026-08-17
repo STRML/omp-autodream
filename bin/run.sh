@@ -1145,10 +1145,20 @@ PY
   fi
 
   L2_ATTEMPTS="${AUTODREAM_L2_ATTEMPTS:-3}"
+  # Delivery gate across attempts. L2_ATTEMPTED separates a fresh run that actually
+  # spawned the aggregator from the legacy short-circuits above (the idempotency guard
+  # and the COUNT=0 stub both return before L2); L2_DELIVERED flips to 1 only when an
+  # attempt's capture carried the AUTODREAM_REPORT_END sentinel. Both default to 0 so
+  # the move-aside and consume gate below can distinguish "this run confirmed delivery"
+  # from "this run never reached L2" — a pre-existing marker-bearing report from an
+  # earlier night must not be treated as this run's output on either path.
+  L2_ATTEMPTED=0
+  L2_DELIVERED=0
   L2_START=$(date +%s)
   L2_STDOUT="$FINDINGS_DIR/report.stdout"   # L2's report arrives on stdout, not via Write
   L2_RC=1
   for attempt in $(seq 1 "$L2_ATTEMPTS"); do
+    L2_ATTEMPTED=1
     log "L2 aggregation attempt $attempt/$L2_ATTEMPTS..."
     # Same literal-path framing and brace-group assembly as L1 (see the L1 worker
     # comment): keep the paths as literal data the aggregator reads with Glob/Read,
@@ -1176,19 +1186,38 @@ PY
 
     L2_RC=$?
     # ---- Runner writes the report from L2's stdout (L2 holds no Write/Edit tool) ----
-    # The report file exists because THIS script writes it, not the worker. Strip
-    # everything before the first line exactly equal to AUTODREAM_REPORT_END; a missing
-    # sentinel means L2 died mid-output, so keep the whole capture as a degraded report
-    # and let the marker check below decide whether to retry.
+    # The report file exists because THIS script writes it, not the worker. The
+    # AUTODREAM_REPORT_END sentinel is the real completion gate: everything before the
+    # LAST occurrence of it is the report body, and a capture without one is a degraded
+    # report whether or not it happens to carry the open-questions marker — the marker
+    # alone cannot prove the write reached the end (that is the P1 bug shape). Both
+    # writes are staged to a .tmp and renamed so a half-staged file never lands at
+    # $REPORT_PATH, and the post-sentinel lines (the report path + the aggregator's
+    # 3-line summary) are appended to the run log so a stripped capture never loses them.
+    L2_COMPLETE=0
     if grep -q '^AUTODREAM_REPORT_END$' "$L2_STDOUT" 2>/dev/null; then
-      awk '/^AUTODREAM_REPORT_END$/ { exit } { print }' "$L2_STDOUT" > "$REPORT_PATH"
+      if awk '/^AUTODREAM_REPORT_END$/ { last=NR } { line[NR]=$0 } END { for (i=1; i<last; i++) print line[i] }' "$L2_STDOUT" > "$REPORT_PATH.tmp" && mv "$REPORT_PATH.tmp" "$REPORT_PATH"; then
+        L2_COMPLETE=1
+      else
+        log "WARNING: could not stage the sentinel-stripped report at $REPORT_PATH"
+      fi
     elif [ -s "$L2_STDOUT" ]; then
-      log "WARNING: L2 stdout carried no AUTODREAM_REPORT_END sentinel; writing the whole captured output as a degraded report"
-      cat "$L2_STDOUT" > "$REPORT_PATH"
+      log "WARNING: L2 stdout carried no AUTODREAM_REPORT_END sentinel; keeping the whole capture as a degraded report (incomplete - will retry)"
+      cat "$L2_STDOUT" > "$REPORT_PATH.tmp" && mv "$REPORT_PATH.tmp" "$REPORT_PATH" 2>/dev/null || true
     fi
-    report_complete && break
+    awk '/^AUTODREAM_REPORT_END$/ { f=1; next } f { print }' "$L2_STDOUT" >> "$RUN_LOG" 2>/dev/null || true
+    L2_DELIVERED=$L2_COMPLETE
+    # Break only on a sentinel-validated capture that also carries the open-questions
+    # marker; a degraded capture (sentinel absent) NEVER satisfies the loop.
+    if [ "$L2_DELIVERED" = "1" ] && report_complete; then
+      break
+    fi
     if [ -s "$REPORT_PATH" ]; then
-      log "L2 attempt $attempt left a report with no open-questions marker — treating it as truncated and retrying (exit $L2_RC)"
+      if report_complete; then
+        log "L2 attempt $attempt wrote a complete-looking report but no AUTODREAM_REPORT_END sentinel — not a validated delivery, retrying (exit $L2_RC)"
+      else
+        log "L2 attempt $attempt left a report with no open-questions marker — treating it as truncated and retrying (exit $L2_RC)"
+      fi
     else
       log "L2 attempt $attempt wrote no report (exit $L2_RC)"
     fi
@@ -1213,8 +1242,12 @@ PY
   #
   # Move it aside rather than delete it: it may hold most of a report, and a partial
   # report is worth reading even though it must not block a retry. The stub written when
-  # COUNT=0 returns long before this line, so it is never affected.
-  if [ -f "$REPORT_PATH" ] && ! report_complete; then
+  # COUNT=0 returns long before this line, so it is never affected. Also gated on this
+  # run having actually ATTEMPTED L2 and not delivered a sentinel-validated report:
+  # legacy dates that short-circuited at the idempotency guard never reached L2, and
+  # their pre-existing (marker-bearing) report must sit untouched at $REPORT_PATH for
+  # the next catch-up trigger to keep working as before.
+  if [ -f "$REPORT_PATH" ] && [ "$L2_ATTEMPTED" = "1" ] && { [ "$L2_DELIVERED" != "1" ] || ! report_complete; }; then
     PARTIAL_REPORT="$REPORT_PATH.partial-$(date +%s)"
     if mv "$REPORT_PATH" "$PARTIAL_REPORT"; then
       log "WARNING: every L2 attempt left an incomplete report; moved it to $PARTIAL_REPORT so a later trigger retries this date"
@@ -1288,7 +1321,15 @@ PY
     # an override every consume path would take the skip branch and the tests that cover
     # archiving would pass while asserting nothing.
     NORMAL_TARGET_DATE="${AUTODREAM_CONSUME_DATE:-$(date -v-1d +%Y-%m-%d)}"
-    if ! report_complete; then
+    # Three-way gate. The first branch is the fresh-run delivery guard: a run that
+    # spawned L2 but never produced a sentinel-validated capture must not consume,
+    # even when the capture looks complete to report_complete (marker-only, no
+    # sentinel — the P1 shape). Legacy runs that never reached L2 (idempotency
+    # short-circuit, no-sessions stub) fall through this first branch untouched and
+    # keep their historical behavior.
+    if [ "$L2_ATTEMPTED" = "1" ] && [ "$L2_DELIVERED" != "1" ]; then
+      log "skipping vault-notes archive and x-bookmark mark-read: this run did not deliver a sentinel-validated report (still collected as L2 context)"
+    elif ! report_complete; then
       log "report is present but carries no open-questions marker; skipping vault-notes archive and x-bookmark mark-read rather than consuming input against a truncated report"
     else
       # Publishing is NOT a consuming step — it copies the report into the vault so it
@@ -1318,7 +1359,12 @@ PY
   fi
 
   log "===== autodream end: $(date) ====="
-  return $L2_RC
+  # A validated delivery is a success no matter what the last L2 attempt's exit code
+  # was; anything short of that reports the aggregator's own status.
+  if [ "$L2_DELIVERED" = "1" ]; then
+    return 0
+  fi
+  return "$L2_RC"
 }
 
 # ---- The logger must not be able to take the run down with it ----

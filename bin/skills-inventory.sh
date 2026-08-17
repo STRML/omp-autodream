@@ -44,8 +44,11 @@ fi
 #   - inline comments (`- skill # note` -> `skill`) and surrounding quotes are
 #     stripped from each item.
 # Config may be absent -> empty ignore set. python3 is the primary parser (present
-# on macOS); a strict awk implementation is the fallback; neither present is the
-# only case that degrades to "no ignores", and it logs that on stderr.
+# on macOS); a strict awk implementation is the fallback. A python3 FAILURE aborts
+# with exit 1 (run.sh's `||` then writes its unavailable sentinel) rather than
+# quietly reporting an empty ignore list — an empty list would wrongly claim every
+# on-disk skill is active, including ones the operator explicitly disabled. Only
+# "neither parser present" degrades to "no ignores", and it logs that on stderr.
 CLEAN_ITEM='sub(/[ \t]+#.*$/, "", item); gsub(/^[ \t]+|[ \t]+$/, "", item);
 if (length(item) >= 2 && substr(item,1,1) == "\"") { if (substr(item,length(item),1) == "\"") item = substr(item, 2, length(item) - 2) }
 else if (length(item) >= 2 && substr(item,1,1) == "\047") { if (substr(item,length(item),1) == "\047") item = substr(item, 2, length(item) - 2) }
@@ -54,7 +57,7 @@ ignored=""
 CONF="$HOME/.omp/agent/config.yml"
 if [ -r "$CONF" ]; then
   if command -v python3 >/dev/null 2>&1; then
-    ignored="$(IGNORED_SKILLS_CONF="$CONF" python3 - <<'PY' 2>/dev/null || true
+    ignored="$(IGNORED_SKILLS_CONF="$CONF" python3 - <<'PY' 2>/dev/null
 import os, re
 try:
     lines = open(os.environ.get("IGNORED_SKILLS_CONF", ""), "r", encoding="utf-8").read().splitlines()
@@ -86,7 +89,11 @@ for raw in lines:
     if item:
         print(item)
 PY
-)"
+    )"
+    if [ $? -ne 0 ]; then
+      echo "skills-inventory.sh: python3 parser failed for $CONF; cannot compute the ignored-skills list" >&2
+      exit 1
+    fi
   elif command -v awk >/dev/null 2>&1; then
     ignored="$(awk '
       BEGIN { in_block = 0; key_indent = -1 }
@@ -124,12 +131,19 @@ in_ignored() {                                       # $1=name ; exact membershi
 # Reads the YAML frontmatter of one SKILL.md (file head up to the closing `---`) into
 # FM_NAME / FM_DESC / FM_ENABLED.
 #   name:  single line, or a block scalar (`>`, `>-`, `|`, `|-`) whose value is the
-#          first following indented line; a name left empty resolves to the caller's
-#          directory-basename fallback.
+#          first following indented line; a name left empty (or a block scalar whose
+#          value never came and is followed by a column-0 key) resolves to the
+#          caller's directory-basename fallback.
 #   description: single line, or a folded block (`>`/`>-`): all following
 #          more-indented lines joined with single spaces.
 #   enabled: only a false-family value (false, False, 0, no) disables the skill.
+# Inline YAML comments (`value # note`) are stripped from name/description values the
+# same way the config parse strips them from ignore lists.
 # Parsing stops at the closing frontmatter delimiter.
+
+# Drop an inline YAML comment from a scalar: everything from the first ` #` onward.
+strip_comment() { printf '%s' "${1%% \#*}"; }
+
 read_frontmatter() {
   local f="$1" line lspace line_nw in_fm=0 desc_block=0 pending_name=0 rest rest_nw
   FM_NAME=""; FM_DESC=""; FM_ENABLED=1
@@ -149,15 +163,19 @@ read_frontmatter() {
     esac
 
     # A pending block-scalar name takes the first following indented (content) line.
+    # A column-0 non-blank line right after means the block value was empty (e.g.
+    # `name: >-` immediately followed by another key): leave the name empty so the
+    # caller falls back to the directory basename, and do NOT swallow the line — it is
+    # a real key and must be processed normally below.
     if [ "$pending_name" = 1 ]; then
       [ -n "$line_nw" ] || continue                 # blank: keep waiting
       if [ -z "$lspace" ]; then
-        pending_name=0                              # column-0 line: no folded value -> fallback
+        pending_name=0                              # empty block value -> dirname fallback; fall through to key processing
       else
-        FM_NAME="$line_nw"
+        FM_NAME="$(strip_comment "$line_nw")"
         pending_name=0
+        continue                                    # consumed a block value line
       fi
-      continue
     fi
 
     # A folded description joins every following more-indented line; a column-0 line
@@ -168,7 +186,7 @@ read_frontmatter() {
         *[![:space:]]*)
           if [ -n "$lspace" ]; then
             [ -n "$FM_DESC" ] && FM_DESC="$FM_DESC "
-            FM_DESC="$FM_DESC$line_nw"
+            FM_DESC="$FM_DESC$(strip_comment "$line_nw")"
             continue
           fi
           desc_block=0                              # column-0 line ends the fold
@@ -183,7 +201,7 @@ read_frontmatter() {
         case "$rest_nw" in
           ">"|">-"|"|"|"|-") pending_name=1 ;;
           *)
-            FM_NAME="${rest_nw%"${rest_nw##*[![:space:]]}"}"
+            FM_NAME="$(strip_comment "${rest_nw%"${rest_nw##*[![:space:]]}"}")"
             FM_NAME="${FM_NAME%\"}"; FM_NAME="${FM_NAME#\"}"
             FM_NAME="${FM_NAME%\'}"; FM_NAME="${FM_NAME#\'}"
             ;;
@@ -195,7 +213,7 @@ read_frontmatter() {
         case "$rest_nw" in
           ">"|">-"|"|"|"|-") FM_DESC=""; desc_block=1 ;;
           *)
-            FM_DESC="${rest_nw%"${rest_nw##*[![:space:]]}"}"
+            FM_DESC="$(strip_comment "${rest_nw%"${rest_nw##*[![:space:]]}"}")"
             FM_DESC="${FM_DESC%\"}"; FM_DESC="${FM_DESC#\"}"
             FM_DESC="${FM_DESC%\'}"; FM_DESC="${FM_DESC#\'}"
             ;;

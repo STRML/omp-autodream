@@ -95,11 +95,16 @@ run_dream(){ # $1=root ; inherits MOCK_MODE/MOCK_CAPTURE_DIR/FANOUT + changelog 
   # AUTODREAM_VAULT_DIR could reach the nightly run; without this pin a developer whose
   # config points at a real Obsidian vault would have the suite writing into it.
   # Individual tests override this by exporting AUTODREAM_CONFIG before calling.
+  # HOME is pinned into the sandbox too: run.sh's skills-inventory.sh derives its
+  # corpus from $HOME, so an unpinned HOME makes every integration run scan (and
+  # depend on) the REAL host's skill tree. A suite that passes or fails on whatever
+  # skills happen to be installed locally is not a suite.
+  mkdir -p "$1/home"
   AUTODREAM_CHANGELOG="${AUTODREAM_CHANGELOG:-0}" OMP_BIN="$MOCK" \
   AUTODREAM_CONFIG="${AUTODREAM_CONFIG:-$1/autodream/config}" \
   AUTODREAM_CONSUME_DATE="${AUTODREAM_CONSUME_DATE:-$DATE}" \
   AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS="${AUTODREAM_L1_ROUNDS:-2}" \
-  PROJECTS_DIR="$1/projects" AUTODREAM_DIR="$1/autodream" DREAMS_DIR="$1/dreams" \
+  PROJECTS_DIR="$1/projects" HOME="$1/home" AUTODREAM_DIR="$1/autodream" DREAMS_DIR="$1/dreams" \
   bash "$RUN" "$DATE" > "$1/run.out" 2>&1
   # An unattended run logs to its file rather than through a pipe, so that stdout carries
   # only a pointer now. Fold the real log in, so every assertion below still reads what a
@@ -109,11 +114,12 @@ run_dream(){ # $1=root ; inherits MOCK_MODE/MOCK_CAPTURE_DIR/FANOUT + changelog 
 # Same run, but piped into a reader that closes immediately, so any write run.sh makes to
 # stdout lands on a dead pipe. This is the shape of the real 2026-08-02 failure.
 run_dream_broken_pipe(){ # $1=root
+  mkdir -p "$1/home"
   AUTODREAM_CHANGELOG=0 OMP_BIN="$MOCK" \
   AUTODREAM_CONFIG="$1/autodream/config" \
   AUTODREAM_CONSUME_DATE="$DATE" \
   AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=2 \
-  PROJECTS_DIR="$1/projects" AUTODREAM_DIR="$1/autodream" DREAMS_DIR="$1/dreams" \
+  PROJECTS_DIR="$1/projects" HOME="$1/home" AUTODREAM_DIR="$1/autodream" DREAMS_DIR="$1/dreams" \
   bash "$RUN" "$DATE" 2>&1 | true
   cat "$1/autodream/logs/run-$DATE.log" > "$1/run.out" 2>/dev/null || true
 }
@@ -353,7 +359,11 @@ test_unmovable_stale_report_disarms_consuming(){
   chmod 755 "$root/dreams"
   assert_file "$root/vault/inbox/must-survive.md" "the note stayed in the inbox"
   assert_no_file "$root/vault/processed/$DATE/must-survive.md" "the note was not archived"
-  assert_grep "$root/run.out" "will NOT archive notes" "the run says why consuming was disarmed"
+  # The stale-move failure itself disarms consuming and says so (this string is logged
+  # at the move, before the consume gate), and the delivery gate independently skips on
+  # this run having delivered nothing.
+  assert_grep "$root/run.out" "will NOT archive notes" "the stale-move failure says consuming was disarmed"
+  assert_grep "$root/run.out" "did not deliver a sentinel-validated report" "the delivery gate names the reason too"
   rm -rf "$root"
 }
 
@@ -371,6 +381,30 @@ test_partial_report_does_not_consume(){
   assert_grep "$root/run.out" "no open-questions marker" "the run names the reason"
   # It must also have RETRIED rather than accepting the partial file on attempt 1.
   assert_grep "$root/run.out" "L2 aggregation attempt 2" "a truncated report triggers a retry"
+  rm -rf "$root"
+}
+
+test_l2_sentinel_gate(){
+  echo "# regression: a marker-bearing capture with no AUTODREAM_REPORT_END sentinel is not a delivery"
+  local root; root=$(setup_env); mk_session "$root" s1
+  mk_vault_note "$root" survives-p1 "a sentinel-less capture must not consume this"
+  # l2_partial_marker looks COMPLETE to report_complete (it carries the open-questions
+  # marker) but carries no AUTODREAM_REPORT_END sentinel. Marker alone must not break
+  # the retry loop, must not consume the user's input, and must land in .partial like
+  # any other non-delivery — this is the P1 shape the sentinel gate closes.
+  export MOCK_MODE=l2_partial_marker AUTODREAM_L2_ATTEMPTS=2
+  vault_run "$root"
+  unset MOCK_MODE AUTODREAM_L2_ATTEMPTS
+  assert_file "$root/vault/inbox/survives-p1.md" "the note stayed in the inbox"
+  assert_no_file "$root/vault/processed/$DATE/survives-p1.md" "the note was not archived"
+  # Retried rather than accepted on attempt 1, even though the capture had the marker.
+  assert_grep "$root/run.out" "L2 aggregation attempt 2" "a sentinel-less capture triggers a retry"
+  assert_grep "$root/run.out" "no AUTODREAM_REPORT_END sentinel" "the run names the missing sentinel"
+  # And the capture was not left as the day's permanent report.
+  assert_no_file "$root/dreams/$DATE.md" "the sentinel-less capture was moved off the report path"
+  ls "$root/dreams/$DATE.md.partial-"* >/dev/null 2>&1 \
+    && ok "it was preserved as .partial-<epoch>, not deleted" \
+    || no "the sentinel-less capture was lost"
   rm -rf "$root"
 }
 
@@ -1664,6 +1698,7 @@ test_notes_expiry_uses_report_date
 test_force_rebuild_failed_l2_does_not_consume
 test_unmovable_stale_report_disarms_consuming
 test_partial_report_does_not_consume
+test_l2_sentinel_gate
 test_partial_report_keeps_previous
 test_partial_report_does_not_block_retry
 test_complete_report_retires_partials
@@ -1814,6 +1849,7 @@ test_skills_inventory(){
   mkdir -p \
     "$SK/alpha" "$SK/betaquoted" "$SK/gamma" "$SK/delta" "$SK/off-skill" \
     "$SK/folded-desc" "$SK/block-name" "$SK/dirname-fallback" \
+    "$SK/commented-name" "$SK/block-no-value" \
     "$T/home/.claude/plugins/someplugin/skills/plgsku" \
     "$T/home/.claude-ds4/skills/shared-skill" \
     "$T/home/.agents/skills/shared-dup" \
@@ -1829,6 +1865,8 @@ test_skills_inventory(){
     '  Second line of the description' 'enabled: true' '---' > "$SK/folded-desc/SKILL.md"
   printf '%s\n' '---' 'name: >-' '  Blocky Named Skill' 'description: scalar name' '---' > "$SK/block-name/SKILL.md"
   printf '%s\n' '---' 'description: no name line, use the dir basename' '---' > "$SK/dirname-fallback/SKILL.md"
+  printf '%s\n' '---' 'name: triage # local alias' 'description: frontmatter comments stripped # inline' '---' > "$SK/commented-name/SKILL.md"
+  printf '%s\n' '---' 'name: >-' 'description: survives the name swallow' '---' > "$SK/block-no-value/SKILL.md"
   printf '%s\n' '---' 'name: plgsku' 'description: nested plugin skill' '---' \
     > "$T/home/.claude/plugins/someplugin/skills/plgsku/SKILL.md"
   printf '%s\n' '---' 'name: shared-skill' 'description: from the ds4 bucket' '---' \
@@ -1859,6 +1897,8 @@ test_skills_inventory(){
     "folded description is joined with single spaces"
   assert_grep   "$T/out.txt" '^Blocky Named Skill\t' "block-scalar name resolves to its value line"
   assert_grep   "$T/out.txt" '^dirname-fallback\t' "a name-less SKILL.md falls back to the dir basename"
+  assert_grep   "$T/out.txt" '^triage\tfrontmatter comments stripped$' "inline comments are stripped from name and description"
+  assert_grep   "$T/out.txt" '^block-no-value\tsurvives the name swallow$' "an empty block-scalar name falls back to dirname and does not swallow the next key"
   assert_grep   "$T/out.txt" '^plgsku\t' "plugin skill found under plugins/"
   assert_grep   "$T/out.txt" '^oc-skill\t' "opencode root skill listed"
   assert_grep   "$T/out.txt" '^mang\t' "OMP managed-root skill listed"
@@ -1868,8 +1908,32 @@ test_skills_inventory(){
   rm -rf "$T"
 }
 
+test_skills_inventory_python_failure_exits_1(){
+  echo "# skills-inventory.sh: a crashing python3 parser aborts with exit 1, not an empty ignore list"
+  local T; T=$(mktemp -d "${TMPDIR:-/tmp}/ccad.XXXXXX")
+  mkdir -p "$T/home/.omp/agent" "$T/bin" "$T/home/.claude/skills/real-skill"
+  printf '%s\n' 'skills:' '  ignoredSkills:' '    - crit-skill' > "$T/home/.omp/agent/config.yml"
+  printf '%s\n' '---' 'name: real-skill' 'description: on disk' '---' > "$T/home/.claude/skills/real-skill/SKILL.md"
+  # A failing python3 must abort: an empty ignore list would wrongly report every
+  # on-disk skill active, including ones the operator disabled.
+  printf '#!/bin/bash\nexit 1\n' > "$T/bin/python3"
+  chmod +x "$T/bin/python3"
+  local out rc
+  out=$(HOME="$T/home" PATH="$T/bin:$PATH" "$REPO/bin/skills-inventory.sh" "$T/out.txt" 2>&1)
+  rc=$?
+  assert_eq "$rc" "1" "a failing python3 parser exits 1 (got $rc)"
+  assert_no_file "$T/out.txt" "no inventory is emitted on a parser failure"
+  assert_grep <(printf '%s' "$out") "python3 parser failed" "the failure is named on stderr"
+  # Same home, real python3 restored: the inventory works again.
+  HOME="$T/home" "$REPO/bin/skills-inventory.sh" "$T/out.txt" 2>/dev/null \
+    && assert_grep "$T/out.txt" '^real-skill\t' "the skill is reported when python3 works" \
+    || no "working python3 did not emit the inventory"
+  rm -rf "$T"
+}
+
 # ---- run the new tests ----
 test_skills_inventory
+test_skills_inventory_python_failure_exits_1
 test_omp_singleroot_autodetect
 test_omp_singleroot_empty_store_no_abort
 test_rootprobe_remembers_choice
