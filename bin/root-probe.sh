@@ -1,24 +1,23 @@
 #!/bin/bash
-# Detect the user's Claude config dirs and decide which ones autodream indexes.
+# Detect the user's session roots and decide which ones autodream indexes.
 #
-# Claude Code supports many config dirs at once: each profile that runs under a
-# different $CLAUDE_CONFIG_DIR (~/.claude-nous, ~/.claude-ds4, ~/.claude-sigint, ...)
-# gets its own projects/ bucket holding that profile's session transcripts. autodream
-# used to scan exactly one ($HOME/.claude/projects), so any session recorded in a
-# different profile's bucket was invisible to the nightly report. This script closes
-# that gap: it lists every $HOME/.claude*/projects it can find, applies the choices the
-# user has already recorded, and reports the rest.
+# The OMP harness keeps ONE config dir (~/.omp/agent) and ONE session store:
+# $HOME/.omp/agent/sessions — one JSONL per session, grouped into project-encoded
+# subdirs. cc-autodream used to scan a single Claude profile's bucket
+# ($HOME/.claude/projects), then every $HOME/.claude*/projects: the multiple
+# CLAUDE_CONFIG_DIR profile story that motivated this multi-root machinery. OMP
+# collapses that to a single root, so this script keeps the whole index/ignore
+# machinery structurally intact — there is just the primary root now, and everything
+# degrades gracefully.
 #
 # Choices are remembered in $AUTODREAM_DIR/root-choices.conf, a plain KEY=VALUE file
 # with `# claude-folder-indexing` as a header comment so a human can tell the managed
 # lines from their own edits:
 #
 #   # claude-folder-indexing  (managed by bin/root-probe.sh)
-#   ~/.claude/projects=index      # always indexed
-#   ~/.claude-ds4/projects=index
-#   ~/.claude-kimi/projects=ignore
+#   $HOME/.omp/agent/sessions=index      # always indexed
 #
-# Values: index | ignore. The primary $HOME/.claude/projects is always index and is
+# Values: index | ignore. The primary $HOME/.omp/agent/sessions is always index and is
 # always scanned. Editing or deleting a line in this file is how a choice is changed.
 # AUTODREAM_INDEX_ALL=1 flips everything to index without asking.
 #
@@ -31,7 +30,7 @@
 #   root-probe.sh --default-index   # never prompt; unasked roots -> index (install non-TTY)
 #
 # Env:
-#   AUTODREAM_DIR    where root-choices.conf lives   default: $HOME/.claude/autodream
+#   AUTODREAM_DIR    where root-choices.conf lives   default: $HOME/.omp/agent/autodream
 #   AUTODREAM_INDEX_ALL  set 1 to index every detected root without asking
 #
 # With neither --ask nor --default-index (the nightly run), choices are never written:
@@ -42,12 +41,14 @@
 
 set -u
 
-AUTODREAM_DIR="${AUTODREAM_DIR:-$HOME/.claude/autodream}"
+AUTODREAM_DIR="${AUTODREAM_DIR:-$HOME/.omp/agent/autodream}"
 CHOICES="$AUTODREAM_DIR/root-choices.conf"
 
-PRIMARY="$HOME/.claude/projects"
-# shellcheck disable=SC2125  # the glob must stay literal so it expands in the `for` loop below
-PROBE_GLOB="$HOME"/.claude*/projects
+PRIMARY="$HOME/.omp/agent/sessions"
+# A single literal root (OMP has one session store). Kept as a glob-shaped variable
+# so the discovery loop below stays structurally identical to the multi-root Claude
+# era and degrades gracefully.
+PROBE_GLOB="$HOME/.omp/agent/sessions"
 
 MODE=""
 WRITE=0
@@ -56,7 +57,7 @@ for a in "$@"; do
   case "$a" in
     --list|--consolidated|--unindexed|--write-config) MODE="${MODE:-$a}" ;;
     --ask|--default-index) MODE="${MODE:-$a}" ;;
-    -h|--help) sed -n '1,44p' "$0"; exit 0 ;;
+    -h|--help) sed -n '1,40p' "$0"; exit 0 ;;
     -*) echo "unknown flag: $a" >&2; exit 2 ;;
   esac
 done
@@ -100,8 +101,8 @@ if [ -d "$PRIMARY" ]; then
   roots=("${sorted[@]}")
 fi
 
-# With no $HOME/.claude*/projects at all, `"${roots[@]}"` is an unbound-array reference
-# under set -u. Keep a sentinel so every expansion below is safe.
+# With no $HOME/.omp/agent/sessions at all, `"${roots[@]}"` is an unbound-array
+# reference under set -u. Keep a sentinel so every expansion below is safe.
 [ "${#roots[@]}" -gt 0 ] || roots=("")
 
 unasked=()

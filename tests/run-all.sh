@@ -14,6 +14,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/.." && pwd)
 RUN="$REPO/bin/run.sh"
 MOCK="$HERE/mock-claude.sh"
+OMP_MOCK="$HERE/mock-omp.sh"
 DATE=2020-01-02          # fixed target date; sessions are touched into this day
 STAMP=202001021200       # touch -t form of DATE at noon
 
@@ -39,33 +40,39 @@ mk_session(){ # $1=root $2=name
   # Two real user turns (no timestamps -> duration_minutes 0, uncomputable and
   # so exempt from the duration gate rule) so this fixture clears the noise
   # gate's default AUTODREAM_MIN_USER_TURNS=2 floor and every existing test
-  # that expects real L1 triage keeps getting it.
+  # that expects real L1 triage keeps getting it. OMP transcript shape
+  # (PORT_CONTRACT.md): message records + custom tool_execution_start.
   local f="$1/projects/proj-a/$2.jsonl"
   printf '%s\n' \
-    '{"type":"user","cwd":"/tmp/proj-a","message":{"content":"start the task"}}' \
-    '{"type":"user","message":{"content":"keep going"}}' \
-    '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read"}]}}' \
+    '{"type":"message","message":{"role":"user","content":[{"type":"text","text":"start the task"}]}}' \
+    '{"type":"message","message":{"role":"user","content":[{"type":"text","text":"keep going"}]}}' \
+    '{"type":"custom","customType":"tool_execution_start","data":{"toolName":"Read","intent":"read"}}' \
     > "$f"
   touch -t "$STAMP" "$f"
 }
 mk_trivial_session(){ # $1=root $2=name — single user turn, no tool calls: below the noise gate
   local f="$1/projects/proj-a/$2.jsonl"
-  printf '{"type":"user","message":{"content":"quick question"}}\n' > "$f"
+  printf '{"type":"message","message":{"role":"user","content":[{"type":"text","text":"quick question"}]}}\n' > "$f"
   touch -t "$STAMP" "$f"
 }
 mk_short_duration_session(){ # $1=root $2=name — 2 user turns, 5s apart: gates on duration alone
   local f="$1/projects/proj-a/$2.jsonl"
   printf '%s\n' \
-    '{"type":"user","timestamp":"2026-07-20T10:00:00Z","message":{"content":"quick check"}}' \
-    '{"type":"user","timestamp":"2026-07-20T10:00:05Z","message":{"content":"thanks bye"}}' \
+    '{"type":"message","timestamp":"2026-07-20T10:00:00Z","message":{"role":"user","content":[{"type":"text","text":"quick check"}]}}' \
+    '{"type":"message","timestamp":"2026-07-20T10:00:05Z","message":{"role":"user","content":[{"type":"text","text":"thanks bye"}]}}' \
     > "$f"
   touch -t "$STAMP" "$f"
 }
 mk_subagent_session(){ # $1=root $2=name — isSidechain + >=5 tool calls: carve-out, never gated
   local f="$1/projects/proj-a/$2.jsonl"
   printf '%s\n' \
-    '{"type":"user","isSidechain":true,"timestamp":"2026-07-20T10:00:00Z","message":{"content":"subagent task"}}' \
-    '{"type":"assistant","isSidechain":true,"timestamp":"2026-07-20T10:00:05Z","message":{"content":[{"type":"tool_use","name":"Read"},{"type":"tool_use","name":"Write"},{"type":"tool_use","name":"Bash"},{"type":"tool_use","name":"Grep"},{"type":"tool_use","name":"Edit"}]}}' \
+    '{"type":"message","timestamp":"2026-07-20T10:00:00Z","message":{"role":"user","content":[{"type":"text","text":"subagent task"}]}}' \
+    '{"type":"custom","customType":"agent","data":{},"timestamp":"2026-07-20T10:00:01Z"}' \
+    '{"type":"custom","customType":"tool_execution_start","data":{"toolName":"Read"},"timestamp":"2026-07-20T10:00:02Z"}' \
+    '{"type":"custom","customType":"tool_execution_start","data":{"toolName":"Write"},"timestamp":"2026-07-20T10:00:03Z"}' \
+    '{"type":"custom","customType":"tool_execution_start","data":{"toolName":"Bash"},"timestamp":"2026-07-20T10:00:04Z"}' \
+    '{"type":"custom","customType":"tool_execution_start","data":{"toolName":"Grep"},"timestamp":"2026-07-20T10:00:05Z"}' \
+    '{"type":"custom","customType":"tool_execution_start","data":{"toolName":"Edit"},"timestamp":"2026-07-20T10:00:06Z"}' \
     > "$f"
   touch -t "$STAMP" "$f"
 }
@@ -74,7 +81,7 @@ mk_timed_session(){ # $1=root $2=name $3.. = ISO8601 timestamps, one user turn e
   local f="$root/projects/proj-a/$name.jsonl" ts
   : > "$f"
   for ts in "$@"; do
-    printf '{"type":"user","timestamp":"%s","message":{"content":"turn"}}\n' "$ts" >> "$f"
+    printf '{"type":"message","timestamp":"%s","message":{"role":"user","content":[{"type":"text","text":"turn"}]}}\n' "$ts" >> "$f"
   done
   touch -t "$STAMP" "$f"
 }
@@ -88,7 +95,7 @@ run_dream(){ # $1=root ; inherits MOCK_MODE/MOCK_CAPTURE_DIR/FANOUT + changelog 
   # AUTODREAM_VAULT_DIR could reach the nightly run; without this pin a developer whose
   # config points at a real Obsidian vault would have the suite writing into it.
   # Individual tests override this by exporting AUTODREAM_CONFIG before calling.
-  AUTODREAM_GC=0 AUTODREAM_CHANGELOG="${AUTODREAM_CHANGELOG:-0}" CLAUDE_BIN="$MOCK" \
+  AUTODREAM_GC=0 AUTODREAM_CHANGELOG="${AUTODREAM_CHANGELOG:-0}" OMP_BIN="$MOCK" \
   AUTODREAM_CONFIG="${AUTODREAM_CONFIG:-$1/autodream/config}" \
   AUTODREAM_CONSUME_DATE="${AUTODREAM_CONSUME_DATE:-$DATE}" \
   AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS="${AUTODREAM_L1_ROUNDS:-2}" \
@@ -102,7 +109,7 @@ run_dream(){ # $1=root ; inherits MOCK_MODE/MOCK_CAPTURE_DIR/FANOUT + changelog 
 # Same run, but piped into a reader that closes immediately, so any write run.sh makes to
 # stdout lands on a dead pipe. This is the shape of the real 2026-08-02 failure.
 run_dream_broken_pipe(){ # $1=root
-  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 OMP_BIN="$MOCK" \
   AUTODREAM_CONFIG="$1/autodream/config" \
   AUTODREAM_CONSUME_DATE="$DATE" \
   AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=2 \
@@ -506,49 +513,37 @@ test_session_stats(){
   local root; root=$(mktemp -d "${TMPDIR:-/tmp}/ccad.XXXXXX")
   local fixture out
 
+  # Fixtures are emitted by tests/mock-omp.sh in OMP transcript shape (message
+  # records + custom tool_execution_start), the format bin/session-stats.sh now
+  # parses. MOCK guards the emitter so it never writes outside a test run.
+
   fixture="$root/carriers.jsonl"; out="$root/carriers.stats.json"
-  printf '%s\n' \
-    '{"type":"user","message":{"role":"user","content":"human question"}}' \
-    '{"type":"assistant","message":{"model":"claude-haiku","content":[{"type":"tool_use","name":"Read"}]}}' \
-    '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"a","content":"result"}]}}' \
-    'not json' \
-    '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"b","content":"result"}]}}' > "$fixture"
+  MOCK=1 "$OMP_MOCK" "$fixture" carriers
   "$REPO/bin/session-stats.sh" "$fixture" "$out"
   assert_eq "$(jq -r 'keys | sort | join(",")' "$out")" \
     "duration_minutes,isSidechain,models_used,tool_call_count,tools_used,transcript_bytes,transcript_mtime,turn_count,user_message_count,user_turn_timestamps" \
     "stats output has exactly the specified fields"
   assert_eq "$(jq -r '.user_turn_timestamps | length' "$out")" "0" "no timestamped user turns in this fixture -> empty user_turn_timestamps"
-  assert_eq "$(jq -r .user_message_count "$out")" "1" "tool_result carriers are excluded from user message count"
-  assert_eq "$(jq -r .turn_count "$out")" "4" "turn count includes tool_result carriers"
+  assert_eq "$(jq -r .user_message_count "$out")" "1" "toolResult records are excluded from user message count"
+  assert_eq "$(jq -r .turn_count "$out")" "2" "turn count excludes toolResult records (OMP has no tool-in-user-message carriers)"
 
   fixture="$root/timestamps.jsonl"; out="$root/timestamps.stats.json"
-  printf '%s\n' \
-    '{"type":"user","timestamp":"2026-07-20T10:00:00.500Z","message":{"content":"start"}}' \
-    '{"type":"system","message":{"content":"no timestamp needed"}}' \
-    '{"type":"assistant","message":{"model":"claude-opus","content":"middle"}}' \
-    '{"type":"progress","timestamp":"2026-07-20T10:01:00.250Z"}' \
-    '{"type":"assistant","timestamp":"2026-07-20T10:02:30.750Z","message":{"model":"<synthetic>","content":"end"}}' > "$fixture"
+  MOCK=1 "$OMP_MOCK" "$fixture" timestamps
   "$REPO/bin/session-stats.sh" "$fixture" "$out"
   assert_eq "$(jq -r .duration_minutes "$out")" "2.5" "duration uses available fractional timestamps"
   assert_eq "$(jq -r .models_used[0] "$out")" "claude-opus" "synthetic model is dropped"
   assert_eq "$(jq -r '.user_turn_timestamps | join(",")' "$out")" "1784541600" "user_turn_timestamps holds only the (fractional-second-truncated) real user turn's epoch"
 
   fixture="$root/text-image.jsonl"; out="$root/text-image.stats.json"
-  printf '%s\n' \
-    '{"type":"user","message":{"content":[{"type":"text","text":"caption"},{"type":"image","source":{"type":"base64","data":"abc"}}]}}' > "$fixture"
+  MOCK=1 "$OMP_MOCK" "$fixture" text-image
   "$REPO/bin/session-stats.sh" "$fixture" "$out"
   assert_eq "$(jq -r .user_message_count "$out")" "1" "text plus image human turn counts"
 
   fixture="$root/sidechain.jsonl"; out="$root/sidechain.stats.json"
-  printf '%s\n' \
-    '{"type":"user","isSidechain":true,"message":{"content":"subagent task"}}' \
-    '{"type":"assistant","isSidechain":true,"message":{"model":"claude-haiku","content":[{"type":"tool_use","name":"Write"},{"type":"tool_use","name":"Bash"},{"type":"tool_use","name":"Read"}]}}' \
-    '{"type":"user","isSidechain":true,"message":{"content":[{"type":"tool_result","content":"one"}]}}' \
-    '{"type":"user","isSidechain":true,"message":{"content":[{"type":"tool_result","content":"two"}]}}' \
-    '{"type":"user","isSidechain":true,"message":{"content":[{"type":"tool_result","content":"three"}]}}' > "$fixture"
+  MOCK=1 "$OMP_MOCK" "$fixture" sidechain
   "$REPO/bin/session-stats.sh" "$fixture" "$out"
   assert_eq "$(jq -r .user_message_count "$out")" "1" "sidechain has one human message"
-  assert_eq "$(jq -r .turn_count "$out")" "5" "sidechain turn count includes carriers"
+  assert_eq "$(jq -r .turn_count "$out")" "5" "sidechain turn count counts user/assistant message records"
   assert_eq "$(jq -r .tool_call_count "$out")" "3" "sidechain tool calls are counted mechanically"
   assert_eq "$(jq -r '.tools_used | join(",")' "$out")" "Bash,Read,Write" "sidechain tools are sorted and unique"
   assert_eq "$(jq -r .isSidechain "$out")" "true" "sidechain marker is copied"
@@ -1087,7 +1082,7 @@ test_runner_provenance_no_git(){
   # history at all — the tarball-install case, which must still produce a report.
   local bin="$root/bin"; mkdir -p "$bin"
   cp "$REPO"/bin/*.sh "$bin/"
-  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 OMP_BIN="$MOCK" \
   AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=2 \
   PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
   bash "$bin/run.sh" "$DATE" > "$root/run.out" 2>&1
@@ -1107,7 +1102,7 @@ test_runner_provenance_through_symlink(){
   # .git, and provenance has to follow the file's own link to find the working tree.
   # Six production runs through 2026-08-03 stamped "unknown" against a clean checkout.
   local f; for f in "$REPO"/bin/*.sh; do ln -sf "$f" "$root/autodream/$(basename "$f")"; done
-  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 OMP_BIN="$MOCK" \
   AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
   AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=2 \
   PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
@@ -1135,7 +1130,7 @@ test_runner_provenance_relative_symlink(){
   phys_bin=$(cd "$REPO/bin" && pwd -P)
   rel=$(python3 -c 'import os,sys;print(os.path.relpath(sys.argv[1],sys.argv[2]))' "$phys_bin" "$phys_ad")
   local f; for f in "$REPO"/bin/*.sh; do ln -sf "$rel/$(basename "$f")" "$root/autodream/$(basename "$f")"; done
-  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 OMP_BIN="$MOCK" \
   AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
   AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=2 \
   PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
@@ -1161,7 +1156,7 @@ test_runner_provenance_unresolvable_chain(){
     prev="$root/autodream/hop-$i.sh"
   done
   ln -sf "$prev" "$root/autodream/run.sh"
-  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 OMP_BIN="$MOCK" \
   AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
   AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=2 \
   PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
@@ -1482,7 +1477,7 @@ test_runner_dirty_ignores_untracked(){
   git -C "$repo" add -A 2>/dev/null
   git -C "$repo" -c user.email=t@t -c user.name=t commit -qm init 2>/dev/null
   printf 'scratch\n' > "$repo/untracked-scratch.txt"
-  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 OMP_BIN="$MOCK" \
   AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=2 \
   PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
   bash "$repo/bin/run.sh" "$DATE" > "$root/run.out" 2>&1
@@ -1492,7 +1487,7 @@ test_runner_dirty_ignores_untracked(){
   # A tracked modification still does.
   printf '\n# tracked edit\n' >> "$repo/bin/session-stats.sh"
   rm -rf "$(fdir "$root")" "$root/dreams/$DATE.md"
-  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 OMP_BIN="$MOCK" \
   AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=2 \
   PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
   bash "$repo/bin/run.sh" "$DATE" > "$root/run2.out" 2>&1
@@ -1685,7 +1680,7 @@ test_config_unbound_var_does_not_kill_run
 # and overriding HOME into the sandbox so root-probe discovers the sandbox's claude dirs
 # rather than the host's.
 run_dream_autodetect(){ # $1=root — like run_dream but with HOME inside the sandbox, no PROJECTS_DIR
-  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 OMP_BIN="$MOCK" \
   AUTODREAM_CONFIG="$1/autodream/config" \
   AUTODREAM_CONSUME_DATE="$DATE" \
   AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=2 \
@@ -1693,21 +1688,20 @@ run_dream_autodetect(){ # $1=root — like run_dream but with HOME inside the sa
   bash "$RUN" "$DATE" > "$1/run.out" 2>&1
   cat "$1/autodream/logs/run-$DATE.log" >> "$1/run.out" 2>/dev/null || true
 }
-setup_env_altroot(){ # like setup_env, but with HOME inside the sandbox (no $1/projects); echoes the root
+setup_env_altroot(){ # like setup_env, but with HOME inside the sandbox; uses OMP session store path
   local root; root=$(mktemp -d "${TMPDIR:-/tmp}/ccad.XXXXXX")
-  mkdir -p "$root/home/.claude/projects/proj-a" \
-           "$root/home/.claude-ds4/projects/proj-a" \
+  mkdir -p "$root/home/.omp/agent/sessions/proj-a" \
            "$root/autodream" "$root/dreams" "$root/cap"
   cp "$REPO/prompts/SESSION_TRIAGE.md" "$root/autodream/SESSION_TRIAGE.md"
   cp "$REPO/prompts/PROMPT.md"         "$root/autodream/PROMPT.md"
   printf '%s' "$root"
 }
-mk_session_in(){ # $1=dir $2=name
+mk_session_in(){ # $1=dir $2=name — OMP transcript shape
   local f="$1/$2.jsonl"
   printf '%s\n' \
-    '{"type":"user","cwd":"/tmp/proj-a","message":{"content":"start the task"}}' \
-    '{"type":"user","message":{"content":"keep going"}}' \
-    '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read"}]}}' \
+    '{"type":"message","message":{"role":"user","content":[{"type":"text","text":"start the task"}]}}' \
+    '{"type":"message","message":{"role":"user","content":[{"type":"text","text":"keep going"}]}}' \
+    '{"type":"custom","customType":"tool_execution_start","data":{"toolName":"Read","intent":"read"}}' \
     > "$f"
   touch -t "$STAMP" "$f"
 }
@@ -1718,69 +1712,34 @@ decide_index(){ # $1=root-dir — writes $AUTODREAM_DIR/root-choices.conf
   printf '%s=index\n' "$2" >> "$1/autodream/root-choices.conf"
 }
 
-test_multiroot_triages_alt_root(){
-  echo "# multi-root: sessions in a second (decided) claude dir get triaged too"
+# ---- OMP single-root autodetect: HOME inside the sandbox, no PROJECTS_DIR ----
+# The OMP port collapsed Claude's multi-profile dirs (~/.claude-ds4/projects,
+# ~/.claude-sigint/projects) into ONE session store: $HOME/.omp/agent/sessions.
+# These tests assert the ported reality: root-probe autodetects that single root
+# under a sandboxed HOME, run.sh triages sessions found there, and no stale
+# Claude-profile dirs are flagged. Multi-root discovery was removed by design.
+test_omp_singleroot_autodetect(){
+  echo "# single-root: OMP session store under sandbox HOME is autodetected and triaged"
   local root; root=$(setup_env_altroot)
-  decide_index "$root" "$root/home/.claude-ds4/projects"
-  mk_session_in "$root/home/.claude/projects/proj-a" s1
-  mk_session_in "$root/home/.claude-ds4/projects/proj-a" s2
+  mk_session_in "$root/home/.omp/agent/sessions/proj-a" s1
   run_dream_autodetect "$root"
   local fdir="$root/autodream/findings/$DATE"
-  assert_grep "$root/run.out" "session roots:" "probe_roots logged the resolved roots"
-  assert_file "$fdir/$(printf '%s' "$root/home/.claude/projects/proj-a/s1.jsonl" | shasum | cut -c1-12).json" "primary-root session has a findings JSON"
-  assert_file "$fdir/$(printf '%s' "$root/home/.claude-ds4/projects/proj-a/s2.jsonl" | shasum | cut -c1-12).json" "decided alt-root session has a findings JSON"
-  assert_grep "$root/autodream/findings/$DATE/sessions.txt.raw" "$root/home/.claude/projects/proj-a/s1.jsonl" "primary session enumerated"
-  assert_grep "$root/autodream/findings/$DATE/sessions.txt.raw" "$root/home/.claude-ds4/projects/proj-a/s2.jsonl" "decided alt session enumerated"
-  assert_grep "$root/autodream/findings/$DATE/run-stats.txt" "session_roots: 2" "run-stats reports 2 roots scanned"
-  # A decided-index root is not flagged.
-  assert_nogrep "$root/autodream/findings/$DATE/unindexed-roots.txt" "$root/home/.claude-ds4/projects" "a decided-index root is not flagged"
+  assert_grep "$root/run.out" "session roots: $root/home/.omp/agent/sessions" "probe_roots resolved the OMP session store"
+  assert_file "$fdir/$(printf '%s' "$root/home/.omp/agent/sessions/proj-a/s1.jsonl" | shasum | cut -c1-12).json" "session in the OMP store has a findings JSON"
+  assert_grep "$fdir/sessions.txt.raw" "$root/home/.omp/agent/sessions/proj-a/s1.jsonl" "OMP store session enumerated"
+  assert_grep "$fdir/run-stats.txt" "session_roots: 1" "run-stats reports the single OMP root"
+  # The primary root is never flagged as unindexed.
+  assert_nogrep "$fdir/unindexed-roots.txt" "$root/home/.omp/agent/sessions" "the OMP root is never flagged"
   rm -rf "$root"
 }
 
-test_multiroot_heldout_and_dedup(){
-  echo "# multi-root: undecided dirs are held out (flagged, not triaged); a file reachable via symlink from two roots is triaged once"
+test_omp_singleroot_empty_store_no_abort(){
+  echo "# single-root: an absent OMP session store does not abort (autodetect falls back cleanly)"
   local root; root=$(setup_env_altroot)
-  decide_index "$root" "$root/home/.claude-ds4/projects"
-  # An undecided third dir (present, no choice recorded).
-  mkdir -p "$root/home/.claude-sigint/projects/proj-a"
-  mk_session_in "$root/home/.claude-sigint/projects/proj-a" s9
-  mk_session_in "$root/home/.claude/projects/proj-a" s1
-  # The same transcript reachable from both decided roots: a symlink in the alt root
-  # pointing at the primary's file. `find -type f` follows the link and reports the
-  # target path, so the two roots yield the SAME path and sort -u must collapse it.
-  mk_session_in "$root/home/.claude/projects/proj-a" s2
-  ln -s "$root/home/.claude/projects/proj-a/s2.jsonl" "$root/home/.claude-ds4/projects/proj-a/s2.jsonl"
   run_dream_autodetect "$root"
   local fdir="$root/autodream/findings/$DATE"
-  # Held-out: sigint is flagged and its session is NOT triaged.
-  assert_grep "$fdir/unindexed-roots.txt" "$root/home/.claude-sigint/projects" "the undecided sigint dir is flagged"
-  assert_nogrep "$fdir/sessions.txt.raw" "$root/home/.claude-sigint/projects/proj-a/s9.jsonl" "the undecided sigint session is NOT triaged"
-  # Dedup: the symlinked path appears exactly once in sessions.txt.raw.
-  local n; n=$(grep -c "$root/home/.claude/projects/proj-a/s2.jsonl" "$fdir/sessions.txt.raw")
-  assert_eq "$n" "1" "the symlinked path appears once in sessions.txt.raw"
-  local p; p=$(printf '%s' "$root/home/.claude/projects/proj-a/s2.jsonl" | shasum | cut -c1-12)
-  assert_file "$fdir/$p.json" "the one overlapping session has a findings JSON"
-  rm -rf "$root"
-}
-
-test_multiroot_flags_unindexed(){
-  echo "# multi-root: claude dirs that exist but are not indexed are flagged for the report"
-  local root; root=$(setup_env_altroot)
-  # Third dir, present, not indexed, not in root-choices.conf.
-  mkdir -p "$root/home/.claude-sigint/projects/proj-a"
-  : > "$root/home/.claude-sigint/projects/proj-a/s9.jsonl"; touch -t "$STAMP" "$root/home/.claude-sigint/projects/proj-a/s9.jsonl"
-  mk_session_in "$root/home/.claude/projects/proj-a" s1
-  # The ds4 dir (from setup) is also present and undecided.
-  mk_session_in "$root/home/.claude-ds4/projects/proj-a" s2
-  run_dream_autodetect "$root"
-  local flag="$root/autodream/findings/$DATE/unindexed-roots.txt"
-  assert_file "$flag" "unindexed-roots.txt written"
-  assert_grep "$flag" "$root/home/.claude-sigint/projects" "the sigint dir is named"
-  assert_grep "$flag" "$root/home/.claude-ds4/projects" "the ds4 dir is named too"
-  assert_nogrep "$flag" "$root/home/.claude/projects" "the primary dir is never flagged"
-  # Neither undecided dir is triaged — they're held out until decided.
-  assert_nogrep "$root/autodream/findings/$DATE/sessions.txt.raw" "$root/home/.claude-sigint/projects/proj-a/s9.jsonl" "sigint session is not triaged"
-  assert_nogrep "$root/autodream/findings/$DATE/sessions.txt.raw" "$root/home/.claude-ds4/projects/proj-a/s2.jsonl" "ds4 session is not triaged"
+  assert_file "$fdir/sessions.txt.raw" "sessions.txt.raw written (empty store, empty list)"
+  assert_file "$root/dreams/$DATE.md" "stub report written for an empty store"
   rm -rf "$root"
 }
 
@@ -1788,24 +1747,26 @@ test_multiroot_flags_unindexed(){
 rp(){ AUTODREAM_DIR="$T/ad" HOME="$T/home" "$REPO/bin/root-probe.sh" "$@"; }
 
 test_rootprobe_remembers_choice(){
-  echo "# root-probe: --default-index records the choice once and stops re-asking"
+  echo "# root-probe: --default-index on the single OMP root records nothing unasked, stays idempotent"
   local T; T=$(mktemp -d "${TMPDIR:-/tmp}/ccad.XXXXXX")
-  mkdir -p "$T/home/.claude/projects" "$T/home/.claude-ds4/projects" "$T/ad"
+  mkdir -p "$T/home/.omp/agent/sessions" "$T/ad"
   rp --default-index >/dev/null 2>&1
-  assert_grep "$T/ad/root-choices.conf" "$T/home/.claude-ds4/projects=index" "unasked alt root recorded as index"
-  # Second invocation with a NEW unasked dir: only the new one gets a line.
-  mkdir -p "$T/home/.claude-sigint/projects"
-  rp --default-index >/dev/null 2>&1
-  local n; n=$(grep -c '^.*=index' "$T/ad/root-choices.conf")
-  assert_eq "$n" "2" "second run records only the newly-unasked root"
-  assert_nogrep "$T/ad/root-choices.conf" "$T/home/.claude-sigint/projects=ignore" "new root not ignored"
+  # The OMP session store is the always-index primary root; with no unasked roots,
+  # --default-index writes no choice lines.
+  assert_no_file "$T/ad/root-choices.conf" "no choice file written (only the always-index primary root exists)"
+  # The primary root is reported as index and consolidated without a choice file.
+  local out; out=$(rp --list 2>&1)
+  assert_grep <(printf '%s' "$out") "$T/home/.omp/agent/sessions" "the OMP root is listed"
+  assert_grep <(printf '%s' "$out") "index" "the OMP root is reported as index"
+  out=$(rp --consolidated 2>&1)
+  assert_eq "$out" "$T/home/.omp/agent/sessions" "consolidated emits the single OMP root"
   rm -rf "$T"
 }
 
 test_rootprobe_no_write_mode_flags_but_does_not_write(){
   echo "# root-probe: nightly mode (no --ask/--default-index) flags but never writes choices"
   local T; T=$(mktemp -d "${TMPDIR:-/tmp}/ccad.XXXXXX")
-  mkdir -p "$T/home/.claude/projects" "$T/home/.claude-ds4/projects" "$T/ad"
+  mkdir -p "$T/home/.omp/agent/sessions" "$T/ad"
   rp --unindexed >/dev/null 2>&1 || true
   assert_no_file "$T/ad/root-choices.conf" "no choice file written by a nightly-mode run"
   rm -rf "$T"
@@ -1829,9 +1790,8 @@ test_rootprobe_empty_home(){
 }
 
 # ---- run the new tests ----
-test_multiroot_triages_alt_root
-test_multiroot_heldout_and_dedup
-test_multiroot_flags_unindexed
+test_omp_singleroot_autodetect
+test_omp_singleroot_empty_store_no_abort
 test_rootprobe_remembers_choice
 test_rootprobe_no_write_mode_flags_but_does_not_write
 test_rootprobe_empty_home

@@ -1,12 +1,12 @@
 #!/bin/bash
 # cc-autodream installer.
 #
-# Symlinks the scripts + prompts from this repo into ~/.claude/autodream/ and (on
+# Symlinks the scripts + prompts from this repo into ~/.omp/agent/autodream/ and (on
 # macOS) installs the nightly launchd schedule so overnight runs Just Work.
 # Idempotent — safe to re-run.
 #
 # Usage:
-#   ./install.sh                 # symlink into $HOME/.claude/ + schedule nightly job
+#   ./install.sh                 # symlink into $HOME/.omp/agent/ + schedule nightly job
 #   ./install.sh /path/to        # symlink into /path/to/autodream/ instead
 #   ./install.sh --no-schedule   # symlink only; don't touch launchd
 #   ./install.sh -h|--help
@@ -17,7 +17,7 @@ REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # ----------------------------------------------------------------- arg parsing --
 SCHEDULE=1
-TARGET_PARENT="$HOME/.claude"
+TARGET_PARENT="$HOME/.omp/agent"
 for a in "$@"; do
   case "$a" in
     --no-schedule) SCHEDULE=0 ;;
@@ -68,19 +68,30 @@ link "$REPO_DIR/prompts/SESSION_TRIAGE.md" "$TARGET/SESSION_TRIAGE.md"
 
 chmod +x "$REPO_DIR/bin/"*.sh
 
+# --------------------------------------------------- advisor-off overlay --
+# OMP boots the opus advisor on every headless compile of a run unless told not to,
+# burning subscription budget. run.sh passes the overlay below as --config to every
+# worker (env NO_ADVISOR_CFG). Written here once so a fresh install is complete.
+cat > "$TARGET/l1-no-advisor.yml" <<'YAML'
+advisor:
+  enabled: false
+  subagents: false
+YAML
+chmod 644 "$TARGET/l1-no-advisor.yml"
+
 # --------------------------------------------------- session roots --
-# autodream scans every $HOME/.claude*/projects dir that has a session store. At
-# install time we detect them, ask about the ones the user hasn't decided on yet, and
-# record the decision in root-choices.conf so the nightly run stays unattended. On a
-# non-TTY install (CI, an automated shell), unasked roots default to indexed so the
-# install silently covers everything; the log line says what was chosen. The
-# SESSION_ROOTS line below is the managed section run.sh sources.
+# autodream scans the OMP session store — a single root, $HOME/.omp/agent/sessions.
+# At install time we confirm it and cover any choice bookkeeping in root-choices.conf
+# so the nightly run stays unattended. On a non-TTY install (CI, an automated shell),
+# unasked roots default to indexed so the install silently covers everything; the log
+# line says what was chosen. The SESSION_ROOTS line below is the managed section
+# run.sh sources.
 if [ -x "$TARGET/root-probe.sh" ]; then
   CONFIG="$TARGET/config"
   if [ -t 1 ]; then
     AUTODREAM_DIR="$TARGET" "$TARGET/root-probe.sh" --ask
   else
-    echo "  non-interactive install: indexing any unasked Claude folders (edit root-choices.conf to change)"
+    echo "  non-interactive install: indexing any unasked session roots (edit root-choices.conf to change)"
     AUTODREAM_DIR="$TARGET" "$TARGET/root-probe.sh" --default-index
   fi
   # Insert/replace the managed section. A prior line (or lines) under the marker is

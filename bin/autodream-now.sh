@@ -55,8 +55,8 @@ RUN_SH="$BIN_DIR/run.sh"
 # ------------------------------------------------------------- state locations --
 # Defaults mirror run.sh's own defaults; honor the same env overrides so a
 # customized install (different AUTODREAM_DIR / DREAMS_DIR) still works.
-AUTODREAM_DIR="${AUTODREAM_DIR:-$HOME/.claude/autodream}"
-DREAMS_DIR="${DREAMS_DIR:-$HOME/.claude/dreams}"
+AUTODREAM_DIR="${AUTODREAM_DIR:-$HOME/.omp/agent/autodream}"
+DREAMS_DIR="${DREAMS_DIR:-$HOME/.omp/agent/dreams}"
 mkdir -p "$AUTODREAM_DIR/logs"
 
 # Target date: explicit arg, else "yesterday" computed exactly like run.sh does —

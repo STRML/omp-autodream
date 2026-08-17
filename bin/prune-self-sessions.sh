@@ -1,26 +1,24 @@
 #!/bin/bash
 # Find (and optionally delete) autodream's OWN session transcripts.
 #
-# Every `claude --print` worker autodream spawns used to persist its own session
-# JSONL into ~/.claude/projects/-Users-<you>/. The next night's run would then
-# triage those as if they were real sessions — ~190 self-generated files/night,
-# ~90% of the corpus, pure noise and wasted model spend. run.sh now passes
-# --no-session-persistence so new runs leave no full transcript, and now runs workers
-# from an isolated cwd so even the residual AI-title stub lands in a bucket run.sh
-# wipes. Older runs predating those fixes still littered the real session bucket with
-# both full transcripts AND one-line ai-title stubs; this script cleans up both and is
-# the single source of truth for the "is this one of ours?" predicate (run.sh
-# calls `--filter`).
+# Every headless worker autodream spawns used to persist its own session JSONL into
+# ~/.claude/projects/-Users-<you>/. The next night's run would then triage those as
+# if they were real sessions — ~190 self-generated files/night, ~90% of the corpus,
+# pure noise and wasted model spend. run.sh now passes --no-session-persistence (and
+# the OMP port's workers run `omp` with --no-session), so new runs leave no
+# transcript. Older runs predating those fixes still littered the real session
+# bucket with full transcripts; this script cleans them up and is the single source
+# of truth for the "is this one of ours?" predicate (run.sh calls `--filter`).
 #
 # Usage:
 #   prune-self-sessions.sh                 # list self-sessions under $PROJECTS_DIR (dry run)
 #   prune-self-sessions.sh --delete        # delete them
 #   prune-self-sessions.sh --quiet         # just the summary line, no per-file paths
-#   prune-self-sessions.sh /path/projects  # scan a specific projects dir
+#   prune-self-sessions.sh /path/sessions  # scan a specific sessions dir
 #   prune-self-sessions.sh --filter        # stdin: session paths; stdout: only NON-self ones
 #
 # Env:
-#   PROJECTS_DIR   default $HOME/.claude/projects
+#   PROJECTS_DIR   default $HOME/.omp/agent/sessions
 
 set -u
 
@@ -28,8 +26,19 @@ set -u
 # prompts. Anchored to the start of the message content so a human session that
 # merely *discusses* autodream (mentions SESSION_PATH= mid-conversation) is NOT
 # matched. Covers both the current literal-path framing and the legacy KEY=value
-# framing from earlier runs.
-SELF_RE='"content":"(Session transcript to analyze \(literal absolute path\)|Findings directory to aggregate \(literal absolute path\)|SESSION_PATH=|FINDINGS_DIR=)'
+# framing from earlier runs, on either transcript shape:
+#   - Claude stores user content in a string:   {"type":"user",...,"content":"…"}
+#   - OMP stores an array of items:             {"type":"message","message":{"role":"user","content":[{"type":"text","text":"…"}]}}
+# The `"(content":"|text":")` anchor matches both.
+SELF_RE='"(content":"|text":")(Session transcript to analyze \(literal absolute path\)|Findings directory to aggregate \(literal absolute path\)|SESSION_PATH=|FINDINGS_DIR=)'
+
+# The FIRST user-turn record, whichever shape the transcript uses. Claude persists
+# user turns as {"type":"user",...}; OMP as {"type":"message",...} with a message
+# object whose role is "user" (assistant/system records never match). `-m1` stops at
+# the first record matching either shape, so callers always get the first user turn.
+first_user_turn() { # $1 = jsonl path → first user-turn record line (or nothing)
+  grep -m1 -E '"type":"user"|"type":"message".*"message":\{"role":"user"' "$1" 2>/dev/null
+}
 
 # Second vector: an orphan AI-title stub. Claude Code's async title generation writes
 # a one-line `{"type":"ai-title",...}` record into the worker's session bucket even
@@ -46,7 +55,7 @@ SELF_RE='"content":"(Session transcript to analyze \(literal absolute path\)|Fin
 # spared. Tuned against the real backlog: catches the L1/L2 title variants, spares
 # terminal-tab-title stubs and unrelated work-session orphans.
 is_self_title() { # $1 = jsonl path → exit 0 if it's an autodream orphan title stub
-  grep -q '"type":"user"' "$1" 2>/dev/null && return 1   # has conversation → not an orphan
+  first_user_turn "$1" | grep -q . && return 1   # has conversation → not an orphan
   local t
   t=$(sed -n 's/.*"aiTitle":"\([^"]*\)".*/\1/p' "$1" 2>/dev/null | head -1)
   [ -n "$t" ] || return 1
@@ -62,7 +71,7 @@ is_self_title() { # $1 = jsonl path → exit 0 if it's an autodream orphan title
 }
 
 is_self() { # $1 = jsonl path → exit 0 if it's an autodream-generated session
-  grep -m1 '"type":"user"' "$1" 2>/dev/null | grep -qE "$SELF_RE" && return 0
+  first_user_turn "$1" | grep -qE "$SELF_RE" && return 0
   is_self_title "$1"
 }
 
@@ -86,7 +95,7 @@ for a in "$@"; do
     *) SCAN_DIR="$a" ;;
   esac
 done
-PROJECTS_DIR="${SCAN_DIR:-${PROJECTS_DIR:-$HOME/.claude/projects}}"
+PROJECTS_DIR="${SCAN_DIR:-${PROJECTS_DIR:-$HOME/.omp/agent/sessions}}"
 
 [ -d "$PROJECTS_DIR" ] || { echo "no such projects dir: $PROJECTS_DIR" >&2; exit 1; }
 

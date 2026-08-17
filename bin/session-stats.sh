@@ -35,7 +35,7 @@ jq -R -s \
   ] as $lines
   | [
       $lines[]
-      | select(.type == "user" and .isMeta != true)
+      | select(.type == "message" and (.message.role? // "") == "user")
       | .message.content
       | select(
           type == "string"
@@ -49,7 +49,7 @@ jq -R -s \
   | (
       [
         $lines[]
-        | select(.type == "user" and .isMeta != true)
+        | select(.type == "message" and (.message.role? // "") == "user")
         | select(
             (.message.content) as $c
             | ($c | type) == "string"
@@ -66,18 +66,19 @@ jq -R -s \
     ) as $user_turn_timestamps
   | [
       $lines[]
-      | select(.isMeta != true and (.type == "user" or .type == "assistant"))
+      | select(
+          .type == "message"
+          and (((.message.role? // "") == "user") or ((.message.role? // "") == "assistant"))
+        )
     ] as $turns
   | [
       $lines[]
-      | select(.type == "assistant" and (.message.content | type) == "array")
-      | .message.content[]
-      | select(.type == "tool_use")
+      | select(.type == "custom" and .customType == "tool_execution_start")
     ] as $tool_uses
   | [
       $lines[]
-      | select(.type == "assistant")
-      | .message.model
+      | select(.type == "model_change")
+      | .model
       | select(type == "string" and length > 0 and . != "<synthetic>")
     ] as $models
   | [
@@ -93,7 +94,7 @@ jq -R -s \
       tool_call_count: ($tool_uses | length),
       tools_used: (
         $tool_uses
-        | map(.name)
+        | map(.data.toolName)
         | map(select(type == "string"))
         | unique
         | sort
@@ -109,7 +110,7 @@ jq -R -s \
       # transcript archive ever emitted one. It measured only silence.
       transcript_bytes: $transcript_bytes,
       transcript_mtime: $transcript_mtime,
-      isSidechain: (any($lines[]?; .isSidechain == true)),
+      isSidechain: (any($lines[]?; ((.customType? // "") == "agent") or ((.customType? // "") == "subagent"))),
       user_turn_timestamps: $user_turn_timestamps
     }
   ' "$transcript" > "$output"

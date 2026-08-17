@@ -2,9 +2,9 @@
 # Autodream runner — invoked by launchd at ~3am local time.
 #
 # Two-layer pipeline:
-#   L1: For each of yesterday's session JSONLs, spawn a parallel `claude --model haiku`
+#   L1: For each of yesterday's session JSONLs, spawn a parallel `omp --model deepseek-v4-flash`
 #       running SESSION_TRIAGE.md → writes one findings.json per session.
-#   L2: One `claude --model opus` running PROMPT.md → reads all findings JSONs,
+#   L2: One `omp --model claude-opus-5` running PROMPT.md → reads all findings JSONs,
 #       writes $DREAMS_DIR/YYYY-MM-DD.md, updates project MEMORY.md files.
 #
 # Usage:
@@ -13,7 +13,10 @@
 #   FANOUT=4 ./run.sh    # tune L1 parallelism (default 8)
 #
 # Environment overrides (all optional):
-#   CLAUDE_BIN     path to claude CLI                   default: $HOME/.local/bin/claude
+#   OMP_BIN        path to omp CLI                       default: /opt/homebrew/bin/omp
+#   NO_ADVISOR_CFG path to the advisor-off yaml passed as --config to every worker
+#                  (keeps the opus advisor from booting on headless runs)
+#                                                        default: $AUTODREAM_DIR/l1-no-advisor.yml
 #   PROJECTS_DIR   single root: where session JSONLs live (kept for compat; one root)
 #                  default: $HOME/.claude/projects
 #   SESSION_ROOTS  colon-separated dirs to scan for session JSONLs. Takes precedence
@@ -33,7 +36,11 @@
 #   AUTODREAM_NETCHECK   set 0 to skip waiting-for-network on retry  default: 1
 #   AUTODREAM_FORCE      set 1 to rebuild even if a report exists    default: 0
 #   AUTODREAM_SLIM_BYTES sessions larger than this are slimmed for L1  default: 262144
-#   AUTODREAM_L2_MODEL   override the L2 aggregator model            default: fable-5 until 2026-06-20, claude-opus-4-7 from 2026-06-21
+#   AUTODREAM_L1_MODEL   override the L1 triage model                 default: runinfra/deepseek-v4-flash
+#   AUTODREAM_L2_MODEL   override the L2 aggregator model             default: anthropic/claude-opus-5
+#   RUNINFRA_API_KEY     L1 provider key; sourced from $AUTODREAM_DIR/x-credentials (chmod 600)
+#                        when present, else resolved from the login keychain. L2 needs no key
+#                        (agent.db OAuth).
 #   AUTODREAM_MIN_USER_TURNS  noise-gate floor on user_message_count  default: 2
 #   AUTODREAM_MIN_MINUTES     noise-gate floor on duration_minutes    default: 1
 #   AUTODREAM_STATS_BIN       override the resolved session-stats.sh path, authoritative
@@ -50,7 +57,7 @@
 
 set -u
 
-CLAUDE_BIN="${CLAUDE_BIN:-$HOME/.local/bin/claude}"
+OMP_BIN="${OMP_BIN:-/opt/homebrew/bin/omp}"
 # PROJECTS_DIR's default is applied here AND its explicit-ness is recorded, because the
 # resolution order is SESSION_ROOTS > PROJECTS_DIR(explicit) > autodetect. `:-` can't
 # tell "unset" from "set to the default", and treating the always-present default as
@@ -58,11 +65,15 @@ CLAUDE_BIN="${CLAUDE_BIN:-$HOME/.local/bin/claude}"
 PROJECTS_DIR_EXPLICIT=0
 if [ -n "${PROJECTS_DIR+x}" ]; then
   PROJECTS_DIR_EXPLICIT=1
-  PROJECTS_DIR="${PROJECTS_DIR:-$HOME/.claude/projects}"
+  PROJECTS_DIR="${PROJECTS_DIR:-$HOME/.omp/agent/sessions}"
 else
-  PROJECTS_DIR="$HOME/.claude/projects"
+  PROJECTS_DIR="$HOME/.omp/agent/sessions"
 fi
 AUTODREAM_DIR="${AUTODREAM_DIR:-$HOME/.claude/autodream}"
+# Advisor-off overlay, passed as --config to every headless worker (L1 + L2) so no
+# worker boots the opus advisor (verified: it fires in print mode otherwise). install.sh
+# writes this file; it must exist before the first worker dispatch.
+NO_ADVISOR_CFG="$AUTODREAM_DIR/l1-no-advisor.yml"
 
 # ---- Config file ----
 # run.sh historically ignored ~/.claude/autodream/config; only review.sh sourced it. That
@@ -112,6 +123,17 @@ if [ -f "$AUTODREAM_CONFIG" ]; then
   set -u
   eval "$_env_snapshot"
   unset _env_snapshot _config_probe_err
+fi
+# L1 auth band-aid: the L1 provider key (RUNINFRA_API_KEY) lives in the login keychain
+# (!security escape), which can be locked at 3am. If $AUTODREAM_DIR/x-credentials
+# (chmod 600, key=value lines) exists, source it so the L1 workers pick the key up
+# directly; the keychain is the fallback when the file is absent (or lacks the key).
+# L2 never needs a key: it authenticates via agent.db OAuth. Sourced with nounset off
+# so a user-edited key=value file can never abort the run.
+if [ -f "$AUTODREAM_DIR/x-credentials" ]; then
+  set +u
+  . "$AUTODREAM_DIR/x-credentials" 2>/dev/null || true
+  set -u
 fi
 DREAMS_DIR="${DREAMS_DIR:-$HOME/.claude/dreams}"
 LOG_DIR="$AUTODREAM_DIR/logs"
@@ -293,7 +315,7 @@ probe_roots() {
     # lie. Folders the user explicitly ignored are likewise skipped.
     SESSION_ROOTS=$("$ROOT_PROBE" --consolidated 2>/dev/null) || SESSION_ROOTS=""
   fi
-  [ -n "$SESSION_ROOTS" ] || SESSION_ROOTS="$HOME/.claude/projects"
+  [ -n "$SESSION_ROOTS" ] || SESSION_ROOTS="$HOME/.omp/agent/sessions"
   log "session roots: ${SESSION_ROOTS//:/, }"
 }
 
@@ -357,7 +379,10 @@ filter_empty_sessions() {
 session_is_substantive() {
   local sp="$1" verdict
   [ -r "$sp" ] || return 0
-  verdict=$(jq -s 'if any(.[]; .type=="user" and (.isMeta != true)) then 1 else 0 end' "$sp" 2>/dev/null) || return 0
+  # OMP transcript shape (PORT_CONTRACT.md): a substantive session has at least one
+  # `message` record with role user holding a text content item. UI-only
+  # custom_message records never count. Unparseable files are kept (bias to triage).
+  verdict=$(jq -s 'if any(.[]; (.type=="message") and (.message.role=="user") and ([.message.content[]? | select(.type=="text")] | length > 0)) then 1 else 0 end' "$sp" 2>/dev/null) || return 0
   [ "$verdict" = "0" ] && return 1
   return 0
 }
@@ -600,7 +625,7 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
     # straight to the Read/Write tools and never tries to $-expand them in a shell
     # (there is no such env var, so it would expand to nothing and fail — exactly
     # the failure mode that broke earlier runs). Assemble via a brace group piped
-    # straight to claude: a `prompt=$(...)` capture strips the trailing newlines,
+    # straight to the worker: a `prompt=$(...)` capture strips the trailing newlines,
     # which would glue the SESSION_TRIAGE.md body onto the end of the output-path
     # line and corrupt it. The printf keeps its blank-line separator this way.
     # Launch from the isolated worker cwd so any AI-title stub lands in $WORK_BUCKET,
@@ -615,15 +640,14 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
         cat "$FINDINGS_DIR/$hash.stats.json"
         printf "\n\`\`\`\n"
       fi
-    } | "$CLAUDE_BIN" \
-      --print \
-      --permission-mode bypassPermissions \
-      --model claude-haiku-4-5 \
-      --no-session-persistence \
-      --tools Read Write \
-      --disable-slash-commands \
-      --strict-mcp-config \
-      --settings "{\"disableAllHooks\":true}" \
+    } | "$OMP_BIN" \
+      --allow-home \
+      -p \
+      --approval-mode yolo \
+      --no-session \
+      --config "$NO_ADVISOR_CFG" \
+      --model "${AUTODREAM_L1_MODEL:-runinfra/deepseek-v4-flash}" \
+      --tools=Read,Write \
       --append-system-prompt "Headless triage worker. Read the session transcript and write exactly one findings JSON object, via the Write tool, to the literal output path given on line 2 of the prompt. Those paths are literal strings, not shell variables — never \$-expand them. Print only the literal word done and exit." \
       > /dev/null 2> "$errlog"
 
@@ -640,7 +664,7 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
       [ -n "$slimfile" ] && rm -f "$slimfile"
       # Worker exited without writing findings JSON. Record a diagnostic so the
       # failure is visible.
-      printf "worker produced no findings JSON for %s (incomplete run: claude exited without writing output)\n" "$session" >> "$errlog"
+      printf "worker produced no findings JSON for %s (incomplete run: omp exited without writing output)\n" "$session" >> "$errlog"
       # On the FINAL retry round, fall back to a metadata-only findings stub so
       # the session is visible to L1_ERRORED and the L2 aggregator instead of
       # disappearing into a silent .err file (the old behavior, which the
@@ -697,9 +721,9 @@ run() {
   log "findings:    $FINDINGS_DIR"
   log "report:      $REPORT_PATH"
   log "fanout:      $FANOUT"
-  log "claude:      $CLAUDE_BIN"
+  log "omp:         $OMP_BIN"
 
-  [ -x "$CLAUDE_BIN" ] || { log "FATAL: claude not at $CLAUDE_BIN"; exit 1; }
+  [ -x "$OMP_BIN" ] || { log "FATAL: omp not found at $OMP_BIN (set OMP_BIN)"; exit 1; }
 
   # ---- Session roots (which $HOME/.claude*/projects dirs we scan) ----
   probe_roots
@@ -741,7 +765,7 @@ run() {
   scan_roots
 
   # Exclude autodream's OWN headless worker/aggregator transcripts. New runs leave none
-  # (--no-session-persistence), but runs predating that fix littered ~/.claude/projects/
+  # (--no-session), but runs predating that fix littered ~/.claude/projects/
   # and those files must not be re-triaged. The prune helper owns the predicate; if it's
   # missing, fall back to the raw list rather than silently dropping real sessions.
   if [ -x "$PRUNE" ]; then
@@ -788,16 +812,15 @@ EOF
   # participate in overlap (see the comment in bin/overlap-stats.sh).
   compute_overlap_stats
 
-  # ---- Layer 1: haiku triage, parallel, retried across sleep/network gaps ----
-  # Lean-query env (claude-cells internal/claude/query.go pattern): keep subscription
-  # OAuth auth but strip per-call bloat — no CLAUDE.md auto-load, no telemetry/error
-  # reporting. Combined with the per-call flags (--no-session-persistence, --tools,
-  # --disable-slash-commands, --strict-mcp-config, --settings disableAllHooks) this is
-  # the token-minimal footprint WITHOUT --bare (which would disable OAuth/keychain auth
-  # and require an API key). Exported once so both the L1 xargs subshells and the L2
-  # call inherit it.
+  # ---- Layer 1: triage, parallel, retried across sleep/network gaps ----
+  # Worker env for omp: keep provider auth (L1's runinfra key from x-credentials or the
+  # login keychain) but strip per-call bloat — no CLAUDE.md auto-load, a scoped tool
+  # surface (--tools=Read,Write: read the transcript, write the findings JSON), and the
+  # advisor-off overlay (--config "$NO_ADVISOR_CFG") so no headless worker boots the
+  # opus advisor. --no-session leaves no transcript.
+  # Exported once so both the L1 xargs subshells and the L2 call inherit it.
   export CLAUDE_CODE_DISABLE_CLAUDE_MDS=1 DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1
-  export CLAUDE_BIN AUTODREAM_DIR FINDINGS_DIR SLIM WORK_DIR
+  export OMP_BIN NO_ADVISOR_CFG RUNINFRA_API_KEY AUTODREAM_L1_MODEL AUTODREAM_DIR FINDINGS_DIR SLIM WORK_DIR
   # AUTODREAM_L1_ROUNDS is referenced by the dispatcher subshell to decide
   # whether this is the last retry round (gates the metadata-stub fallback).
   export AUTODREAM_L1_ROUNDS
@@ -1075,20 +1098,8 @@ PY
   # The aggregator call can also die to a mid-run sleep (this is what left exit 1 +
   # "no report" overnight). Retry until $REPORT_PATH is non-empty, waiting for the
   # network between attempts. Idempotent: a re-run overwrites the report harmlessly.
-  # Fable 5 is included in the subscription only until 2026-06-20; it moves to
-  # usage-based pricing on 2026-06-21, so revert to opus from that day on. The
-  # cutoff keys on the wall-clock run date (when the call is billed), not the
-  # target date being processed. Pin the exact "claude-fable-5[1m]" string: the
-  # CLI silently falls back to opus on unrecognized --model values (verified
-  # 2026-06-09 on 2.1.170), and bare "claude-fable-5" is one of those — only
-  # the alias "fable" and the [1m]-suffixed form actually serve Fable 5.
-  if [ -z "${AUTODREAM_L2_MODEL:-}" ]; then
-    if [ "$(date +%Y%m%d)" -ge 20260621 ]; then
-      AUTODREAM_L2_MODEL="claude-opus-4-7"
-    else
-      AUTODREAM_L2_MODEL="claude-fable-5[1m]"
-    fi
-  fi
+  # L2 auth is agent.db OAuth (file-based, safe at 3am) — no API key needed.
+  AUTODREAM_L2_MODEL="${AUTODREAM_L2_MODEL:-anthropic/claude-opus-5}"
   log "L2 model: $AUTODREAM_L2_MODEL"
 
   # ---- Move a stale report aside before attempting L2 ----
@@ -1143,15 +1154,14 @@ PY
         printf "Findings directory to aggregate (literal absolute path): %s\n" "$FINDINGS_DIR"
         printf "Write the report to this literal absolute path: %s\n\n" "$REPORT_PATH"
         cat "$AUTODREAM_DIR/PROMPT.md"
-      } | "$CLAUDE_BIN" \
-        --print \
-        --permission-mode bypassPermissions \
-        --model "$AUTODREAM_L2_MODEL" \
-        --no-session-persistence \
-        --tools Glob Read Write Edit \
-        --disable-slash-commands \
-        --strict-mcp-config \
-        --settings '{"disableAllHooks":true}' \
+      } | "$OMP_BIN" \
+        --allow-home \
+        -p \
+        --approval-mode yolo \
+        --no-session \
+        --config "$NO_ADVISOR_CFG" \
+        --model "${AUTODREAM_L2_MODEL:-anthropic/claude-opus-5}" \
+        --tools=Glob,Read,Write,Edit \
         --append-system-prompt "Headless aggregator. Read the per-session findings JSONs from the findings directory given on line 1 of the prompt, then write the report, via the Write tool, to the literal report path given on line 2. Those paths are literal strings, not shell variables — never \$-expand them. May edit project MEMORY.md files per the prompt rules. Print report path and 3-line summary, then exit."
     )
 
