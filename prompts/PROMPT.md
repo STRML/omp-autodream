@@ -1,6 +1,6 @@
 # Autodream — Layer 2 (aggregator)
 
-You are running headlessly at ~3am. Layer 1 (haiku, fanned out one-per-session) has already triaged yesterday's sessions and written per-session findings JSONs. Your job: aggregate them into a coherent, actionable report and update memory where high-confidence patterns warrant it.
+You are running headlessly at ~3am. Layer 1 (haiku, fanned out one-per-session) has already triaged yesterday's sessions and written per-session findings JSONs. Your job: aggregate them into a coherent, actionable report.
 
 ## Inputs (first two lines of this prompt)
 
@@ -17,8 +17,8 @@ All other inputs you need (treat `<findings-dir>` below as the literal path from
 
 - **Per-session findings JSONs**: every file matching `<findings-dir>/*.json` except `*.stats.json` (Glob it) is one session's structured output (schema in `SESSION_TRIAGE.md`). Read them all.
 - **Per-session stderr**: `<findings-dir>/*.json.err` if a triage call failed — note in your report.
-- **Installed skills**: walk `~/.claude/skills/`, `~/.claude/plugins/*/skills/`, and project `.claude/skills/`. Each has frontmatter `description`/triggers. Use this to validate `missed_skill` findings (skill exists? trigger matches?).
-- **Memory files**: `~/.claude/projects/*/memory/MEMORY.md` (one per project — may not exist).
+- **Installed skills**: walk `~/.claude/skills/`, `~/.claude/plugins/*/skills/`, project `.claude/skills/`, and `~/.omp/agent/managed-skills/` (OMP managed skills, same frontmatter `description`/triggers shape). Ignored skills stay on disk, so read `~/.omp/agent/config.yml` `skills.ignoredSkills` and subtract those names from every globbed source before treating anything as installed. The built-in binary skills are compiled into the omp binary and not glob-able: enumerate them from your session skill surface, where the harness has already filtered the ignored ones out. Use this to validate `missed_skill` findings (skill exists? trigger matches?).
+- **Memory**: none — under OMP, Layer 2 performs no memory writes. Project memory is OMP's per-project mnemopi SQLite store with autolearn, so there is no MEMORY.md for you to maintain.
 - **Global rules**: `~/.claude/CLAUDE.md`, `~/.claude/rules/*.md`, and the lazy-loaded
   playbooks in `~/.claude/docs/guardrails/*.md` (dev-workflow, advisor-mode,
   failure-discipline, pr-workflow, claude-code-lore). The guardrails moved out of `rules/`
@@ -82,7 +82,7 @@ Two limits on the above. Bound the read: the region around the defect, or the wh
 For each project with ≥3 findings, a short paragraph: what went well, what hurt. Anchor it in the sessions' `underlying_goal` facets when present — what the user was actually trying to do, not just what broke.
 
 ## Skill coverage gaps
-Cross-reference `missed_skill` findings against installed skills. **Before recommending "create skill X", actually list the skills directory (`ls ~/.claude/skills/` and glob `~/.claude/plugins/**/skills/*/SKILL.md`) and confirm no skill with that name or trigger set already exists.** If one exists, the gap is a *triggering* problem, not a missing skill — reframe it as "skill X exists but didn't fire on pattern Y; consider adding trigger phrase Z" and do not propose creating it. Only flag "skill to create" when the filesystem confirms nothing covers the pattern.
+Cross-reference `missed_skill` findings against installed skills. **Before recommending "create skill X", actually list the skills directory (`ls ~/.claude/skills/` and glob `~/.claude/plugins/**/skills/*/SKILL.md`, plus `~/.omp/agent/managed-skills/*/SKILL.md`, minus the names in `~/.omp/agent/config.yml` `skills.ignoredSkills`, and account for the built-in binary skills your session skill surface exposes) and confirm no active skill with that name or trigger set already exists.** If one exists, the gap is a *triggering* problem, not a missing skill — reframe it as "skill X exists but didn't fire on pattern Y; consider adding trigger phrase Z" and do not propose creating it. Only flag "skill to create" when the filesystem confirms nothing covers the pattern.
 
 Two matching rules for that cross-reference:
 - **Namespace-aware matching.** Plugin skills resolve under both the `plugin:skill` display form (`superpowers:brainstorming`) and the bare name (`brainstorming`). The display namespace is the plugin's manifest name (`name` in its `.claude-plugin/plugin.json`), which often differs from the directory name — read the manifest when you need the namespace; never derive it from the path segment alone. A finding that references either form of an installed skill matches; when the namespace is uncertain, match on the bare skill name.
@@ -147,25 +147,9 @@ An open question that would take the user ten seconds to answer with "that alrea
 N is how many questions survived the triviality gate above. Count the questions you are actually asking the user to decide, not the notes you kept for context: a section that says "None that clear the triviality gate" followed by three explanatory bullets is `N=0`, because none of those bullets is a question. `review.sh` reads this marker to decide whether the morning triage session is worth opening at all, so an inflated N costs a pointless session and a deflated N silently buries a real question.
 ```
 
-### 2. Memory updates (high-confidence only)
+### 2. Compliance detection (`instructions_given`)
 
-For findings with `confidence: high` AND `count >= 2` AND `severity: high`, you MAY edit the relevant project's `MEMORY.md`:
-
-**Pilot quarantine — LIFTED for `buggy_code_shipped` on 2026-07-28.** Its pilot week ran 2026-07-20…07-27: 28 sessions emitted the category and none was dropped as a false positive, so it is now eligible for the normal memory-write gate above like any other category. (The one date that looked like a mass discard was a single code-review fanout, `wf_e1571958-08b`, which L2 correctly collapsed into one aggregate pattern rather than 9 separate ones.)
-
-**`instructions_given` — the repetition-ranking rule is RETIRED (2026-07-28); the compliance check stays.** Over the pilot week not one cross-session repetition became a memory candidate, and the reason is structural rather than bad luck: what people actually repeat is session scoping ("do not commit", "stay on this branch", "work in this worktree", "read-only investigation"). Those recur constantly and are correctly un-pinnable — a permanent 📌 saying "do not commit" would be actively wrong. So do NOT enter repeated instructions in Top patterns as memory candidates, and do not rank by repetition count.
-
-Still read the field, for the one thing it proved good at: **compliance detection.** When a session was given an explicit instruction and the transcript shows it wasn't followed, that is a `compliance_failure` — report it as such, citing the instruction. This is the routing that surfaced "`verify-spec-against-code` not invoked by verifier subagents despite an explicit brief instruction", and it only works because the field records what was asked. The field is also legitimate colour for Per-project notes. If an instruction is already recorded in the relevant `MEMORY.md` or `~/.claude/CLAUDE.md` and was ignored, that is likewise a `compliance_failure`, not a memory candidate.
-
-- Project memory paths follow `~/.claude/projects/<encoded-cwd>/memory/MEMORY.md`.
-- The encoded-cwd comes from `session.project` in the JSON or by inspecting the session path.
-- **Always 📌-pin any entry you add.** A separate memory-consolidation pass (Claude Code's built-in auto-dream, or the `cc-simple-memory` plugin's `gc-memory.sh`) prunes non-pinned entries on a different schedule — the 📌 marker is the contract that keeps cc-autodream's signal from being garbage-collected before the human sees it.
-- **Never delete or rewrite an existing 📌 entry** unless you are explicitly replacing a stale autodream pin with a newer one on the same topic. Memory hygiene (consolidation, pruning, contradiction resolution) is the consolidator's job, not ours.
-- Keep each file ≤200 lines AND ≤25,000 bytes — these are the same caps Anthropic's auto-dream enforces (`MAX_ENTRYPOINT_LINES = 200`, `MAX_ENTRYPOINT_BYTES = 25_000` in `src/memdir/memdir.ts`). If you'd overflow, remove the oldest *non-pinned* entry only.
-- Each MEMORY.md line is an **index entry**, not a full memory body. Hold it under ~150 characters: one-line pointer that can include a markdown link to a topic file. (claude-dream and Anthropic's auto-dream both groom on this contract — staying within it makes your pins survive their passes.)
-- When you write a longer-form memory body, put it in a topic file alongside MEMORY.md with frontmatter `type: feedback` (or `project` / `reference` where applicable — match Anthropic's four-type taxonomy: `user`, `feedback`, `project`, `reference`). cc-autodream's signal almost always maps to `type: feedback`.
-- Record EVERY edit in the report's "Auto-applied: yes" lines. Before writing "Auto-applied: yes", Read the edited file back and confirm the change is on disk. Never claim an edit you have not verified, and never reference a topic file or `[[pin]]` you did not just write or confirm exists — a past report cited a pin that was never written.
-- **Sidecar for the GC step**: every time you write to a project's `MEMORY.md`, append the project's encoded directory name (the `<encoded-cwd>` segment of the path) as a new line in a `touched-projects.txt` file inside the findings directory (the literal path from line 1). The runner reads this file after you exit and triggers `claude-memory gc` for each listed project so the consolidator can resettle around your new pins. If you didn't touch any project memory, don't create the file.
+Read the `instructions_given` field from the findings (collected in step 2 below) for what each session was explicitly told. When a session was given an explicit instruction and the transcript shows it wasn't followed, that is a `compliance_failure` — report it as such in Top patterns, citing the instruction. If an instruction was already recorded in `~/.claude/CLAUDE.md` or `~/.claude/rules/*.md` and was ignored, that is likewise a `compliance_failure`, not a pattern. Do NOT rank repeated instructions by repetition count, and do NOT surface routine session scoping ("do not commit", "stay on this branch", "work in this worktree", "read-only investigation") as patterns — those recur constantly and are not signal.
 
 ### 3. Anything you may NOT edit
 
@@ -177,12 +161,11 @@ Still read the field, for the one thing it proved good at: **compliance detectio
 ## How to start
 
 1. Read the findings directory's `*.json` files (use Glob then Read).
-2. Build an in-memory aggregate: group findings by category, count, sort by (count × severity). Exclude `*.stats.json` sidecars from the findings aggregate. Ignore `compliance_markers` entirely — retired 2026-08-08 after an archive-wide scan found zero real emissions of `RETRY-BUDGET:` / `FETCH-PIVOT:` / `DELEGATED:` / `DIRECT-OK:` in any session ever recorded; the detector was correct and the markers were simply never written, so the telemetry only measured silence. Do NOT report a Compliance-markers line in the Activity snapshot, and do NOT split `tool_loop` sessions by marker presence — report a `tool_loop` pattern on its transcript evidence alone. Older findings still carry non-zero-shaped keys; leave them unread. Also collect the facet fields when present: `outcome` for the Activity-snapshot outcomes line, `underlying_goal` for Per-project notes, and the `instructions_given` lists for the compliance check (see Memory updates). Ignore `satisfaction_signals` entirely — retired 2026-07-28.
-3. Walk installed skills (Glob `~/.claude/skills/*/SKILL.md` etc., Read frontmatter).
+2. Build an in-memory aggregate: group findings by category, count, sort by (count × severity). Exclude `*.stats.json` sidecars from the findings aggregate. Ignore `compliance_markers` entirely — retired 2026-08-08 after an archive-wide scan found zero real emissions of `RETRY-BUDGET:` / `FETCH-PIVOT:` / `DELEGATED:` / `DIRECT-OK:` in any session ever recorded; the detector was correct and the markers were simply never written, so the telemetry only measured silence. Do NOT report a Compliance-markers line in the Activity snapshot, and do NOT split `tool_loop` sessions by marker presence — report a `tool_loop` pattern on its transcript evidence alone. Older findings still carry non-zero-shaped keys; leave them unread. Also collect the facet fields when present: `outcome` for the Activity-snapshot outcomes line, `underlying_goal` for Per-project notes, and the `instructions_given` lists for the compliance check (see Compliance detection). Ignore `satisfaction_signals` entirely — retired 2026-07-28.
+3. Walk installed skills (Glob `~/.claude/skills/*/SKILL.md`, `~/.claude/plugins/**/skills/*/SKILL.md`, and `~/.omp/agent/managed-skills/*/SKILL.md`, minus the names in `~/.omp/agent/config.yml` `skills.ignoredSkills`; plus the built-in binary skills your session skill surface exposes; Read frontmatter).
 4. Read `<findings-dir>/changelog-window.md` (Upstream changes) and `<findings-dir>/run-stats.txt` (Autodream self-audit) if present.
 5. Write the report to the literal report path from line 2.
-6. For each high-confidence high-severity recurring finding, update the matching project's MEMORY.md.
-7. Print: `report: <report-path>` (the literal path from line 2) then a 3-line summary (sessions reviewed, findings, edits made), then exit.
+6. Print: `report: <report-path>` (the literal path from line 2) then a 3-line summary (sessions reviewed, findings, edits made), then exit.
 
 ## Style
 

@@ -17,6 +17,9 @@ All notable changes to cc-autodream. Format loosely follows Keep a Changelog.
 ### Changed
 - **Lean-query invocation.** Both layers compose minimal-footprint flags from claude-cells `internal/claude/query.go` (`--tools <only-needed> --disable-slash-commands --strict-mcp-config --settings '{"disableAllHooks":true}'` + env `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1`, etc.), cutting per-call tokens by dropping hooks/skills/MCP/CLAUDE.md while keeping subscription OAuth auth.
 
+- **No L2 memory writes under OMP (#1).** PROMPT.md's memory-pinning instructions and the runner's `claude-memory gc` step are gone. OMP's memory is per-project mnemopi SQLite with autolearn, so the old path wrote `~/.claude/projects/*/memory/MEMORY.md` into a store nothing reads. L2 now produces the report and touches nothing else.
+- **Skill-coverage walk sees the OMP surface (#2).** The L2 "Installed skills" walk now enumerates `~/.omp/agent/managed-skills` and the built-in binary skills (session skill surface), and subtracts `skills.ignoredSkills` from globbed sources so disabled skills aren't reported as installed.
+
 ### Notes
 - **Do not use `--bare` / `CLAUDE_CODE_SIMPLE`.** Verified they disable OAuth/keychain auth (require an API key) and limit tools to Bash+Edit; the composed flags above are the supported path for subscription users.
 - Tests grew from 6 to 14 cases (changelog window, prune helper, self-session exclusion, L1 flaky retry, idempotency guard, self-audit stats, transcript slimming); all offline against the mock claude.
