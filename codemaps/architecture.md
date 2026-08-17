@@ -28,7 +28,8 @@ bin/run.sh  TARGET_DATE
       ├─ L2 retry loop (AUTODREAM_L2_ATTEMPTS):
       │     claude --print (opus, lean flags) with PROMPT.md
       │       reads all findings/<date>/*.json + changelog-window.md + run-stats.txt
-      │       writes dreams/<date>.md (no memory writes — L2 does not edit MEMORY.md under OMP)
+      │       emits the report on stdout; run.sh writes dreams/<date>.md
+      │       (L2 has no file tools — no memory writes under OMP)
       │
       ├─ notify.sh → open-questions inbox file ($AUTODREAM_OPEN, default `open`)
 ```

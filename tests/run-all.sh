@@ -1789,7 +1789,87 @@ test_rootprobe_empty_home(){
   rm -rf "$T"
 }
 
+# ---- skills-inventory.sh unit tests (no run.sh) ----
+skinv(){ HOME="$T/home" "$REPO/bin/skills-inventory.sh" "$@"; }
+
+test_skills_inventory(){
+  echo "# skills-inventory.sh: multi-bucket scan, ignoredSkills parse, frontmatter, dedupe"
+  local T; T=$(mktemp -d "${TMPDIR:-/tmp}/ccad.XXXXXX")
+
+  # config.yml: an ignoredSkills block with an inline comment, a quoted entry, a blank
+  # line (must keep parsing), and a sibling key whose deeper item must NOT be ignored.
+  mkdir -p "$T/home/.omp/agent" "$T/home/.claude/skills"
+  printf '%s\n' \
+    'skills:' \
+    '  ignoredSkills:' \
+    '    - alpha # documented off' \
+    '    - "betaquoted"' \
+    '' \
+    '    - gamma' \
+    '  toolAllow:' \
+    '    - delta' \
+    > "$T/home/.omp/agent/config.yml"
+
+  local SK="$T/home/.claude/skills"
+  mkdir -p \
+    "$SK/alpha" "$SK/betaquoted" "$SK/gamma" "$SK/delta" "$SK/off-skill" \
+    "$SK/folded-desc" "$SK/block-name" "$SK/dirname-fallback" \
+    "$T/home/.claude/plugins/someplugin/skills/plgsku" \
+    "$T/home/.claude-ds4/skills/shared-skill" \
+    "$T/home/.agents/skills/shared-dup" \
+    "$T/home/.config/opencode/skills/oc-skill" \
+    "$T/home/.omp/agent/managed-skills/mang"
+
+  printf '%s\n' '---' 'name: alpha' 'description: ignored anyway' '---' > "$SK/alpha/SKILL.md"
+  printf '%s\n' '---' 'name: betaquoted' 'description: listed quoted' '---' > "$SK/betaquoted/SKILL.md"
+  printf '%s\n' '---' 'name: gamma' 'description: after a blank line' '---' > "$SK/gamma/SKILL.md"
+  printf '%s\n' '---' 'name: delta' 'description: under a sibling key, must survive' '---' > "$SK/delta/SKILL.md"
+  printf '%s\n' '---' 'name: off-skill' 'description: excluded' 'enabled: false' '---' > "$SK/off-skill/SKILL.md"
+  printf '%s\n' '---' 'name: folded-desc' 'description: >' '  First line of the description' \
+    '  Second line of the description' 'enabled: true' '---' > "$SK/folded-desc/SKILL.md"
+  printf '%s\n' '---' 'name: >-' '  Blocky Named Skill' 'description: scalar name' '---' > "$SK/block-name/SKILL.md"
+  printf '%s\n' '---' 'description: no name line, use the dir basename' '---' > "$SK/dirname-fallback/SKILL.md"
+  printf '%s\n' '---' 'name: plgsku' 'description: nested plugin skill' '---' \
+    > "$T/home/.claude/plugins/someplugin/skills/plgsku/SKILL.md"
+  printf '%s\n' '---' 'name: shared-skill' 'description: from the ds4 bucket' '---' \
+    > "$T/home/.claude-ds4/skills/shared-skill/SKILL.md"
+  printf '%s\n' '---' 'name: shared-skill' 'description: from the agents root' '---' \
+    > "$T/home/.agents/skills/shared-dup/SKILL.md"
+  printf '%s\n' '---' 'name: oc-skill' 'description: opencode root' '---' \
+    > "$T/home/.config/opencode/skills/oc-skill/SKILL.md"
+  printf '%s\n' '---' 'name: mang' 'description: managed root' '---' \
+    > "$T/home/.omp/agent/managed-skills/mang/SKILL.md"
+
+  skinv "$T/out.txt"
+  local rc=$?
+  assert_eq "$rc" "0" "inventory exits 0 on the fixture (got $rc)"
+  assert_file "$T/out.txt" "inventory file written"
+  assert_eq "$(sed -n '1p' "$T/out.txt")" "# skills-inventory.txt — authoritative active on-disk skill list for L2 (write: bin/skills-inventory.sh)" \
+    "first line is the authoritative header"
+
+  # ignoredSkills parse: comment stripped, quotes, blank line inside the block.
+  assert_nogrep "$T/out.txt" '^alpha\t' "inline-comment ignore name is excluded"
+  assert_nogrep "$T/out.txt" '^betaquoted\t' "quoted ignore name is excluded"
+  assert_nogrep "$T/out.txt" '^gamma\t' "blank line inside the block does not drop later ignores"
+  assert_grep   "$T/out.txt" '^delta\t' "a deeper item under a SIBLING key is not ignored"
+
+  # frontmatter handling.
+  assert_nogrep "$T/out.txt" '^off-skill\t' "enabled: false skill is excluded"
+  assert_grep   "$T/out.txt" '^folded-desc\tFirst line of the description Second line of the description$' \
+    "folded description is joined with single spaces"
+  assert_grep   "$T/out.txt" '^Blocky Named Skill\t' "block-scalar name resolves to its value line"
+  assert_grep   "$T/out.txt" '^dirname-fallback\t' "a name-less SKILL.md falls back to the dir basename"
+  assert_grep   "$T/out.txt" '^plgsku\t' "plugin skill found under plugins/"
+  assert_grep   "$T/out.txt" '^oc-skill\t' "opencode root skill listed"
+  assert_grep   "$T/out.txt" '^mang\t' "OMP managed-root skill listed"
+
+  # dedupe: the same name in two buckets emits one row (agents root scanned first).
+  assert_eq "$(grep -c $'^shared-skill\t' "$T/out.txt")" "1" "duplicate names are deduplicated to one row"
+  rm -rf "$T"
+}
+
 # ---- run the new tests ----
+test_skills_inventory
 test_omp_singleroot_autodetect
 test_omp_singleroot_empty_store_no_abort
 test_rootprobe_remembers_choice

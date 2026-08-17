@@ -1146,11 +1146,12 @@ PY
 
   L2_ATTEMPTS="${AUTODREAM_L2_ATTEMPTS:-3}"
   L2_START=$(date +%s)
+  L2_STDOUT="$FINDINGS_DIR/report.stdout"   # L2's report arrives on stdout, not via Write
   L2_RC=1
   for attempt in $(seq 1 "$L2_ATTEMPTS"); do
     log "L2 aggregation attempt $attempt/$L2_ATTEMPTS..."
     # Same literal-path framing and brace-group assembly as L1 (see the L1 worker
-    # comment): keep the paths as literal data the aggregator hands to Glob/Read/Write,
+    # comment): keep the paths as literal data the aggregator reads with Glob/Read,
     # and preserve the blank-line separator before PROMPT.md instead of letting a
     # `prompt=$(...)` capture strip it and glue the doc onto the report-path line.
     # Subshell so the cwd change (isolating the AI-title stub into $WORK_BUCKET, same
@@ -1160,7 +1161,7 @@ PY
       cd "$WORK_DIR" 2>/dev/null || true
       {
         printf "Findings directory to aggregate (literal absolute path): %s\n" "$FINDINGS_DIR"
-        printf "Write the report to this literal absolute path: %s\n\n" "$REPORT_PATH"
+        printf "Report destination (literal absolute path): %s\n\n" "$REPORT_PATH"
         cat "$AUTODREAM_DIR/PROMPT.md"
       } | "$OMP_BIN" \
         --allow-home \
@@ -1169,11 +1170,22 @@ PY
         --no-session \
         --config "$NO_ADVISOR_CFG" \
         --model "${AUTODREAM_L2_MODEL:-anthropic/claude-opus-5}" \
-        --tools=Glob,Read,Write \
-        --append-system-prompt "Headless aggregator. Read the per-session findings JSONs from the findings directory given on line 1 of the prompt, then write the report, via the Write tool, to the literal report path given on line 2. Those paths are literal strings, not shell variables — never \$-expand them. Print report path and 3-line summary, then exit."
-    )
+        --tools=Glob,Read \
+        --append-system-prompt "Headless aggregator. Read the per-session findings JSONs from the findings directory given on line 1 of the prompt, then produce the COMPLETE report only on standard output, ending with a line containing exactly AUTODREAM_REPORT_END. Do not use Write or Edit anywhere. Those paths are literal strings, not shell variables — never \$-expand them. After the sentinel line print one line: report: <literal path from line 2 of the prompt> then a 3-line summary (sessions reviewed, findings), then exit."
+    ) > "$L2_STDOUT"
 
     L2_RC=$?
+    # ---- Runner writes the report from L2's stdout (L2 holds no Write/Edit tool) ----
+    # The report file exists because THIS script writes it, not the worker. Strip
+    # everything before the first line exactly equal to AUTODREAM_REPORT_END; a missing
+    # sentinel means L2 died mid-output, so keep the whole capture as a degraded report
+    # and let the marker check below decide whether to retry.
+    if grep -q '^AUTODREAM_REPORT_END$' "$L2_STDOUT" 2>/dev/null; then
+      awk '/^AUTODREAM_REPORT_END$/ { exit } { print }' "$L2_STDOUT" > "$REPORT_PATH"
+    elif [ -s "$L2_STDOUT" ]; then
+      log "WARNING: L2 stdout carried no AUTODREAM_REPORT_END sentinel; writing the whole captured output as a degraded report"
+      cat "$L2_STDOUT" > "$REPORT_PATH"
+    fi
     report_complete && break
     if [ -s "$REPORT_PATH" ]; then
       log "L2 attempt $attempt left a report with no open-questions marker — treating it as truncated and retrying (exit $L2_RC)"

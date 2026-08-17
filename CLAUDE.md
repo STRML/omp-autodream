@@ -7,7 +7,7 @@ Operating notes for working on this repo. Read this before changing `bin/run.sh`
 A nightly two-layer pipeline that reads yesterday's Claude Code session transcripts and produces a ranked daily report.
 
 - **Layer 1** (`prompts/SESSION_TRIAGE.md`, haiku, fanned out one per session): reads one transcript, writes one findings JSON.
-- **Layer 2** (`prompts/PROMPT.md`, opus, single call): reads all findings JSONs, writes `dreams/YYYY-MM-DD.md`. L2 performs no memory writes under OMP.
+- **Layer 2** (`prompts/PROMPT.md`, opus, single call): reads all findings JSONs, emits the report on stdout (run.sh captures it and writes `dreams/YYYY-MM-DD.md`). L2 has no file tools — no memory writes under OMP.
 - `bin/run.sh` orchestrates both layers and everything around them.
 
 ## Session roots: one dir is not the corpus
@@ -71,7 +71,7 @@ Both layers call `claude --print` with a composed set of minimal-footprint flags
 
 ```
 --no-session-persistence            # see self-pollution below
---tools Read Write                  # L1; L2 uses: Glob Read Write Edit
+--tools Read Write                  # L1; L2 uses: Glob Read
 --disable-slash-commands            # no skills
 --strict-mcp-config                 # no MCP servers
 --settings '{"disableAllHooks":true}'   # no hooks (incl. the big SessionStart injection)
