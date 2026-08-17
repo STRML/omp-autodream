@@ -1094,6 +1094,14 @@ PY
   fi
   printf 'x_queryid_source: %s\n' "$XQID_SOURCE" >> "$FINDINGS_DIR/run-stats.txt"
 
+  # ---- Skills inventory (writes skills-inventory.txt for L2 to read) ----
+  # The L2 prompt treats this file as the authoritative active-skill list. Best-effort:
+  # an unusable inventory must never abort the pipeline (L2 falls back to its session surface).
+  skills_inv="$SCRIPT_DIR/skills-inventory.sh"
+  [ -x "$skills_inv" ] || skills_inv="$AUTODREAM_DIR/skills-inventory.sh"
+  "$skills_inv" "$FINDINGS_DIR/skills-inventory.txt" 2>/dev/null \
+    || printf '# skills-inventory.txt unavailable\n' > "$FINDINGS_DIR/skills-inventory.txt"
+
   # ---- Layer 2: opus aggregate, retried until a report lands ----
   # The aggregator call can also die to a mid-run sleep (this is what left exit 1 +
   # "no report" overnight). Retry until $REPORT_PATH is non-empty, waiting for the
@@ -1161,7 +1169,7 @@ PY
         --no-session \
         --config "$NO_ADVISOR_CFG" \
         --model "${AUTODREAM_L2_MODEL:-anthropic/claude-opus-5}" \
-        --tools=Glob,Read,Write,Edit \
+        --tools=Glob,Read,Write \
         --append-system-prompt "Headless aggregator. Read the per-session findings JSONs from the findings directory given on line 1 of the prompt, then write the report, via the Write tool, to the literal report path given on line 2. Those paths are literal strings, not shell variables — never \$-expand them. Print report path and 3-line summary, then exit."
     )
 
