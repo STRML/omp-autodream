@@ -95,7 +95,7 @@ run_dream(){ # $1=root ; inherits MOCK_MODE/MOCK_CAPTURE_DIR/FANOUT + changelog 
   # AUTODREAM_VAULT_DIR could reach the nightly run; without this pin a developer whose
   # config points at a real Obsidian vault would have the suite writing into it.
   # Individual tests override this by exporting AUTODREAM_CONFIG before calling.
-  AUTODREAM_GC=0 AUTODREAM_CHANGELOG="${AUTODREAM_CHANGELOG:-0}" OMP_BIN="$MOCK" \
+  AUTODREAM_CHANGELOG="${AUTODREAM_CHANGELOG:-0}" OMP_BIN="$MOCK" \
   AUTODREAM_CONFIG="${AUTODREAM_CONFIG:-$1/autodream/config}" \
   AUTODREAM_CONSUME_DATE="${AUTODREAM_CONSUME_DATE:-$DATE}" \
   AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS="${AUTODREAM_L1_ROUNDS:-2}" \
@@ -109,7 +109,7 @@ run_dream(){ # $1=root ; inherits MOCK_MODE/MOCK_CAPTURE_DIR/FANOUT + changelog 
 # Same run, but piped into a reader that closes immediately, so any write run.sh makes to
 # stdout lands on a dead pipe. This is the shape of the real 2026-08-02 failure.
 run_dream_broken_pipe(){ # $1=root
-  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 OMP_BIN="$MOCK" \
+  AUTODREAM_CHANGELOG=0 OMP_BIN="$MOCK" \
   AUTODREAM_CONFIG="$1/autodream/config" \
   AUTODREAM_CONSUME_DATE="$DATE" \
   AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=2 \
@@ -1082,7 +1082,7 @@ test_runner_provenance_no_git(){
   # history at all — the tarball-install case, which must still produce a report.
   local bin="$root/bin"; mkdir -p "$bin"
   cp "$REPO"/bin/*.sh "$bin/"
-  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 OMP_BIN="$MOCK" \
+  AUTODREAM_CHANGELOG=0 OMP_BIN="$MOCK" \
   AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=2 \
   PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
   bash "$bin/run.sh" "$DATE" > "$root/run.out" 2>&1
@@ -1102,7 +1102,7 @@ test_runner_provenance_through_symlink(){
   # .git, and provenance has to follow the file's own link to find the working tree.
   # Six production runs through 2026-08-03 stamped "unknown" against a clean checkout.
   local f; for f in "$REPO"/bin/*.sh; do ln -sf "$f" "$root/autodream/$(basename "$f")"; done
-  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 OMP_BIN="$MOCK" \
+  AUTODREAM_CHANGELOG=0 OMP_BIN="$MOCK" \
   AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
   AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=2 \
   PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
@@ -1130,7 +1130,7 @@ test_runner_provenance_relative_symlink(){
   phys_bin=$(cd "$REPO/bin" && pwd -P)
   rel=$(python3 -c 'import os,sys;print(os.path.relpath(sys.argv[1],sys.argv[2]))' "$phys_bin" "$phys_ad")
   local f; for f in "$REPO"/bin/*.sh; do ln -sf "$rel/$(basename "$f")" "$root/autodream/$(basename "$f")"; done
-  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 OMP_BIN="$MOCK" \
+  AUTODREAM_CHANGELOG=0 OMP_BIN="$MOCK" \
   AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
   AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=2 \
   PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
@@ -1156,7 +1156,7 @@ test_runner_provenance_unresolvable_chain(){
     prev="$root/autodream/hop-$i.sh"
   done
   ln -sf "$prev" "$root/autodream/run.sh"
-  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 OMP_BIN="$MOCK" \
+  AUTODREAM_CHANGELOG=0 OMP_BIN="$MOCK" \
   AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
   AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=2 \
   PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
@@ -1477,7 +1477,7 @@ test_runner_dirty_ignores_untracked(){
   git -C "$repo" add -A 2>/dev/null
   git -C "$repo" -c user.email=t@t -c user.name=t commit -qm init 2>/dev/null
   printf 'scratch\n' > "$repo/untracked-scratch.txt"
-  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 OMP_BIN="$MOCK" \
+  AUTODREAM_CHANGELOG=0 OMP_BIN="$MOCK" \
   AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=2 \
   PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
   bash "$repo/bin/run.sh" "$DATE" > "$root/run.out" 2>&1
@@ -1487,7 +1487,7 @@ test_runner_dirty_ignores_untracked(){
   # A tracked modification still does.
   printf '\n# tracked edit\n' >> "$repo/bin/session-stats.sh"
   rm -rf "$(fdir "$root")" "$root/dreams/$DATE.md"
-  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 OMP_BIN="$MOCK" \
+  AUTODREAM_CHANGELOG=0 OMP_BIN="$MOCK" \
   AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=2 \
   PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
   bash "$repo/bin/run.sh" "$DATE" > "$root/run2.out" 2>&1
@@ -1680,7 +1680,7 @@ test_config_unbound_var_does_not_kill_run
 # and overriding HOME into the sandbox so root-probe discovers the sandbox's claude dirs
 # rather than the host's.
 run_dream_autodetect(){ # $1=root — like run_dream but with HOME inside the sandbox, no PROJECTS_DIR
-  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 OMP_BIN="$MOCK" \
+  AUTODREAM_CHANGELOG=0 OMP_BIN="$MOCK" \
   AUTODREAM_CONFIG="$1/autodream/config" \
   AUTODREAM_CONSUME_DATE="$DATE" \
   AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=2 \

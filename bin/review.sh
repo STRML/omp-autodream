@@ -220,7 +220,7 @@ Workflow when the user says "go" or otherwise signals ready:
 When all open questions are resolved, write a brief summary at the bottom of $REPORT under "## Triage decisions", thank the user, and exit.
 
 Other rules:
-- You may edit any file the autodream prompt allows you to edit (project MEMORY.md, settings.json, .claude/* in the relevant project), plus you may now edit ~/.claude/CLAUDE.md, ~/.claude/rules/*, and ~/.claude/docs/guardrails/* if the user explicitly approves.
+- You may edit any file the autodream prompt allows you to edit (settings.json, .claude/* in the relevant project), plus you may now edit ~/.claude/CLAUDE.md, ~/.claude/rules/*, and ~/.claude/docs/guardrails/* if the user explicitly approves.
 - Don't proceed on any CLAUDE.md / rules / guardrails edit without explicit per-edit approval — those are global.
 - Be terse. One question, one decision, one action, then next.
 EOF

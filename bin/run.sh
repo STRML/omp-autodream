@@ -1146,7 +1146,7 @@ PY
     # and preserve the blank-line separator before PROMPT.md instead of letting a
     # `prompt=$(...)` capture strip it and glue the doc onto the report-path line.
     # Subshell so the cwd change (isolating the AI-title stub into $WORK_BUCKET, same
-    # as L1) is scoped to this call and doesn't leak into the notify/GC steps below.
+    # as L1) is scoped to this call and doesn't leak into the notify step below.
     # $? after the subshell is the pipeline's exit (claude's), exactly as before.
     (
       cd "$WORK_DIR" 2>/dev/null || true
