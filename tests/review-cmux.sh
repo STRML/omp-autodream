@@ -38,9 +38,11 @@ assert_eq(){ [ "$1" = "$2" ] && ok "$3" || no "$3 (got [$1] want [$2])"; }
 assert_grep(){ grep -q -- "$2" "$1" 2>/dev/null && ok "$3" || no "$3 (no /$2/ in $1)"; }
 assert_nogrep(){ grep -q -- "$2" "$1" 2>/dev/null && no "$3 (/ $2 / unexpectedly in $1)" || ok "$3"; }
 
-# Sandbox: a dreams/ dir plus a mock cmux that records invocations. The mock
-# exits with CMUX_EXIT (default 0) and prints a workspace ref like the real
-# tool does, so the WS_REF parse in review.sh is exercised too.
+# Sandbox: a dreams/ dir plus a mock cmux AND a mock claude (the review
+# preflight now requires CLAUDE_BIN to exist before it will launch a workspace).
+# The claude mock only needs to be present + executable — in cmux mode review.sh
+# never actually execs it, it only preflights the path. Fake both so the suite
+# is self-contained on a CI runner with no ~/.local/bin/claude.
 setup_env(){
   local root; root=$(mktemp -d "${TMPDIR:-/tmp}/ccrevcmux.XXXXXX")
   mkdir -p "$root/dreams" "$root/autodream"
@@ -60,6 +62,8 @@ case "$1" in
 esac
 MOCK
   chmod +x "$root/cmux-mock.sh"
+  printf '#!/bin/bash\nexit 0\n' > "$root/claude-mock.sh"
+  chmod +x "$root/claude-mock.sh"
   : > "$root/cmux.log"
   printf '%s' "$root"
 }
@@ -90,6 +94,7 @@ run_review(){ # $1=root ; rest = args ; override env via $REVIEW_ENV
   AUTODREAM_CONFIG="$root/nonexistent-config" \
   AUTODREAM_TRIAGE_SURFACE=cmux \
   CMUX_BIN="$root/cmux-mock.sh" \
+  CLAUDE_BIN="$root/claude-mock.sh" \
   CMUX_LOG="$root/cmux.log" \
   DREAMS_DIR="$root/dreams" \
   bash "$REVIEW" "$@" > "$root/out" 2>&1
@@ -281,6 +286,11 @@ test_legacy_marker_is_migrated(){
   local root; root=$(setup_env)
   mk_report "$root" 2020-01-02 "$REPORT_OPEN"
   mkdir -p "$root/autodream/logs"
+  # The migration base is the report mtime; force the report to an OLD stamp so
+  # the legacy marker (touched after) is unambiguously STRICTLY newer — BSD
+  # seconds-resolution would otherwise tie them and (correctly) refuse to
+  # migrate, which is not what this test is about.
+  touch -t 202006010000 "$root/dreams/2020-01-02.md"
   touch "$root/autodream/logs/review-launched-2020-01-02"
   run_review "$root" 2020-01-02
   assert_eq "$(cmux_calls "$root")" 0 "legacy marker suppresses a duplicate launch"
@@ -381,10 +391,28 @@ test_legacy_marker_stale_is_not_migrated(){
   mk_report "$root" 2020-01-02 "$REPORT_OPEN"
   run_review "$root" 2020-01-02
   assert_eq "$(cmux_calls "$root")" 1 "stale legacy marker does not suppress a rebuilt report"
-  assert_grep "$root/out" 'predates the current report' "stale legacy marker is reported as not migrated"
+  assert_grep "$root/out" 'not newer than the current report' "stale legacy marker is reported as not migrated"
   [ -f "$(marker_confirmed "$root" 2020-01-02)" ] \
     && ok "rebuilt report gets its own confirmed token" \
     || no "rebuilt report has no confirmed token"
+}
+
+# A legacy marker and a rebuilt report sharing the same wall-clock second (BSD
+# seconds-resolution mtime) must NOT migrate: the legacy launch is not
+# unambiguously newer, so the rebuilt report opens for triage instead of being
+# marked confirmed (executor 6.1).
+test_legacy_marker_same_second_tie_not_migrated(){
+  local root; root=$(setup_env)
+  mkdir -p "$root/autodream/logs"
+  mk_report "$root" 2020-01-02 "$REPORT_OPEN"
+  touch -t 202006011200 "$root/dreams/2020-01-02.md"
+  touch -t 202006011200 "$root/autodream/logs/review-launched-2020-01-02"   # tie
+  run_review "$root" 2020-01-02
+  assert_eq "$(cmux_calls "$root")" 1 "same-second legacy tie opens the report (no migration)"
+  assert_grep "$root/out" 'not newer than the current report' "tie is reported as not migrated"
+  [ -f "$(marker_confirmed "$root" 2020-01-02)" ] \
+    && ok "tied report gets its own confirmed token" \
+    || no "tied report has no confirmed token"
 }
 
 # A workspace whose embedded claude cannot start is a confirmed dead end: the
@@ -485,6 +513,7 @@ test_abandoned_claim_is_reclaimed
 test_in_progress_claim_suppresses
 test_legacy_marker_is_migrated
 test_legacy_marker_stale_is_not_migrated
+test_legacy_marker_same_second_tie_not_migrated
 test_headless_missing_cmux_fails
 test_interactive_missing_cmux_falls_back_inline
 test_logs_dir_failure_exits_nonzero

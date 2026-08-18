@@ -182,8 +182,8 @@ if [ "$AUTODREAM_TRIAGE_SURFACE" = "cmux" ]; then
   # (config → PATH → default) finds an executable, so runtime can never diverge
   # from install time.
   if [ -n "$CMUX" ] && [ -x "$CMUX" ]; then
-    # Same-day dedup for the review job's catch-up triggers (08:00/09:15/12:15,
-    # provisioned by install.sh like the run job). Whichever trigger fires first
+    # Same-day dedup for the review job's catch-up triggers (08:00/09:15/12:15/
+    # 15:30/18:15, provisioned by install.sh like the run job). Whichever trigger fires first
     # after the report lands opens the workspace and stamps a confirmed marker;
     # later triggers for the same date honor it instead of opening a second
     # workspace on top of the first. --force bypasses the marker, so a
@@ -205,9 +205,9 @@ if [ "$AUTODREAM_TRIAGE_SURFACE" = "cmux" ]; then
     # Report identity key: a content digest, not mtime. mtime is
     # seconds-resolution, so a same-second rebuild shares a marker and its
     # triage is silently swallowed. The digest changes whenever the report
-    # content changes, which is exactly the rebuild signal. Fall back to the
-    # mtime if shasum is somehow unavailable (a 64-char dir name is the only
-    # cost either way).
+    # content changes, which is exactly the rebuild signal. A missing shasum is
+    # a hard error (fail closed), never a silent regression to mtime — see the
+    # emptiness check below.
     REPORT_KEY=$(shasum -a 256 "$REPORT" 2>/dev/null | awk '{print $1}')
     # The assignment's exit status is awk's (0 even on empty input), so a
     # failing/missing shasum must be detected by emptiness, not rc — an empty
@@ -232,23 +232,38 @@ if [ "$AUTODREAM_TRIAGE_SURFACE" = "cmux" ]; then
     # from here on — otherwise the same report opens a second workspace
     # post-upgrade on the very day it was already triaged.
     #
-    # But only when the marker is not OLDER than the current report: a date
-    # was triaged, then the report rebuilt for that date (new content, new
+    # But only when the marker is strictly NEWER than the current report: a
+    # date was triaged, then the report rebuilt for that date (new content, new
     # digest), the legacy date-only marker must NOT be migrated onto the new
     # report's key — that would mark unreviewed content as confirmed and
-    # swallow its triage. Compare mtimes: a rebuilt report is newer than the
-    # legacy launch, so we skip the migration and let the fresh digest open.
+    # swallow its triage. Compare mtimes; same-second ties (a rebuild landing in
+    # the same wall-clock second as the legacy touch) are treated as
+    # not-newer — migrate only when the legacy launch is unambiguously after the
+    # current report, letting a tied/older report open for triage (executor 6.1).
     LEGACY_MARKER="$LOGS_DIR/review-launched-$DATE"
     if [ -f "$LEGACY_MARKER" ]; then
       LEGACY_MTIME=$(stat -f %m "$LEGACY_MARKER" 2>/dev/null || echo 0)
-      if [ "$LEGACY_MTIME" -lt "$(stat -f %m "$REPORT" 2>/dev/null || echo 0)" ]; then
-        echo "review.sh: legacy marker $LEGACY_MARKER predates the current report; not migrated (report content changed since)"
-      else
+      if [ "$LEGACY_MTIME" -gt "$(stat -f %m "$REPORT" 2>/dev/null || echo 0)" ]; then
         echo "review.sh: migrating legacy marker $LEGACY_MARKER -> $LAUNCH_CONFIRMED"
         mv "$LEGACY_MARKER" "$LAUNCH_CONFIRMED" 2>/dev/null || true
+      else
+        echo "review.sh: legacy marker $LEGACY_MARKER not newer than the current report; not migrated (may be rebuilt content)"
       fi
     fi
     CLAIM_GRACE=900
+    CLAIMED_OWN=0
+    # A workspace that opens but whose embedded claude can't start is a waste:
+    # the confirmed token (below) is written on cmux success, so a missing
+    # CLAUDE_BIN would make every future trigger dedupe on a token whose session
+    # died in the workspace. Preflight the EXACT path we pass into the workspace
+    # env (CLAUDE_BIN resolves to $HOME/.local/bin/claude by default, or
+    # config/env). This runs BEFORE the claim is acquired: a missing binary must
+    # not leak a fresh claim that suppresses later triggers as "in progress"
+    # for the grace window (auditor 6.1 / deepseek 6.1 / executor 6.2).
+    if [ ! -x "$CLAUDE_BIN" ]; then
+      echo "review.sh: claude binary not found ($CLAUDE_BIN); not launching triage workspace" >&2
+      exit 1
+    fi
     # Reap stale state so it cannot grow unbounded: claim dirs and confirmed
     # tokens older than 14 days. `-delete` handles both the empty dir and its
     # sibling file. Unconditional on --force: the force path is exactly the
@@ -285,13 +300,14 @@ if [ "$AUTODREAM_TRIAGE_SURFACE" = "cmux" ]; then
       # claim dir now exists it was a genuine race (exit 0); otherwise it is
       # an I/O error (fail loudly).
       if ! mkdir "$LAUNCH_MARKER" 2>/dev/null; then
-        if [ -e "$LAUNCH_MARKER" ]; then
+        if [ -d "$LAUNCH_MARKER" ]; then
           echo "review.sh: $DATE triage launch already in progress by another invocation"
           exit 0
         fi
         echo "review.sh: cannot create claim $LAUNCH_MARKER" >&2
         exit 1
       fi
+      CLAIMED_OWN=1
     fi
     SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
     # Workspace + tab are named after the triaged date (ISO, i.e. the report's
@@ -311,20 +327,6 @@ if [ "$AUTODREAM_TRIAGE_SURFACE" = "cmux" ]; then
     # legitimately contain apostrophes (e.g. an install under /tmp/O'Brien),
     # and an unquoted one would break the inner shell parse. $FORCE_ARG is
     # generated here and can only be empty or " --force", so it stays literal.
-    # A workspace that opens but whose embedded claude can't start is a waste:
-    # the confirmed token (below) is written on cmux success, so a missing
-    # CLAUDE_BIN would make every future trigger dedupe on a token whose session
-    # died in the workspace (executor 5.1). Preflight the EXACT path we pass
-    # into the workspace env (CLAUDE_BIN resolves to $HOME/.local/bin/claude by
-    # default, or config/env) — a `command -v` on the basename would accept a
-    # different PATH claude that the workspace env never uses. claude-existing-
-    # but-crashing at startup remains visible in the open workspace; proving the
-    # child actually reached claude would require an async handshake that makes
-    # the trigger block, so this subset is closed and the rest is residual.
-    if [ ! -x "$CLAUDE_BIN" ]; then
-      echo "review.sh: claude binary not found ($CLAUDE_BIN); not launching triage workspace" >&2
-      exit 1
-    fi
     shq(){ printf '%q' "$1"; }
     INNER_CMD="env AUTODREAM_TRIAGE_SURFACE=inline CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 DREAMS_DIR=$(shq "$DREAMS_DIR") CLAUDE_BIN=$(shq "$CLAUDE_BIN") $(shq "$SELF") $(shq "$DATE")$FORCE_ARG"
     WS_OUT=$("$CMUX" workspace create \
@@ -340,11 +342,18 @@ if [ "$AUTODREAM_TRIAGE_SURFACE" = "cmux" ]; then
     # workspace-like output would also satisfy the ref parse below and latch a
     # false marker.
     if [ "$WS_RC" -ne 0 ]; then
-      # Release the claim unconditionally. A --force run skips claim acquisition
-      # but may be retrying over an abandoned claim from a killed normal run
-      # (executor 5.2); that stale claim must be released too, or scheduled
-      # triggers report "already in progress" for the next grace window.
-      rmdir "$LAUNCH_MARKER" 2>/dev/null || true
+      # Release the claim only if THIS process owns it, or if it is an
+      # abandoned one (older than the grace window). A --force run never
+      # claims, so it must not delete a LIVE claim acquired by a concurrent
+      # normal invocation whose cmux is still running (auditor 6.3 / executor
+      # 6.3) — but it still releases a stale claim left by a killed normal run
+      # (executor 5.2), so scheduled triggers don't stall on "in progress".
+      if [ "$CLAIMED_OWN" -eq 1 ]; then
+        rmdir "$LAUNCH_MARKER" 2>/dev/null || true
+      elif [ -d "$LAUNCH_MARKER" ]; then
+        MARKER_AGE=$(( $(date +%s) - $(stat -f %m "$LAUNCH_MARKER" 2>/dev/null || echo "$(date +%s)") ))
+        [ "$MARKER_AGE" -ge "$CLAIM_GRACE" ] && rmdir "$LAUNCH_MARKER" 2>/dev/null || true
+      fi
       echo "review.sh: cmux workspace create failed (exit $WS_RC); triage not opened" >&2
       exit 1
     fi

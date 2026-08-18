@@ -140,9 +140,16 @@ install_schedule() {
 
   # launchd agents start with a minimal PATH; seed it with the dirs of the tools
   # the pipeline shells out to (claude, git, bash) plus the usual suspects.
-  local path_dirs="" tool b d
+  local path_dirs="" tool b d CLAUDE_BIN_ABS=""
   for tool in claude git bash; do
     if b="$(command -v "$tool" 2>/dev/null)"; then
+      if [ "$tool" = "claude" ] && [ -n "$b" ]; then
+        # review.sh preflights the EXACT binary path (it aborts if CLAUDE_BIN
+        # is not -x), and its default $HOME/.local/bin/claude is wrong when
+        # claude lives elsewhere (e.g. /opt/homebrew/bin). Remember the real
+        # one so the review LaunuchAgent can pin it in its env.
+        CLAUDE_BIN_ABS="$b"
+      fi
       d="$(cd "$(dirname "$b")" && pwd)"
       case ":$path_dirs:" in *":$d:"*) ;; *) path_dirs="${path_dirs:+$path_dirs:}$d" ;; esac
     fi
@@ -257,6 +264,7 @@ PLIST
   # XML-escape the value before embedding in the plist: a path containing & or
   # < breaks the <string> element and plutil/launchctl reject the job.
   CMUX_FOUND_XML=$(printf '%s' "${CMUX_FOUND:-}" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+  CLAUDE_BIN_XML=$(printf '%s' "${CLAUDE_BIN_ABS:-}" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
   local review_label="${label}-review"
   if [ -z "$CMUX_FOUND" ]; then
     echo "  ! cmux not found (config CMUX_BIN, PATH, or $CMUX_DEFAULT); skipping review LaunchAgent"
@@ -302,6 +310,7 @@ PLIST
         <key>DREAMS_DIR</key><string>$TARGET_PARENT/dreams</string>
         <key>AUTODREAM_TRIAGE_SURFACE</key><string>cmux</string>
         <key>CMUX_BIN</key><string>${CMUX_FOUND_XML}</string>
+        <key>CLAUDE_BIN</key><string>${CLAUDE_BIN_XML}</string>
     </dict>
     <key>StandardOutPath</key>
     <string>$TARGET/logs/review-launch.out.log</string>
