@@ -153,17 +153,21 @@ test_second_trigger_is_deduped(){
 }
 
 # --force must bypass the marker even when a fresh confirmed token is sitting
-# there. It must also keep the existing confirmed state (not delete it).
+# there. It must ALSO stamp its own confirmed token on a first-ever force run
+# (round-3 finding 1: gating the write on CLAIMED meant a first force launch
+# left no token, so the next scheduled trigger opened a duplicate workspace).
 test_force_bypasses_marker(){
   local root; root=$(setup_env)
   mk_report "$root" 2020-01-02 "$REPORT_OPEN"
-  run_review "$root" 2020-01-02                     # stamps confirmed, 1 create
   local before; before=$(cmux_calls "$root")
-  run_review "$root" --force 2020-01-02
-  assert_eq "$(cmux_calls "$root")" "$((before + 1))" "--force opens despite the existing marker"
+  run_review "$root" --force 2020-01-02              # first run is a force
+  assert_eq "$(cmux_calls "$root")" "$((before + 1))" "--force opens despite the marker"
   [ -f "$(marker_confirmed "$root" 2020-01-02)" ] \
-    && ok "--force keeps the confirmed token" \
-    || no "--force removed the confirmed token"
+    && ok "--force stamps its own confirmed token" \
+    || no "--force left no confirmed token (next trigger would re-pop)"
+  # The stamped token must then dedup the routine trigger.
+  run_review "$root" 2020-01-02
+  assert_eq "$(cmux_calls "$root")" "$((before + 1))" "token stamped by --force dedups the next trigger"
 }
 
 # A failed create must release the claim (rmdir) so the next trigger retries,
@@ -341,6 +345,25 @@ test_logs_dir_failure_exits_nonzero(){
   assert_grep "$root/out" 'cannot create logs dir' "logs-dir failure is named"
 }
 
+# A legacy date-only marker that predates the current report (the date was
+# triaged, then the report rebuilt with new content before upgrade) must NOT be
+# migrated onto the new digest — that would mark unreviewed content confirmed
+# and swallow its triage. The report must open again.
+test_legacy_marker_stale_is_not_migrated(){
+  local root; root=$(setup_env)
+  mkdir -p "$root/autodream/logs"
+  # Legacy marker OLDER than the report: touch a stale marker at an ancient
+  # mtime, then write the report after it.
+  touch -t 202006010000 "$root/autodream/logs/review-launched-2020-01-02"
+  mk_report "$root" 2020-01-02 "$REPORT_OPEN"
+  run_review "$root" 2020-01-02
+  assert_eq "$(cmux_calls "$root")" 1 "stale legacy marker does not suppress a rebuilt report"
+  assert_grep "$root/out" 'predates the current report' "stale legacy marker is reported as not migrated"
+  [ -f "$(marker_confirmed "$root" 2020-01-02)" ] \
+    && ok "rebuilt report gets its own confirmed token" \
+    || no "rebuilt report has no confirmed token"
+}
+
 # ---------------------------------------------------------------------------
 
 [ -x "$REVIEW" ] || { echo "FATAL: $REVIEW not executable"; exit 1; }
@@ -357,6 +380,7 @@ test_confirmed_marker_survives_grace
 test_abandoned_claim_is_reclaimed
 test_in_progress_claim_suppresses
 test_legacy_marker_is_migrated
+test_legacy_marker_stale_is_not_migrated
 test_headless_missing_cmux_fails
 test_interactive_missing_cmux_falls_back_inline
 test_logs_dir_failure_exits_nonzero

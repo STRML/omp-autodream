@@ -174,6 +174,13 @@ fi
 # falls through to the normal `exec claude` below.
 if [ "$AUTODREAM_TRIAGE_SURFACE" = "cmux" ]; then
   CMUX="$CMUX_BIN"; [ -x "$CMUX" ] || CMUX=$(command -v cmux 2>/dev/null || true)
+  # Runtime cmux discovery does NOT depend on PATH: CMUX_BIN's default is the
+  # hardcoded /Applications bundle (config-load section above), so the launchd
+  # job's minimal env resolves cmux whenever install.sh's preflight accepted it.
+  # Config CMUX_BIN takes precedence (review.sh preserves it from the config);
+  # install.sh provisions the review job iff the same three-way resolution
+  # (config → PATH → default) finds an executable, so runtime can never diverge
+  # from install time.
   if [ -n "$CMUX" ] && [ -x "$CMUX" ]; then
     # Same-day dedup for the review job's catch-up triggers (08:00/09:15/12:15,
     # provisioned by install.sh like the run job). Whichever trigger fires first
@@ -218,10 +225,22 @@ if [ "$AUTODREAM_TRIAGE_SURFACE" = "cmux" ]; then
     # launch and migrate it to the confirmed token so the new key owns state
     # from here on — otherwise the same report opens a second workspace
     # post-upgrade on the very day it was already triaged.
+    #
+    # But only when the marker is not OLDER than the current report: a date
+    # was triaged, then the report rebuilt for that date (new content, new
+    # digest), the legacy date-only marker must NOT be migrated onto the new
+    # report's key — that would mark unreviewed content as confirmed and
+    # swallow its triage. Compare mtimes: a rebuilt report is newer than the
+    # legacy launch, so we skip the migration and let the fresh digest open.
     LEGACY_MARKER="$LOGS_DIR/review-launched-$DATE"
     if [ -f "$LEGACY_MARKER" ]; then
-      echo "review.sh: migrating legacy marker $LEGACY_MARKER -> $LAUNCH_CONFIRMED"
-      mv "$LEGACY_MARKER" "$LAUNCH_CONFIRMED" 2>/dev/null || true
+      LEGACY_MTIME=$(stat -f %m "$LEGACY_MARKER" 2>/dev/null || echo 0)
+      if [ "$LEGACY_MTIME" -lt "$(stat -f %m "$REPORT" 2>/dev/null || echo 0)" ]; then
+        echo "review.sh: legacy marker $LEGACY_MARKER predates the current report; not migrated (report content changed since)"
+      else
+        echo "review.sh: migrating legacy marker $LEGACY_MARKER -> $LAUNCH_CONFIRMED"
+        mv "$LEGACY_MARKER" "$LAUNCH_CONFIRMED" 2>/dev/null || true
+      fi
     fi
     CLAIM_GRACE=900
     CLAIMED=0
@@ -295,11 +314,6 @@ if [ "$AUTODREAM_TRIAGE_SURFACE" = "cmux" ]; then
       echo "review.sh: cmux workspace create failed (exit $WS_RC); triage not opened" >&2
       exit 1
     fi
-    # The launch succeeded: write the confirmed token so later triggers dedup
-    # on a real launch, not on the claim dir alone (the claim dir is what the
-    # age-based reclaim looks at; an unconfirmed claim gets reclaimed after
-    # CLAIM_GRACE as a possible dead process).
-    [ "$CLAIMED" -eq 1 ] && touch "$LAUNCH_CONFIRMED"
     # Pin the tab title to the date. The shell sets a startup title (the cwd) a
     # beat after creation, so rename a few times across that window; with claude's
     # own title updates disabled above, the rename then holds. Detached + best
@@ -310,6 +324,20 @@ if [ "$AUTODREAM_TRIAGE_SURFACE" = "cmux" ]; then
           sleep 3
           "$CMUX" tab-action --action rename --workspace "$WS_REF" --title "$TAB_TITLE" >/dev/null 2>&1
         done ) &
+    fi
+    # The launch succeeded (create returned 0 AND the workspace ref parsed):
+    # write the confirmed token so later triggers dedup on a real launch. This
+    # is deliberately UNCONDITIONAL on the claim — a --force run skipped the
+    # claim mkdir but is still a real launch, and round-1 stamped on any
+    # successful create. Gating on CLAIMED meant a first force run of the day
+    # left no token, so the next scheduled trigger opened a second workspace.
+    # Requiring the parsed ref (not just rc 0) is the extra guard: a cmux that
+    # exits 0 without producing a workspace does not count as launched.
+    # touch failure (e.g. read-only logs) is reported but not fatal: the
+    # workspace IS open; dropping the claim would make the next trigger open a
+    # duplicate on top of it.
+    if [ -n "$WS_REF" ] && ! touch "$LAUNCH_CONFIRMED" 2>/dev/null; then
+      echo "review.sh: WARNING could not write confirmed token $LAUNCH_CONFIRMED" >&2
     fi
     exit 0
   fi

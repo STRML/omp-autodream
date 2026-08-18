@@ -208,9 +208,10 @@ PLIST
   # Runs review.sh on several morning triggers (catch-up for the same reason as
   # run.sh: a slow run that lands its report after 08:00 still gets its triage
   # popup at the next trigger). review.sh's same-day launch marker (bound to the
-  # report mtime) dedups the triggers, so at most one workspace opens per report.
-  # Env must carry AUTODREAM_TRIAGE_SURFACE=cmux — the whole point is the popup
-  # opening in its own cmux workspace rather than inline in a headless shell.
+  # report content digest) dedups the triggers, so at most one workspace opens
+  # per report. Env must carry AUTODREAM_TRIAGE_SURFACE=cmux — the whole point
+  # is the popup opening in its own cmux workspace rather than inline in a
+  # headless shell.
   #
   # The report to triage is yesterday's (the date run.sh targeted: $DREAMS_DIR/
   # $(date -v-1d).md). review.sh with no date picks the newest report in the dir
@@ -222,15 +223,36 @@ PLIST
   # hasn't landed yet — a scheduled job must not silently triage the wrong day.
   # The review job MUST have cmux or the whole point (the popup) is moot, and a
   # headless inline fallback would silently run claude with no terminal. Skip
-  # provisioning unless cmux is on PATH or sits at review.sh's configured
-  # default — on macOS cmux typically installs under /Applications and is NOT
-  # on PATH, so the PATH check alone would wrongly skip.
+  # provisioning unless cmux resolves at runtime the same way review.sh does:
+  # a config-file CMUX_BIN first, then PATH, then review.sh's default /Applicat-
+  # ions path (macOS GUI installs typically put cmux there and NOT on PATH, so
+  # a PATH-only check would wrongly skip).
+  #
+  # NOTE: the resolved cmux absolute path IS passed through as CMUX_BIN so the
+  # scheduled job resolves the same binary install.sh accepted — the launchd
+  # env's PATH is fixed and a non-default cmux (e.g. ~/bin/cmux) would
+  # otherwise pass the install check but be unfindable at runtime.
+  local cfg_cmux=""
+  if [ -f "$TARGET/config" ]; then
+    # capture an uncommented CMUX_BIN=... line from the config that will ship
+    # with this install (review.sh sources $AUTODREAM_DIR/config at runtime,
+    # so this is the same value the scheduled job will resolve).
+    cfg_cmux=$(sed -n 's/^[[:space:]]*CMUX_BIN=[[:space:]]*//p' "$TARGET/config" | head -1)
+  fi
   CMUX_DEFAULT=/Applications/cmux.app/Contents/Resources/bin/cmux
-  if ! command -v cmux >/dev/null 2>&1 && [ ! -x "$CMUX_DEFAULT" ]; then
-    echo "  ! cmux not found (PATH or $CMUX_DEFAULT); skipping review LaunchAgent"
+  CMUX_FOUND=""
+  { [ -n "$cfg_cmux" ] && [ -x "$cfg_cmux" ]; } && CMUX_FOUND="$cfg_cmux"
+  { [ -z "$CMUX_FOUND" ] && command -v cmux >/dev/null 2>&1; } && CMUX_FOUND=$(command -v cmux)
+  { [ -z "$CMUX_FOUND" ] && [ -x "$CMUX_DEFAULT" ]; } && CMUX_FOUND="$CMUX_DEFAULT"
+  local review_label="${label}-review"
+  if [ -z "$CMUX_FOUND" ]; then
+    echo "  ! cmux not found (config CMUX_BIN, PATH, or $CMUX_DEFAULT); skipping review LaunchAgent"
+    # Unload any previously-provisioned review job even though we're skipping —
+    # a machine that had cmux at install and lost it would otherwise keep the
+    # stale scheduled service firing a failing trigger forever.
+    launchctl bootout "$domain/$review_label" 2>/dev/null || true
     return 0
   fi
-  local review_label="${label}-review"
   local review_plist="$la_dir/$review_label.plist"
   cat > "$review_plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -243,13 +265,16 @@ PLIST
     <array>
         <string>/bin/bash</string>
         <string>-c</string>
-        <string>exec "$TARGET/review.sh" "\$(date -v-1d +%Y-%m-%d)"</string>
+        <string>exec "\$1" "\$(date -v-1d +%Y-%m-%d)"</string>
+        <string>triage</string>
+        <string>$TARGET/review.sh</string>
     </array>
     <key>StartCalendarInterval</key>
     <array>
         <dict><key>Hour</key><integer>8</integer><key>Minute</key><integer>0</integer></dict>
         <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>15</integer></dict>
         <dict><key>Hour</key><integer>12</integer><key>Minute</key><integer>15</integer></dict>
+        <dict><key>Hour</key><integer>15</integer><key>Minute</key><integer>30</integer></dict>
     </array>
     <key>RunAtLoad</key>
     <false/>
@@ -262,6 +287,7 @@ PLIST
         <key>AUTODREAM_DIR</key><string>$TARGET</string>
         <key>DREAMS_DIR</key><string>$TARGET_PARENT/dreams</string>
         <key>AUTODREAM_TRIAGE_SURFACE</key><string>cmux</string>
+        <key>CMUX_BIN</key><string>$CMUX_FOUND</string>
     </dict>
     <key>StandardOutPath</key>
     <string>$TARGET/logs/review-launch.out.log</string>
@@ -270,6 +296,21 @@ PLIST
 </dict>
 </plist>
 PLIST
+
+  # The two shell-command substitutions in ProgramArguments must survive the
+  # heredoc LITERALLY (evaluated at fire time, not install time): the target
+  # path as \$1 and yesterday's date as \$(date ...). If the escaping regressed
+  # and one of them got pre-expanded, the plist carries the frozen value — fail
+  # the install loudly rather than provisioning a job that fires the wrong path
+  # or a wrong date.
+  grep -qF '$(date -v-1d +%Y-%m-%d)' "$review_plist" || {
+    echo "  ! review plist lost the fire-time date expression; aborting" >&2
+    return 1
+  }
+  grep -qF 'exec "$1"' "$review_plist" || {
+    echo "  ! review plist lost the argv path reference; aborting" >&2
+    return 1
+  }
 
   if command -v plutil >/dev/null 2>&1; then
     plutil -lint "$review_plist" >/dev/null || {
