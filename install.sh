@@ -211,6 +211,25 @@ PLIST
   # report mtime) dedups the triggers, so at most one workspace opens per report.
   # Env must carry AUTODREAM_TRIAGE_SURFACE=cmux — the whole point is the popup
   # opening in its own cmux workspace rather than inline in a headless shell.
+  #
+  # The report to triage is yesterday's (the date run.sh targeted: $DREAMS_DIR/
+  # $(date -v-1d).md). review.sh with no date picks the newest report in the dir
+  # — which at 08:00 is NOT necessarily yesterday's, it's whatever is newest, so
+  # a still-running overnight report sets up the job to triage an OLDER one.
+  # Pass yesterday's date explicitly (evaluated at fire time, not install time:
+  # the \$(...) is escaped so the plist bakes the expression, not a frozen
+  # date). review.sh fails fast with "no autodream report found" if yesterday's
+  # hasn't landed yet — a scheduled job must not silently triage the wrong day.
+  # The review job MUST have cmux or the whole point (the popup) is moot, and a
+  # headless inline fallback would silently run claude with no terminal. Skip
+  # provisioning unless cmux is on PATH or sits at review.sh's configured
+  # default — on macOS cmux typically installs under /Applications and is NOT
+  # on PATH, so the PATH check alone would wrongly skip.
+  CMUX_DEFAULT=/Applications/cmux.app/Contents/Resources/bin/cmux
+  if ! command -v cmux >/dev/null 2>&1 && [ ! -x "$CMUX_DEFAULT" ]; then
+    echo "  ! cmux not found (PATH or $CMUX_DEFAULT); skipping review LaunchAgent"
+    return 0
+  fi
   local review_label="${label}-review"
   local review_plist="$la_dir/$review_label.plist"
   cat > "$review_plist" <<PLIST
@@ -223,7 +242,8 @@ PLIST
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>$TARGET/review.sh</string>
+        <string>-c</string>
+        <string>exec "$TARGET/review.sh" "\$(date -v-1d +%Y-%m-%d)"</string>
     </array>
     <key>StartCalendarInterval</key>
     <array>

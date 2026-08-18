@@ -177,39 +177,86 @@ if [ "$AUTODREAM_TRIAGE_SURFACE" = "cmux" ]; then
   if [ -n "$CMUX" ] && [ -x "$CMUX" ]; then
     # Same-day dedup for the review job's catch-up triggers (08:00/09:15/12:15,
     # provisioned by install.sh like the run job). Whichever trigger fires first
-    # after the report lands opens the workspace and stamps a marker; later
-    # triggers for the same date honor it instead of opening a second workspace
-    # on top of the first. --force bypasses the marker, so a deliberately
-    # relaunched triage still works.
+    # after the report lands opens the workspace and stamps a confirmed marker;
+    # later triggers for the same date honor it instead of opening a second
+    # workspace on top of the first. --force bypasses the marker, so a
+    # deliberately relaunched triage still works.
     #
-    # The marker binds to the REPORT's mtime (not just the date): rebuilding a
-    # date with AUTODREAM_FORCE=1 produces a new report, so a normal review of
-    # the rebuilt report must not be swallowed by the previous report's marker.
-    # The claim is atomic (mkdir, which fails if the dir already exists) so two
+    # The marker binds to the REPORT's content digest (not just the date):
+    # rebuilding a date with AUTODREAM_FORCE=1 produces a new report, whose new
+    # digest invalidates the old marker and lets the popup re-trigger. The claim
+    # is atomic (mkdir, which fails if the dir already exists) so two
     # overlapping triggers cannot both pass the check before either stamps.
     LOGS_DIR="$AUTODREAM_DIR/logs"
-    mkdir -p "$LOGS_DIR"
-    REPORT_MTIME=$(stat -f %m "$REPORT" 2>/dev/null || echo 0)
-    LAUNCH_MARKER="$LOGS_DIR/review-launched-$DATE-$REPORT_MTIME"
-    if [ "$FORCE" -eq 0 ] && [ -e "$LAUNCH_MARKER" ]; then
-      echo "review.sh: $DATE triage already launched for this report (marker $LAUNCH_MARKER)"
-      echo "  open anyway: $(basename "$0") --force $DATE"
-      exit 0
+    # Fail loudly if the logs dir can't be made: a subsequent claim-mkdir
+    # failure would otherwise be misreported as "another invocation" and
+    # silently drop triage.
+    if ! mkdir -p "$LOGS_DIR"; then
+      echo "review.sh: cannot create logs dir $LOGS_DIR" >&2
+      exit 1
     fi
+    # Report identity key: a content digest, not mtime. mtime is
+    # seconds-resolution, so a same-second rebuild shares a marker and its
+    # triage is silently swallowed. The digest changes whenever the report
+    # content changes, which is exactly the rebuild signal. Fall back to the
+    # mtime if shasum is somehow unavailable (a 64-char dir name is the only
+    # cost either way).
+    REPORT_KEY=$(shasum -a 256 "$REPORT" 2>/dev/null | awk '{print $1}')
+    # The assignment's exit status is awk's (0 even on empty input), so a
+    # failing/missing shasum must be detected by emptiness, not rc — an empty
+    # key would collapse every report that day to the same marker. Fall back
+    # to the mtime (a failed shasum is the only path that lands here).
+    [ -n "$REPORT_KEY" ] || REPORT_KEY="mtime-$(stat -f %m "$REPORT" 2>/dev/null || echo 0)"
+    LAUNCH_MARKER="$LOGS_DIR/review-launched-$DATE-$REPORT_KEY"
+    # Confirmation lives as a SIBLING file, not inside the claim dir: the
+    # stale-reap below uses `find -delete` (rmdir semantics), which silently
+    # fails on a non-empty dir. Kept separate, the claim dir stays empty and
+    # both names still match the review-launched-* prune glob.
+    LAUNCH_CONFIRMED="$LAUNCH_MARKER.confirmed"
+    # Users upgrading from the round-1 code carry a touch-created FILE
+    # review-launched-$DATE (date-bound, no content key). Honor it as a real
+    # launch and migrate it to the confirmed token so the new key owns state
+    # from here on — otherwise the same report opens a second workspace
+    # post-upgrade on the very day it was already triaged.
+    LEGACY_MARKER="$LOGS_DIR/review-launched-$DATE"
+    if [ -f "$LEGACY_MARKER" ]; then
+      echo "review.sh: migrating legacy marker $LEGACY_MARKER -> $LAUNCH_CONFIRMED"
+      mv "$LEGACY_MARKER" "$LAUNCH_CONFIRMED" 2>/dev/null || true
+    fi
+    CLAIM_GRACE=900
     CLAIMED=0
     if [ "$FORCE" -eq 0 ]; then
-      # Atomic claim: mkdir fails if another invocation won the race. The claim
-      # dir doubles as the marker, so a successful launch leaves it behind for
-      # later triggers to honor.
+      # Already confirmed -> definitely launched. Skip.
+      if [ -e "$LAUNCH_CONFIRMED" ]; then
+        echo "review.sh: $DATE triage already launched for this report (marker $LAUNCH_CONFIRMED)"
+        echo "  open anyway: $(basename "$0") --force $DATE"
+        exit 0
+      fi
+      # A claim dir with no confirmed token is either an in-flight launch or
+      # an abandoned one (the process died while cmux was blocked). Age
+      # bounds it: younger than CLAIM_GRACE is in-progress; older is a dead
+      # claim to reclaim, so a killed popup can never suppress triggers
+      # forever.
+      if [ -d "$LAUNCH_MARKER" ]; then
+        MARKER_AGE=$(( $(date +%s) - $(stat -f %m "$LAUNCH_MARKER" 2>/dev/null || echo "$(date +%s)") ))
+        if [ "$MARKER_AGE" -ge "$CLAIM_GRACE" ]; then
+          echo "review.sh: reclaiming abandoned claim $LAUNCH_MARKER"
+          rmdir "$LAUNCH_MARKER" 2>/dev/null || true
+        else
+          echo "review.sh: $DATE triage launch already in progress by another invocation"
+          exit 0
+        fi
+      fi
+      # Atomic claim: mkdir fails if another invocation won the race.
       if ! mkdir "$LAUNCH_MARKER" 2>/dev/null; then
         echo "review.sh: $DATE triage launch already in progress by another invocation"
         exit 0
       fi
       CLAIMED=1
-      # Reap stale markers so the dedup state cannot grow unbounded (they are
-      # empty dirs, one per report mtime; anything older than 14 days has been
-      # superseded long since).
-      find "$LOGS_DIR" -maxdepth 1 -type d -name 'review-launched-*' -mtime +14 -delete 2>/dev/null || true
+      # Reap stale state so it cannot grow unbounded: claim dirs and confirmed
+      # tokens older than 14 days. `-delete` handles both the empty dir and its
+      # sibling file.
+      find "$LOGS_DIR" -maxdepth 1 -name 'review-launched-*' -mtime +14 -delete 2>/dev/null || true
     fi
     SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
     # Workspace + tab are named after the triaged date (ISO, i.e. the report's
@@ -248,6 +295,11 @@ if [ "$AUTODREAM_TRIAGE_SURFACE" = "cmux" ]; then
       echo "review.sh: cmux workspace create failed (exit $WS_RC); triage not opened" >&2
       exit 1
     fi
+    # The launch succeeded: write the confirmed token so later triggers dedup
+    # on a real launch, not on the claim dir alone (the claim dir is what the
+    # age-based reclaim looks at; an unconfirmed claim gets reclaimed after
+    # CLAIM_GRACE as a possible dead process).
+    [ "$CLAIMED" -eq 1 ] && touch "$LAUNCH_CONFIRMED"
     # Pin the tab title to the date. The shell sets a startup title (the cwd) a
     # beat after creation, so rename a few times across that window; with claude's
     # own title updates disabled above, the rename then holds. Detached + best
@@ -261,7 +313,18 @@ if [ "$AUTODREAM_TRIAGE_SURFACE" = "cmux" ]; then
     fi
     exit 0
   fi
-  echo "review.sh: cmux not found ($CMUX_BIN); falling back to inline triage" >&2
+  if [ -t 0 ]; then
+    # Interactive manual run (terminal): falling through to the inline claude
+    # session below is right — the user is watching this terminal.
+    echo "review.sh: cmux not found ($CMUX_BIN); falling back to inline triage" >&2
+  else
+    # Non-interactive (the launchd review job, ssh, a script): a headless
+    # `exec claude` has no TTY to talk to — the session hangs or exits
+    # uselessly and the marker was never confirmed, so every trigger retries
+    # forever and no popup ever happens. Fail the trigger loudly instead.
+    echo "review.sh: cmux not found ($CMUX_BIN) and stdin is not a TTY; aborting scheduled triage (no headless launch)" >&2
+    exit 1
+  fi
 fi
 
 REPORT_BYTES=$(wc -c < "$REPORT" | tr -d ' ')
