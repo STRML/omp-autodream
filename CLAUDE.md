@@ -261,6 +261,8 @@ The suite pins `AUTODREAM_CONFIG` into its sandbox now that `run.sh` sources the
 
 `tests/review-skip.sh` covers `bin/review.sh`'s skip/launch decision against fixture reports, with an inline mock claude that just touches a marker file — if the marker exists, review.sh reached `exec claude`. It pins `AUTODREAM_CONFIG` to a nonexistent path so the host's own config (`AUTODREAM_TRIAGE_SURFACE=cmux`) can't leak in and spawn a real workspace mid-test. Run it after any review.sh change, and after changing PROMPT.md's Open-questions marker contract.
 
+`tests/review-cmux.sh` covers `bin/review.sh`'s `AUTODREAM_TRIAGE_SURFACE=cmux` launch path (the morning review job's workspace popup) with a mock cmux binary — no real workspace ever spawns. It pins the same-day dedup marker contract against the report: first trigger opens and stamps, a same-day same-mtime trigger is deduped, `--force` bypasses the marker, a failed create releases the claim and exits non-zero, the marker binds to the report mtime (a rebuilt report opens again), stale markers >14 days get reaped, and two different dates with identical mtimes don't collide. Run it after any change to the cmux branch of review.sh.
+
 ## Gotchas (host environment)
 
 - The user's shell rewrites `grep` to `rtk grep`, which rejects some flags (`-h`); prefer `tail`/`rg`-style invocations when scripting against logs interactively.
