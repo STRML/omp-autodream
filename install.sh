@@ -203,6 +203,63 @@ PLIST
   launchctl bootout   "$domain/$label" 2>/dev/null || true
   launchctl bootstrap "$domain" "$target_plist"
   echo "  scheduled: $label  (daily 03:15/06:15/09:15/12:15)  -> $target_plist"
+
+  # ---- Review triage LaunchAgent ----
+  # Runs review.sh on several morning triggers (catch-up for the same reason as
+  # run.sh: a slow run that lands its report after 08:00 still gets its triage
+  # popup at the next trigger). review.sh's same-day launch marker (bound to the
+  # report mtime) dedups the triggers, so at most one workspace opens per report.
+  # Env must carry AUTODREAM_TRIAGE_SURFACE=cmux — the whole point is the popup
+  # opening in its own cmux workspace rather than inline in a headless shell.
+  local review_label="${label}-review"
+  local review_plist="$la_dir/$review_label.plist"
+  cat > "$review_plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$review_label</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$TARGET/review.sh</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Hour</key><integer>8</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>15</integer></dict>
+        <dict><key>Hour</key><integer>12</integer><key>Minute</key><integer>15</integer></dict>
+    </array>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key><string>$path_val</string>
+        <key>HOME</key><string>$HOME</string>
+        <key>AUTODREAM_DIR</key><string>$TARGET</string>
+        <key>DREAMS_DIR</key><string>$TARGET_PARENT/dreams</string>
+        <key>AUTODREAM_TRIAGE_SURFACE</key><string>cmux</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>$TARGET/logs/review-launch.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>$TARGET/logs/review-launch.err.log</string>
+</dict>
+</plist>
+PLIST
+
+  if command -v plutil >/dev/null 2>&1; then
+    plutil -lint "$review_plist" >/dev/null || {
+      echo "  ! generated review plist failed plutil lint: $review_plist" >&2
+      return 1
+    }
+  fi
+  launchctl bootout   "$domain/$review_label" 2>/dev/null || true
+  launchctl bootstrap "$domain" "$review_plist"
+  echo "  scheduled: $review_label  (daily 08:00/09:15/12:15)  -> $review_plist"
 }
 
 echo

@@ -37,6 +37,7 @@ AUTODREAM_DIR="${AUTODREAM_DIR:-}"
 if [ -z "$AUTODREAM_DIR" ]; then
   AUTODREAM_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
   if [ -z "$AUTODREAM_DIR" ] || { [ ! -f "$AUTODREAM_DIR/config" ] && [ ! -f "$AUTODREAM_DIR/l1-no-advisor.yml" ]; }; then
+    echo "review.sh: WARNING no install markers next to $0; falling back to legacy $HOME/.claude/autodream" >&2
     AUTODREAM_DIR="$HOME/.claude/autodream"
   fi
 fi
@@ -174,17 +175,41 @@ fi
 if [ "$AUTODREAM_TRIAGE_SURFACE" = "cmux" ]; then
   CMUX="$CMUX_BIN"; [ -x "$CMUX" ] || CMUX=$(command -v cmux 2>/dev/null || true)
   if [ -n "$CMUX" ] && [ -x "$CMUX" ]; then
-    # Same-day dedup for the launchd review job's catch-up triggers (08:00 /
-    # catch-up later, mirroring run.sh's multi-trigger schedule). Whichever
-    # trigger fires first after the report lands opens the workspace and stamps
-    # a marker; later triggers for the same date honor it instead of opening a
-    # second workspace on top of the first. --force bypasses the marker, so a
-    # deliberately relaunched triage still works.
-    LAUNCH_MARKER="$AUTODREAM_DIR/logs/review-launched-$DATE"
-    if [ "$FORCE" -eq 0 ] && [ -f "$LAUNCH_MARKER" ]; then
-      echo "review.sh: $DATE triage already launched today (workspace); skipping duplicate (marker $LAUNCH_MARKER)"
+    # Same-day dedup for the review job's catch-up triggers (08:00/09:15/12:15,
+    # provisioned by install.sh like the run job). Whichever trigger fires first
+    # after the report lands opens the workspace and stamps a marker; later
+    # triggers for the same date honor it instead of opening a second workspace
+    # on top of the first. --force bypasses the marker, so a deliberately
+    # relaunched triage still works.
+    #
+    # The marker binds to the REPORT's mtime (not just the date): rebuilding a
+    # date with AUTODREAM_FORCE=1 produces a new report, so a normal review of
+    # the rebuilt report must not be swallowed by the previous report's marker.
+    # The claim is atomic (mkdir, which fails if the dir already exists) so two
+    # overlapping triggers cannot both pass the check before either stamps.
+    LOGS_DIR="$AUTODREAM_DIR/logs"
+    mkdir -p "$LOGS_DIR"
+    REPORT_MTIME=$(stat -f %m "$REPORT" 2>/dev/null || echo 0)
+    LAUNCH_MARKER="$LOGS_DIR/review-launched-$DATE-$REPORT_MTIME"
+    if [ "$FORCE" -eq 0 ] && [ -e "$LAUNCH_MARKER" ]; then
+      echo "review.sh: $DATE triage already launched for this report (marker $LAUNCH_MARKER)"
       echo "  open anyway: $(basename "$0") --force $DATE"
       exit 0
+    fi
+    CLAIMED=0
+    if [ "$FORCE" -eq 0 ]; then
+      # Atomic claim: mkdir fails if another invocation won the race. The claim
+      # dir doubles as the marker, so a successful launch leaves it behind for
+      # later triggers to honor.
+      if ! mkdir "$LAUNCH_MARKER" 2>/dev/null; then
+        echo "review.sh: $DATE triage launch already in progress by another invocation"
+        exit 0
+      fi
+      CLAIMED=1
+      # Reap stale markers so the dedup state cannot grow unbounded (they are
+      # empty dirs, one per report mtime; anything older than 14 days has been
+      # superseded long since).
+      find "$LOGS_DIR" -maxdepth 1 -type d -name 'review-launched-*' -mtime +14 -delete 2>/dev/null || true
     fi
     SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
     # Workspace + tab are named after the triaged date (ISO, i.e. the report's
@@ -198,23 +223,37 @@ if [ "$AUTODREAM_TRIAGE_SURFACE" = "cmux" ]; then
     # The workspace re-runs this script with the surface forced to inline so it
     # falls through to the exec claude below. CLAUDE_CODE_DISABLE_TERMINAL_TITLE
     # stops claude live-rewriting the tab title over our pinned date.
+    #
+    # The inner command is a shell string cmux will run, so every interpolated
+    # value is %q-quoted: paths (DREAMS_DIR, CLAUDE_BIN, SELF) and DATE may
+    # legitimately contain apostrophes (e.g. an install under /tmp/O'Brien),
+    # and an unquoted one would break the inner shell parse. $FORCE_ARG is
+    # generated here and can only be empty or " --force", so it stays literal.
+    shq(){ printf '%q' "$1"; }
+    INNER_CMD="env AUTODREAM_TRIAGE_SURFACE=inline CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 DREAMS_DIR=$(shq "$DREAMS_DIR") CLAUDE_BIN=$(shq "$CLAUDE_BIN") $(shq "$SELF") $(shq "$DATE")$FORCE_ARG"
     WS_OUT=$("$CMUX" workspace create \
       --name "$DATE Autodream Triage" \
       --cwd "$HOME" \
-      --command "env AUTODREAM_TRIAGE_SURFACE=inline CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 DREAMS_DIR='$DREAMS_DIR' CLAUDE_BIN='$CLAUDE_BIN' '$SELF' '$DATE'$FORCE_ARG" \
+      --command "$INNER_CMD" \
       --focus "$AUTODREAM_TRIAGE_FOCUS" 2>&1)
+    WS_RC=$?
     echo "$WS_OUT"
+    # A failed create must not be treated as a launch: release the claim so the
+    # next trigger retries, and exit non-zero so a scheduled job can't think the
+    # triage happened. Without the exit check, a cmux that fails but prints
+    # workspace-like output would also satisfy the ref parse below and latch a
+    # false marker.
+    if [ "$WS_RC" -ne 0 ]; then
+      [ "$CLAIMED" -eq 1 ] && rmdir "$LAUNCH_MARKER" 2>/dev/null || true
+      echo "review.sh: cmux workspace create failed (exit $WS_RC); triage not opened" >&2
+      exit 1
+    fi
     # Pin the tab title to the date. The shell sets a startup title (the cwd) a
     # beat after creation, so rename a few times across that window; with claude's
     # own title updates disabled above, the rename then holds. Detached + best
     # effort so review.sh returns immediately and a failure never affects triage.
     WS_REF=$(printf '%s\n' "$WS_OUT" | sed -n 's/.*\(workspace:[0-9][0-9]*\).*/\1/p' | head -1)
     if [ -n "$WS_REF" ]; then
-      # Only stamp on a confirmed create. A false marker would silently swallow
-      # a real popup (later triggers would skip a report that never actually
-      # surfaced); an empty stamp on failure just risks a duplicate retry.
-      mkdir -p "$(dirname "$LAUNCH_MARKER")"
-      touch "$LAUNCH_MARKER"
       ( for _ in 1 2 3; do
           sleep 3
           "$CMUX" tab-action --action rename --workspace "$WS_REF" --title "$TAB_TITLE" >/dev/null 2>&1

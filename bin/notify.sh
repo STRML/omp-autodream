@@ -33,9 +33,14 @@ AUTODREAM_DIR="${AUTODREAM_DIR:-}"
 if [ -z "$AUTODREAM_DIR" ]; then
   AUTODREAM_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
   if [ -z "$AUTODREAM_DIR" ] || { [ ! -f "$AUTODREAM_DIR/config" ] && [ ! -f "$AUTODREAM_DIR/l1-no-advisor.yml" ]; }; then
+    echo "notify.sh: WARNING no install markers next to $0; falling back to legacy $HOME/.claude/autodream" >&2
     AUTODREAM_DIR="$HOME/.claude/autodream"
   fi
 fi
+# Exported so child processes (make-notifier.sh) resolve the same install dir.
+# Without this, the child's own AUTODREAM_DIR default falls back to the legacy
+# ~/.claude/autodream and the branded notifier bundle lands in the wrong place.
+export AUTODREAM_DIR
 INBOX_DIR="$AUTODREAM_DIR/inbox"
 # How the inbox file gets opened. This is a shell snippet, not a binary path, so an
 # editor that needs flags ("code -g") works without a wrapper. The default is plain
