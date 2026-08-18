@@ -239,15 +239,17 @@ PLIST
   # scheduled job resolves the same binary install.sh accepted — the launchd
   # env's PATH is fixed and a non-default cmux (e.g. ~/bin/cmux) would
   # otherwise pass the install check but be unfindable at runtime.
-  local cfg_cmux=""
+  local cfg_cmux="" cfg_claude=""
   if [ -f "$TARGET/config" ]; then
-    # Read CMUX_BIN with the SAME semantics review.sh uses at runtime (it
-    # sources this config as Bash): a subshell apply handles $HOME/~ expansion
-    # and quotes correctly. A sed/raw-read would grab literal quote characters
-    # from `CMUX_BIN="$HOME/bin/cmux"` and fail the -x test, wrongly skipping
-    # (and unloading) the review agent for a perfectly valid config.
+    # Read CMUX_BIN and CLAUDE_BIN with the SAME semantics review.sh uses at
+    # runtime (it sources this config as Bash): a subshell apply handles $HOME/~
+    # expansion and quotes correctly. A sed/raw-read would grab literal quote
+    # characters from `CMUX_BIN="$HOME/bin/cmux"` and fail the -x test, wrongly
+    # skipping (and unloading) the review agent for a perfectly valid config.
     cfg_cmux=$( autodream_cfg_scope=${TARGET}/config; bash -c 'unset CMUX_BIN; . "$1" >/dev/null 2>&1; printf "%s" "${CMUX_BIN:-}"' _ "$autodream_cfg_scope" )
     cfg_cmux=${cfg_cmux//\"/}
+    cfg_claude=$( autodream_cfg_scope=${TARGET}/config; bash -c 'unset CLAUDE_BIN; . "$1" >/dev/null 2>&1; printf "%s" "${CLAUDE_BIN:-}"' _ "$autodream_cfg_scope" )
+    cfg_claude=${cfg_claude//\"/}
   fi
   CMUX_DEFAULT=/Applications/cmux.app/Contents/Resources/bin/cmux
   CMUX_FOUND=""
@@ -264,13 +266,28 @@ PLIST
   # XML-escape the value before embedding in the plist: a path containing & or
   # < breaks the <string> element and plutil/launchctl reject the job.
   CMUX_FOUND_XML=$(printf '%s' "${CMUX_FOUND:-}" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
-  CLAUDE_BIN_XML=$(printf '%s' "${CLAUDE_BIN_ABS:-}" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+  # Effective CLAUDE_BIN for the scheduled job: a config-set value wins (the
+  # user explicitly chose a wrapper/custom claude — env must not override it at
+  # runtime, review.sh restores env over config), else fall back to the
+  # PATH-discovered binary. Require a regular executable FILE (-f AND -x): a
+  # directory passes -x but `exec <dir>` fails immediately, confirming a dead
+  # workspace (auditor 7.2/7.3).
+  local eff_claude="${cfg_claude:-$CLAUDE_BIN_ABS}"
+  if [ -z "$eff_claude" ] || [ ! -f "$eff_claude" ] || [ ! -x "$eff_claude" ]; then
+    echo "  ! claude binary not usable ($eff_claude); review LaunchAgent will abort every trigger"
+    eff_claude=""
+  fi
+  CLAUDE_BIN_XML=$(printf '%s' "$eff_claude" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
   local review_label="${label}-review"
-  if [ -z "$CMUX_FOUND" ]; then
-    echo "  ! cmux not found (config CMUX_BIN, PATH, or $CMUX_DEFAULT); skipping review LaunchAgent"
+  if [ -z "$CMUX_FOUND" ] || [ -z "$eff_claude" ]; then
+    if [ -z "$CMUX_FOUND" ]; then
+      echo "  ! cmux not found (config CMUX_BIN, PATH, or $CMUX_DEFAULT); skipping review LaunchAgent"
+    else
+      echo "  ! claude binary not usable; skipping review LaunchAgent"
+    fi
     # Unload any previously-provisioned review job even though we're skipping —
-    # a machine that had cmux at install and lost it would otherwise keep the
-    # stale scheduled service firing a failing trigger forever.
+    # a machine that had cmux/claude at install and lost one would otherwise
+    # keep the stale scheduled service firing a failing trigger forever.
     launchctl bootout "$domain/$review_label" 2>/dev/null || true
     return 0
   fi

@@ -149,6 +149,7 @@ test_second_trigger_is_deduped(){
   AUTODREAM_CONFIG="$root/nonexistent-config" \
   AUTODREAM_TRIAGE_SURFACE=cmux \
   CMUX_BIN="$root/cmux-mock.sh" \
+  CLAUDE_BIN="$root/claude-mock.sh" \
   CMUX_LOG="$root/cmux.log" \
   DREAMS_DIR="$root/dreams" \
   bash "$REVIEW" 2020-01-02 > "$root/out2" 2>&1 || rc=$?
@@ -369,6 +370,7 @@ test_unwritable_claim_dir_fails(){
     AUTODREAM_CONFIG="$root/nonexistent-config" \
     AUTODREAM_TRIAGE_SURFACE=cmux \
     CMUX_BIN="$root/cmux-mock.sh" \
+    CLAUDE_BIN="$root/claude-mock.sh" \
     CMUX_LOG="$root/cmux.log" \
     DREAMS_DIR="$root/dreams" \
     bash "$REVIEW" 2020-01-02 > "$root/out" 2>&1 || rc=$?
@@ -477,6 +479,7 @@ MOCK
     AUTODREAM_CONFIG="$root/nonexistent-config" \
     AUTODREAM_TRIAGE_SURFACE=cmux \
     CMUX_BIN="$root/cmux-noref.sh" \
+    CLAUDE_BIN="$root/claude-mock.sh" \
     CMUX_LOG="$root/cmux.log" \
     DREAMS_DIR="$root/dreams" \
     bash "$REVIEW" 2020-01-02 > "$root/out" 2>&1 || rc=$?
@@ -489,11 +492,32 @@ MOCK
     AUTODREAM_CONFIG="$root/nonexistent-config" \
     AUTODREAM_TRIAGE_SURFACE=cmux \
     CMUX_BIN="$root/cmux-noref.sh" \
+    CLAUDE_BIN="$root/claude-mock.sh" \
     CMUX_LOG="$root/cmux.log" \
     DREAMS_DIR="$root/dreams" \
     bash "$REVIEW" 2020-01-02 > "$root/out2" 2>&1 || rc=$?
   assert_eq "$(cmux_calls "$root")" 1 "confirmed empty-ref launch dedups the next trigger"
   assert_grep "$root/out2" 'already launched for this report' "dedup notice fired"
+}
+
+# A late upgrade (>14 days after round-1's launch) still migrates: the legacy
+# marker carries an old mtime, and mv would preserve it into the confirmed
+# token — which the unconditional 14-day reap would then delete immediately,
+# reopening the workspace (deepseek 7.3). The post-migration touch must rebind
+# the token's mtime to now so it survives the prune.
+test_legacy_marker_late_upgrade_survives_prune(){
+  local root; root=$(setup_env)
+  mkdir -p "$root/autodream/logs"
+  # Report older still: legacy launch is AFTER the report (migrates) but both
+  # are >14 days old (would be pruned).
+  touch -t 202001011200 "$root/dreams/2020-01-02.md"
+  touch -t 202001021200 "$root/autodream/logs/review-launched-2020-01-02"
+  run_review "$root" 2020-01-02
+  assert_eq "$(cmux_calls "$root")" 0 "late-upgrade legacy marker suppresses a duplicate launch"
+  assert_grep "$root/out" 'migrating legacy marker' "late-upgrade migration is reported"
+  [ -f "$(marker_confirmed "$root" 2020-01-02)" ] \
+    && ok "late-upgrade migrated token survives the 14-day reap" \
+    || no "late-upgrade migrated token was pruned (duplicate popup)"
 }
 
 # ---------------------------------------------------------------------------
@@ -514,6 +538,7 @@ test_in_progress_claim_suppresses
 test_legacy_marker_is_migrated
 test_legacy_marker_stale_is_not_migrated
 test_legacy_marker_same_second_tie_not_migrated
+test_legacy_marker_late_upgrade_survives_prune
 test_headless_missing_cmux_fails
 test_interactive_missing_cmux_falls_back_inline
 test_logs_dir_failure_exits_nonzero

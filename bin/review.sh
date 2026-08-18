@@ -232,6 +232,18 @@ if [ "$AUTODREAM_TRIAGE_SURFACE" = "cmux" ]; then
     # from here on — otherwise the same report opens a second workspace
     # post-upgrade on the very day it was already triaged.
     #
+    if [ ! -f "$CLAUDE_BIN" ] || [ ! -x "$CLAUDE_BIN" ]; then
+      echo "review.sh: claude binary not found or not executable ($CLAUDE_BIN); not launching triage workspace" >&2
+      exit 1
+    fi
+    # Legacy round-1 marker migration, gated on the SAME preflight as a real
+    # launch: stamping a confirmed token for a workspace whose claude cannot run
+    # would make every later trigger dedupe a report that was never triaged
+    # (deepseek 7.4). The mv PRESERVES the legacy marker's mtime, which on a
+    # late upgrade (>14 days) would be pruned immediately by the reap below —
+    # touch rebinds the token's mtime to now so the just-created migration
+    # survives (deepseek 7.3).
+    #
     # But only when the marker is strictly NEWER than the current report: a
     # date was triaged, then the report rebuilt for that date (new content, new
     # digest), the legacy date-only marker must NOT be migrated onto the new
@@ -245,25 +257,13 @@ if [ "$AUTODREAM_TRIAGE_SURFACE" = "cmux" ]; then
       LEGACY_MTIME=$(stat -f %m "$LEGACY_MARKER" 2>/dev/null || echo 0)
       if [ "$LEGACY_MTIME" -gt "$(stat -f %m "$REPORT" 2>/dev/null || echo 0)" ]; then
         echo "review.sh: migrating legacy marker $LEGACY_MARKER -> $LAUNCH_CONFIRMED"
-        mv "$LEGACY_MARKER" "$LAUNCH_CONFIRMED" 2>/dev/null || true
+        mv "$LEGACY_MARKER" "$LAUNCH_CONFIRMED" 2>/dev/null && touch "$LAUNCH_CONFIRMED"
       else
         echo "review.sh: legacy marker $LEGACY_MARKER not newer than the current report; not migrated (may be rebuilt content)"
       fi
     fi
     CLAIM_GRACE=900
     CLAIMED_OWN=0
-    # A workspace that opens but whose embedded claude can't start is a waste:
-    # the confirmed token (below) is written on cmux success, so a missing
-    # CLAUDE_BIN would make every future trigger dedupe on a token whose session
-    # died in the workspace. Preflight the EXACT path we pass into the workspace
-    # env (CLAUDE_BIN resolves to $HOME/.local/bin/claude by default, or
-    # config/env). This runs BEFORE the claim is acquired: a missing binary must
-    # not leak a fresh claim that suppresses later triggers as "in progress"
-    # for the grace window (auditor 6.1 / deepseek 6.1 / executor 6.2).
-    if [ ! -x "$CLAUDE_BIN" ]; then
-      echo "review.sh: claude binary not found ($CLAUDE_BIN); not launching triage workspace" >&2
-      exit 1
-    fi
     # Reap stale state so it cannot grow unbounded: claim dirs and confirmed
     # tokens older than 14 days. `-delete` handles both the empty dir and its
     # sibling file. Unconditional on --force: the force path is exactly the
