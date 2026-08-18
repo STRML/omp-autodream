@@ -24,7 +24,18 @@ set -u
 
 REPORT="${1:?Usage: notify.sh <report.md>}"
 DATE=$(basename "$REPORT" .md)
-AUTODREAM_DIR="${AUTODREAM_DIR:-$HOME/.claude/autodream}"
+# The install symlinks the scripts INTO $AUTODREAM_DIR (install.sh), so a bare
+# shell invocation with no env resolves the install dir from this script's own
+# location instead of the legacy ~/.claude/autodream default (the OMP port
+# installs under ~/.omp/agent/autodream). Env still wins; the derived dir is
+# only trusted when it carries an install marker file (install.sh writes both).
+AUTODREAM_DIR="${AUTODREAM_DIR:-}"
+if [ -z "$AUTODREAM_DIR" ]; then
+  AUTODREAM_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+  if [ -z "$AUTODREAM_DIR" ] || { [ ! -f "$AUTODREAM_DIR/config" ] && [ ! -f "$AUTODREAM_DIR/l1-no-advisor.yml" ]; }; then
+    AUTODREAM_DIR="$HOME/.claude/autodream"
+  fi
+fi
 INBOX_DIR="$AUTODREAM_DIR/inbox"
 # How the inbox file gets opened. This is a shell snippet, not a binary path, so an
 # editor that needs flags ("code -g") works without a wrapper. The default is plain

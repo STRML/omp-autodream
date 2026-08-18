@@ -5,7 +5,7 @@
 #   L1: For each of yesterday's session JSONLs, spawn a parallel `omp --model deepseek-v4-flash`
 #       running SESSION_TRIAGE.md → writes one findings.json per session.
 #   L2: One `omp --model claude-opus-5` running PROMPT.md → reads all findings JSONs,
-#       writes $DREAMS_DIR/YYYY-MM-DD.md, updates project MEMORY.md files.
+#       writes $DREAMS_DIR/YYYY-MM-DD.md.
 #
 # Usage:
 #   ./run.sh             # process yesterday
@@ -69,7 +69,18 @@ if [ -n "${PROJECTS_DIR+x}" ]; then
 else
   PROJECTS_DIR="$HOME/.omp/agent/sessions"
 fi
-AUTODREAM_DIR="${AUTODREAM_DIR:-$HOME/.claude/autodream}"
+# The install symlinks the scripts INTO $AUTODREAM_DIR (install.sh), so a bare
+# shell invocation with no env resolves the install dir from this script's own
+# location instead of the legacy ~/.claude/autodream default (the OMP port
+# installs under ~/.omp/agent/autodream). Env still wins; the derived dir is
+# only trusted when it carries an install marker file (install.sh writes both).
+AUTODREAM_DIR="${AUTODREAM_DIR:-}"
+if [ -z "$AUTODREAM_DIR" ]; then
+  AUTODREAM_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+  if [ -z "$AUTODREAM_DIR" ] || { [ ! -f "$AUTODREAM_DIR/config" ] && [ ! -f "$AUTODREAM_DIR/l1-no-advisor.yml" ]; }; then
+    AUTODREAM_DIR="$HOME/.claude/autodream"
+  fi
+fi
 # Advisor-off overlay, passed as --config to every headless worker (L1 + L2) so no
 # worker boots the opus advisor (verified: it fires in print mode otherwise). install.sh
 # writes this file; it must exist before the first worker dispatch.
@@ -135,7 +146,7 @@ if [ -f "$AUTODREAM_DIR/x-credentials" ]; then
   . "$AUTODREAM_DIR/x-credentials" 2>/dev/null || true
   set -u
 fi
-DREAMS_DIR="${DREAMS_DIR:-$HOME/.claude/dreams}"
+DREAMS_DIR="${DREAMS_DIR:-$(dirname "$AUTODREAM_DIR")/dreams}"
 LOG_DIR="$AUTODREAM_DIR/logs"
 FANOUT="${FANOUT:-8}"
 
@@ -563,6 +574,7 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
   < "$SESSIONS_LIST" xargs -P "$FANOUT" -I {} bash -c '
     session="$1"
     hash=$(printf "%s" "$session" | shasum -a 1 | cut -c1-12)
+    t0=$(date +%s)
     output="$FINDINGS_DIR/$hash.json"
     errlog="$output.err"
 
@@ -646,7 +658,7 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
       --approval-mode yolo \
       --no-session \
       --config "$NO_ADVISOR_CFG" \
-      --model "${AUTODREAM_L1_MODEL:-runinfra/deepseek-v4-flash}" \
+      --model "${AUTODREAM_L1_MODEL:-anthropic/claude-haiku}" \
       --tools=Read,Write \
       --append-system-prompt "Headless triage worker. Read the session transcript and write exactly one findings JSON object, via the Write tool, to the literal output path given on line 2 of the prompt. Those paths are literal strings, not shell variables — never \$-expand them. Print only the literal word done and exit." \
       > /dev/null 2> "$errlog"
@@ -659,7 +671,7 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
         rm -f "$slimfile"
       fi
       rm -f "$errlog"
-      echo "ok: $session ($hash)"
+      echo "ok: $session ($hash) [$(($(date +%s) - t0))s]"
     else
       [ -n "$slimfile" ] && rm -f "$slimfile"
       # Worker exited without writing findings JSON. Record a diagnostic so the
@@ -677,9 +689,9 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
         lines=$(wc -l < "$session" 2>/dev/null | tr -d " ")
         printf "{\"session_path\":\"%s\",\"error\":\"worker exited without findings JSON after %s rounds\",\"meta\":{\"bytes\":%s,\"lines\":%s,\"slimmed\":%s},\"findings\":[]}\n" \
           "$session" "${AUTODREAM_L1_ROUNDS:-5}" "${sz:-0}" "${lines:-0}" "$([ -n "$slimfile" ] && echo true || echo false)" > "$output"
-        echo "FAIL (metadata stub written): $session ($hash) — see $errlog" >&2
+        echo "FAIL (metadata stub written): $session ($hash) [$(($(date +%s) - t0))s] — see $errlog" >&2
       else
-        echo "FAIL: $session ($hash) — see $errlog" >&2
+        echo "FAIL: $session ($hash) [$(($(date +%s) - t0))s] — see $errlog" >&2
       fi
     fi
   ' _ {}
@@ -1094,10 +1106,21 @@ PY
   fi
   printf 'x_queryid_source: %s\n' "$XQID_SOURCE" >> "$FINDINGS_DIR/run-stats.txt"
 
-  # ---- Layer 2: opus aggregate, retried until a report lands ----
+  # ---- Skills inventory (writes skills-inventory.txt for L2 to read) ----
+  # The L2 prompt treats this file as the authoritative active-skill list. Best-effort:
+  # an unusable inventory must never abort the pipeline (L2 falls back to its session surface).
+  skills_inv="$SCRIPT_DIR/skills-inventory.sh"
+  [ -x "$skills_inv" ] || skills_inv="$AUTODREAM_DIR/skills-inventory.sh"
+  "$skills_inv" "$FINDINGS_DIR/skills-inventory.txt" 2>/dev/null \
+    || printf '# skills-inventory.txt unavailable\n' > "$FINDINGS_DIR/skills-inventory.txt"
+
+  # ---- Layer 2: opus aggregate, retried until a validated report lands ----
   # The aggregator call can also die to a mid-run sleep (this is what left exit 1 +
-  # "no report" overnight). Retry until $REPORT_PATH is non-empty, waiting for the
-  # network between attempts. Idempotent: a re-run overwrites the report harmlessly.
+  # "no report" overnight). Retry until a capture that is BOTH sentinel-validated
+  # (AUTODREAM_REPORT_END present) and open-questions-complete lands at $REPORT_PATH,
+  # waiting for the network between attempts. A non-empty report is not a delivery: a
+  # marker-bearing capture with no sentinel is the P1 shape and must retry. Idempotent:
+  # a re-run overwrites the report harmlessly.
   # L2 auth is agent.db OAuth (file-based, safe at 3am) — no API key needed.
   AUTODREAM_L2_MODEL="${AUTODREAM_L2_MODEL:-anthropic/claude-opus-5}"
   log "L2 model: $AUTODREAM_L2_MODEL"
@@ -1137,22 +1160,33 @@ PY
   fi
 
   L2_ATTEMPTS="${AUTODREAM_L2_ATTEMPTS:-3}"
+  # Delivery gate across attempts. L2_ATTEMPTED separates a fresh run that actually
+  # spawned the aggregator from the legacy short-circuits above (the idempotency guard
+  # and the COUNT=0 stub both return before L2); L2_DELIVERED flips to 1 only when an
+  # attempt's capture carried the AUTODREAM_REPORT_END sentinel. Both default to 0 so
+  # the move-aside and consume gate below can distinguish "this run confirmed delivery"
+  # from "this run never reached L2" — a pre-existing marker-bearing report from an
+  # earlier night must not be treated as this run's output on either path.
+  L2_ATTEMPTED=0
+  L2_DELIVERED=0
   L2_START=$(date +%s)
+  L2_STDOUT="$FINDINGS_DIR/report.stdout"   # L2's report arrives on stdout, not via Write
   L2_RC=1
   for attempt in $(seq 1 "$L2_ATTEMPTS"); do
+    L2_ATTEMPTED=1
     log "L2 aggregation attempt $attempt/$L2_ATTEMPTS..."
     # Same literal-path framing and brace-group assembly as L1 (see the L1 worker
-    # comment): keep the paths as literal data the aggregator hands to Glob/Read/Write,
+    # comment): keep the paths as literal data the aggregator reads with Glob/Read,
     # and preserve the blank-line separator before PROMPT.md instead of letting a
     # `prompt=$(...)` capture strip it and glue the doc onto the report-path line.
     # Subshell so the cwd change (isolating the AI-title stub into $WORK_BUCKET, same
-    # as L1) is scoped to this call and doesn't leak into the notify/GC steps below.
+    # as L1) is scoped to this call and doesn't leak into the notify step below.
     # $? after the subshell is the pipeline's exit (claude's), exactly as before.
     (
       cd "$WORK_DIR" 2>/dev/null || true
       {
         printf "Findings directory to aggregate (literal absolute path): %s\n" "$FINDINGS_DIR"
-        printf "Write the report to this literal absolute path: %s\n\n" "$REPORT_PATH"
+        printf "Report destination (literal absolute path): %s\n\n" "$REPORT_PATH"
         cat "$AUTODREAM_DIR/PROMPT.md"
       } | "$OMP_BIN" \
         --allow-home \
@@ -1161,14 +1195,44 @@ PY
         --no-session \
         --config "$NO_ADVISOR_CFG" \
         --model "${AUTODREAM_L2_MODEL:-anthropic/claude-opus-5}" \
-        --tools=Glob,Read,Write,Edit \
-        --append-system-prompt "Headless aggregator. Read the per-session findings JSONs from the findings directory given on line 1 of the prompt, then write the report, via the Write tool, to the literal report path given on line 2. Those paths are literal strings, not shell variables — never \$-expand them. May edit project MEMORY.md files per the prompt rules. Print report path and 3-line summary, then exit."
-    )
+        --tools=Glob,Read \
+        --append-system-prompt "Headless aggregator. Read the per-session findings JSONs from the findings directory given on line 1 of the prompt, then produce the COMPLETE report only on standard output, ending with a line containing exactly AUTODREAM_REPORT_END. Do not use Write or Edit anywhere. Those paths are literal strings, not shell variables — never \$-expand them. After the sentinel line print one line: report: <literal path from line 2 of the prompt> then a 3-line summary (sessions reviewed, findings), then exit."
+    ) > "$L2_STDOUT"
 
     L2_RC=$?
-    report_complete && break
+    # ---- Runner writes the report from L2's stdout (L2 holds no Write/Edit tool) ----
+    # The report file exists because THIS script writes it, not the worker. The
+    # AUTODREAM_REPORT_END sentinel is the real completion gate: everything before the
+    # LAST occurrence of it is the report body, and a capture without one is a degraded
+    # report whether or not it happens to carry the open-questions marker — the marker
+    # alone cannot prove the write reached the end (that is the P1 bug shape). Both
+    # writes are staged to a .tmp and renamed so a half-staged file never lands at
+    # $REPORT_PATH, and the post-sentinel lines (the report path + the aggregator's
+    # 3-line summary) are appended to the run log so a stripped capture never loses them.
+    L2_COMPLETE=0
+    if grep -q '^AUTODREAM_REPORT_END$' "$L2_STDOUT" 2>/dev/null; then
+      if awk '/^AUTODREAM_REPORT_END$/ { last=NR } { line[NR]=$0 } END { for (i=1; i<last; i++) print line[i] }' "$L2_STDOUT" > "$REPORT_PATH.tmp" && mv "$REPORT_PATH.tmp" "$REPORT_PATH"; then
+        L2_COMPLETE=1
+      else
+        log "WARNING: could not stage the sentinel-stripped report at $REPORT_PATH"
+      fi
+    elif [ -s "$L2_STDOUT" ]; then
+      log "WARNING: L2 stdout carried no AUTODREAM_REPORT_END sentinel; keeping the whole capture as a degraded report (incomplete - will retry)"
+      cat "$L2_STDOUT" > "$REPORT_PATH.tmp" && mv "$REPORT_PATH.tmp" "$REPORT_PATH" 2>/dev/null || true
+    fi
+    awk '/^AUTODREAM_REPORT_END$/ { f=1; next } f { print }' "$L2_STDOUT" >> "$RUN_LOG" 2>/dev/null || true
+    L2_DELIVERED=$L2_COMPLETE
+    # Break only on a sentinel-validated capture that also carries the open-questions
+    # marker; a degraded capture (sentinel absent) NEVER satisfies the loop.
+    if [ "$L2_DELIVERED" = "1" ] && report_complete; then
+      break
+    fi
     if [ -s "$REPORT_PATH" ]; then
-      log "L2 attempt $attempt left a report with no open-questions marker — treating it as truncated and retrying (exit $L2_RC)"
+      if report_complete; then
+        log "L2 attempt $attempt wrote a complete-looking report but no AUTODREAM_REPORT_END sentinel — not a validated delivery, retrying (exit $L2_RC)"
+      else
+        log "L2 attempt $attempt left a report with no open-questions marker — treating it as truncated and retrying (exit $L2_RC)"
+      fi
     else
       log "L2 attempt $attempt wrote no report (exit $L2_RC)"
     fi
@@ -1193,8 +1257,12 @@ PY
   #
   # Move it aside rather than delete it: it may hold most of a report, and a partial
   # report is worth reading even though it must not block a retry. The stub written when
-  # COUNT=0 returns long before this line, so it is never affected.
-  if [ -f "$REPORT_PATH" ] && ! report_complete; then
+  # COUNT=0 returns long before this line, so it is never affected. Also gated on this
+  # run having actually ATTEMPTED L2 and not delivered a sentinel-validated report:
+  # legacy dates that short-circuited at the idempotency guard never reached L2, and
+  # their pre-existing (marker-bearing) report must sit untouched at $REPORT_PATH for
+  # the next catch-up trigger to keep working as before.
+  if [ -f "$REPORT_PATH" ] && [ "$L2_ATTEMPTED" = "1" ] && { [ "$L2_DELIVERED" != "1" ] || ! report_complete; }; then
     PARTIAL_REPORT="$REPORT_PATH.partial-$(date +%s)"
     if mv "$REPORT_PATH" "$PARTIAL_REPORT"; then
       log "WARNING: every L2 attempt left an incomplete report; moved it to $PARTIAL_REPORT so a later trigger retries this date"
@@ -1268,7 +1336,15 @@ PY
     # an override every consume path would take the skip branch and the tests that cover
     # archiving would pass while asserting nothing.
     NORMAL_TARGET_DATE="${AUTODREAM_CONSUME_DATE:-$(date -v-1d +%Y-%m-%d)}"
-    if ! report_complete; then
+    # Three-way gate. The first branch is the fresh-run delivery guard: a run that
+    # spawned L2 but never produced a sentinel-validated capture must not consume,
+    # even when the capture looks complete to report_complete (marker-only, no
+    # sentinel — the P1 shape). Legacy runs that never reached L2 (idempotency
+    # short-circuit, no-sessions stub) fall through this first branch untouched and
+    # keep their historical behavior.
+    if [ "$L2_ATTEMPTED" = "1" ] && [ "$L2_DELIVERED" != "1" ]; then
+      log "skipping vault-notes archive and x-bookmark mark-read: this run did not deliver a sentinel-validated report (still collected as L2 context)"
+    elif ! report_complete; then
       log "report is present but carries no open-questions marker; skipping vault-notes archive and x-bookmark mark-read rather than consuming input against a truncated report"
     else
       # Publishing is NOT a consuming step — it copies the report into the vault so it
@@ -1291,35 +1367,6 @@ PY
         log "target date $TARGET_DATE is not $NORMAL_TARGET_DATE (today's normal nightly date); skipping vault-notes archive and x-bookmark mark-read so today's inbox/unread bookmarks aren't consumed by this reprocess (still collected as L2 context)"
       fi
     fi
-
-    # ---- Symbiotic GC: trigger cc-simple-memory to consolidate
-    #      around the pins Layer 2 just added (no-op if not installed
-    #      or AUTODREAM_GC=0). Iterates the touched-projects sidecar
-    #      Layer 2 wrote — re-uses the cwd recorded in each project's
-    #      session JSONLs to give claude-memory the right project root.
-    if [ "${AUTODREAM_GC:-1}" != "0" ] && command -v claude-memory >/dev/null 2>&1; then
-      TOUCHED="$FINDINGS_DIR/touched-projects.txt"
-      if [ -s "$TOUCHED" ]; then
-        log "claude-memory detected; running GC for $(wc -l < "$TOUCHED" | tr -d ' ') touched project(s)..."
-        sort -u "$TOUCHED" | while IFS= read -r encoded; do
-          [ -z "$encoded" ] && continue
-          proj="$PROJECTS_DIR/$encoded"
-          [ -d "$proj" ] || { log "  skip: $encoded (no project dir)"; continue; }
-
-          cwd=$(grep -hom1 '"cwd":"[^"]*"' "$proj"/*.jsonl 2>/dev/null \
-                 | head -1 | sed 's/^"cwd":"//;s/"$//')
-          if [ -z "$cwd" ] || [ ! -d "$cwd" ]; then
-            log "  skip: $encoded (cwd not resolvable)"
-            continue
-          fi
-          log "  gc: $cwd"
-          ( cd "$cwd" && claude-memory gc ) >> "$RUN_LOG" 2>&1 \
-            || log "    gc failed for $cwd (continuing)"
-        done
-      else
-        log "claude-memory installed but no project memory was touched; skipping per-project GC"
-      fi
-    fi
   else
     # Where the recoverable copies are was already logged above, in the one block that
     # runs whether or not this path still holds a file.
@@ -1327,7 +1374,21 @@ PY
   fi
 
   log "===== autodream end: $(date) ====="
-  return $L2_RC
+  # A validated delivery is the only success, and it is the same predicate the
+  # move-aside and consume gates use: a sentinel-validated capture (L2_DELIVERED) that
+  # also carries the open-questions marker (report_complete). A sentinel-bearing but
+  # marker-less capture is moved to .partial and never consumed, and a fully degraded
+  # night can leave the aggregator's own exit code at 0, so either would return 0 here
+  # and tell the launchd cron -- the only watcher this unattended job has -- that the
+  # night produced a usable report when it produced none. Anything short of validated
+  # keeps the aggregator's status when it was non-zero, else 1.
+  if [ "$L2_DELIVERED" = "1" ] && report_complete; then
+    return 0
+  fi
+  if [ "${L2_RC:-0}" -ne 0 ]; then
+    return "$L2_RC"
+  fi
+  return 1
 }
 
 # ---- The logger must not be able to take the run down with it ----

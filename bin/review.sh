@@ -26,7 +26,20 @@
 
 set -u
 
-AUTODREAM_DIR="${AUTODREAM_DIR:-$HOME/.claude/autodream}"
+# The install symlinks the scripts INTO $AUTODREAM_DIR (install.sh), so on a
+# bare shell invocation with no env the script's own location IS the install
+# dir. This is what lets `review.sh <date>` run from a terminal without the
+# launchd plist's env: the OMP port installs to ~/.omp/agent/{autodream,dreams},
+# so the legacy ~/.claude/{autodream,dreams} defaults made every manual
+# invocation "could not locate" the report. Env still wins; the derived dir is
+# only trusted when it carries an install marker file (install.sh writes both).
+AUTODREAM_DIR="${AUTODREAM_DIR:-}"
+if [ -z "$AUTODREAM_DIR" ]; then
+  AUTODREAM_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+  if [ -z "$AUTODREAM_DIR" ] || { [ ! -f "$AUTODREAM_DIR/config" ] && [ ! -f "$AUTODREAM_DIR/l1-no-advisor.yml" ]; }; then
+    AUTODREAM_DIR="$HOME/.claude/autodream"
+  fi
+fi
 
 # Load the config file first, then let any env-provided values win over it.
 __env_dreams="${DREAMS_DIR:-}"; __env_claude="${CLAUDE_BIN:-}"
@@ -41,7 +54,8 @@ CONFIG_FILE="${AUTODREAM_CONFIG:-$AUTODREAM_DIR/config}"
 [ -n "$__env_cmux" ] && CMUX_BIN="$__env_cmux"
 [ -n "$__env_focus" ] && AUTODREAM_TRIAGE_FOCUS="$__env_focus"
 
-DREAMS_DIR="${DREAMS_DIR:-$HOME/.claude/dreams}"
+# Reports live in the sibling of the install dir (~/.omp/agent/dreams here).
+DREAMS_DIR="${DREAMS_DIR:-$(dirname "$AUTODREAM_DIR")/dreams}"
 CLAUDE_BIN="${CLAUDE_BIN:-$HOME/.local/bin/claude}"
 AUTODREAM_TRIAGE_SURFACE="${AUTODREAM_TRIAGE_SURFACE:-inline}"
 CMUX_BIN="${CMUX_BIN:-/Applications/cmux.app/Contents/Resources/bin/cmux}"
@@ -160,6 +174,18 @@ fi
 if [ "$AUTODREAM_TRIAGE_SURFACE" = "cmux" ]; then
   CMUX="$CMUX_BIN"; [ -x "$CMUX" ] || CMUX=$(command -v cmux 2>/dev/null || true)
   if [ -n "$CMUX" ] && [ -x "$CMUX" ]; then
+    # Same-day dedup for the launchd review job's catch-up triggers (08:00 /
+    # catch-up later, mirroring run.sh's multi-trigger schedule). Whichever
+    # trigger fires first after the report lands opens the workspace and stamps
+    # a marker; later triggers for the same date honor it instead of opening a
+    # second workspace on top of the first. --force bypasses the marker, so a
+    # deliberately relaunched triage still works.
+    LAUNCH_MARKER="$AUTODREAM_DIR/logs/review-launched-$DATE"
+    if [ "$FORCE" -eq 0 ] && [ -f "$LAUNCH_MARKER" ]; then
+      echo "review.sh: $DATE triage already launched today (workspace); skipping duplicate (marker $LAUNCH_MARKER)"
+      echo "  open anyway: $(basename "$0") --force $DATE"
+      exit 0
+    fi
     SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
     # Workspace + tab are named after the triaged date (ISO, i.e. the report's
     # own YYYY-MM-DD — the date of the questions being addressed, not today).
@@ -184,6 +210,11 @@ if [ "$AUTODREAM_TRIAGE_SURFACE" = "cmux" ]; then
     # effort so review.sh returns immediately and a failure never affects triage.
     WS_REF=$(printf '%s\n' "$WS_OUT" | sed -n 's/.*\(workspace:[0-9][0-9]*\).*/\1/p' | head -1)
     if [ -n "$WS_REF" ]; then
+      # Only stamp on a confirmed create. A false marker would silently swallow
+      # a real popup (later triggers would skip a report that never actually
+      # surfaced); an empty stamp on failure just risks a duplicate retry.
+      mkdir -p "$(dirname "$LAUNCH_MARKER")"
+      touch "$LAUNCH_MARKER"
       ( for _ in 1 2 3; do
           sleep 3
           "$CMUX" tab-action --action rename --workspace "$WS_REF" --title "$TAB_TITLE" >/dev/null 2>&1
@@ -220,7 +251,7 @@ Workflow when the user says "go" or otherwise signals ready:
 When all open questions are resolved, write a brief summary at the bottom of $REPORT under "## Triage decisions", thank the user, and exit.
 
 Other rules:
-- You may edit any file the autodream prompt allows you to edit (project MEMORY.md, settings.json, .claude/* in the relevant project), plus you may now edit ~/.claude/CLAUDE.md, ~/.claude/rules/*, and ~/.claude/docs/guardrails/* if the user explicitly approves.
+- You may edit any file the autodream prompt allows you to edit (settings.json, .claude/* in the relevant project), plus you may now edit ~/.claude/CLAUDE.md, ~/.claude/rules/*, and ~/.claude/docs/guardrails/* if the user explicitly approves.
 - Don't proceed on any CLAUDE.md / rules / guardrails edit without explicit per-edit approval — those are global.
 - Be terse. One question, one decision, one action, then next.
 EOF

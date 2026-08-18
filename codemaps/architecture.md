@@ -28,17 +28,17 @@ bin/run.sh  TARGET_DATE
       ├─ L2 retry loop (AUTODREAM_L2_ATTEMPTS):
       │     claude --print (opus, lean flags) with PROMPT.md
       │       reads all findings/<date>/*.json + changelog-window.md + run-stats.txt
-      │       writes dreams/<date>.md; may edit project MEMORY.md (📌) + touched-projects.txt
+      │       emits the report on stdout; run.sh writes dreams/<date>.md
+      │       (L2 has no file tools — no memory writes under OMP)
       │
       ├─ notify.sh → open-questions inbox file ($AUTODREAM_OPEN, default `open`)
-      └─ optional: claude-memory gc per touched project
 ```
 
 ## Files
 
 | File | Role |
 |---|---|
-| `bin/run.sh` | orchestrator: guard, enumerate+filter, L1 retry loop, changelog, L2 retry loop, notify, gc |
+| `bin/run.sh` | orchestrator: guard, enumerate+filter, L1 retry loop, changelog, L2 retry loop, notify |
 | `bin/autodream-now.sh` | run NOW via a transient one-shot launchd agent (escapes the ~10-min cap on bg tasks/ssh). `[DATE] [--force] [--watch] [--dry-run]`. RunAtLoad only (no kickstart → no double run); picks the scheduled plist that runs `run.sh` for its label namespace |
 | `bin/prune-self-sessions.sh` | self-session predicate (single source of truth): list / `--delete` / `--filter` |
 | `bin/oversized-gate.sh` | recompute the #12 measurement gate over a trailing window from the sidecars/findings on disk (`--days N`, or explicit findings dirs). Recovers dates whose `run-stats.txt` predates the counters; artifacts only, no model calls |
@@ -46,7 +46,7 @@ bin/run.sh  TARGET_DATE
 | `bin/notify.sh` | extract "Open questions" → inbox file, counted from the `open-questions=N` marker, opened via `$AUTODREAM_OPEN` |
 | `bin/review.sh` | interactive morning triage (`claude --append-system-prompt <report>`); `AUTODREAM_TRIAGE_SURFACE=cmux` (config/env) launches it in its own cmux workspace instead of inline. Skips the session entirely (prints a notice) when the report has 0 open questions or is already triaged — reads the `<!-- autodream:open-questions=N -->` marker, falls back to prose, launches on anything ambiguous; `--force` overrides. Skip check runs before the cmux branch so a skip never spawns a workspace |
 | `prompts/SESSION_TRIAGE.md` | L1 prompt: per-session JSON schema |
-| `prompts/PROMPT.md` | L2 prompt: report sections incl. Upstream changes + Autodream self-audit, memory rules |
+| `prompts/PROMPT.md` | L2 prompt: report sections incl. Upstream changes + Autodream self-audit |
 | `tests/run-all.sh` | integration tests for `run.sh` vs `mock-claude.sh` (offline) |
 | `tests/review-skip.sh` | tests for `review.sh`'s skip/launch decision (offline; inline mock claude) |
 | `tests/mock-claude.sh` | stand-in claude; modes: good / l1_incomplete / l1_flaky |

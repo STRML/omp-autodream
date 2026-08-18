@@ -3,17 +3,25 @@
 #
 # run.sh invokes the real claude CLI for both layers. Here we stand in for it:
 # read the prompt on stdin, find the two literal-path lines run.sh inlined, and
-# write (or deliberately don't write) the expected output file — no model, no
-# network. Which layer we are is decided by line 1 of the prompt.
+# produce output — no model, no network. Which layer we are is decided by line 1
+# of the prompt. L1 writes its findings JSON; L2 no longer claims Write — it emits
+# the report on stdout, ending with AUTODREAM_REPORT_END (run.sh writes the file).
 #
 # Env knobs (all optional):
-#   MOCK_MODE=good           write findings (L1) / report (L2). [default]
+#   MOCK_MODE=good           write findings (L1) / emit report on stdout (L2). [default]
 #   MOCK_MODE=l1_incomplete  L1 writes nothing (simulates a worker that exits
-#                            without producing JSON); L2 still writes its report.
-#   MOCK_MODE=l2_fail        L2 writes no report and exits 1 (simulates the
+#                            without producing JSON); L2 still emits its report.
+#   MOCK_MODE=l2_fail        L2 emits nothing and exits 1 (simulates the
 #                            aggregator dying to a mid-run sleep). L1 is unaffected.
 #                            Pair with AUTODREAM_L2_ATTEMPTS=1 so the test doesn't
 #                            sit through the retry loop.
+#   MOCK_MODE=l2_partial_marker  L2 emits a COMPLETE-LOOKING report — it carries the
+#                            autodream:open-questions marker — but NO
+#                            AUTODREAM_REPORT_END sentinel, then exits 0. This is the
+#                            P1 bug shape: any completion test that trusts only the
+#                            marker would call this delivered. run.sh must treat the
+#                            missing sentinel as non-delivery (retry, move the
+#                            capture aside, never consume against it).
 #   MOCK_CAPTURE_DIR=<dir>   dump each layer's stdin + argv to <dir>/l{1,2}-*.txt
 #                            so tests can assert on the exact prompt framing.
 #   MOCK_CALL_LOG=<file>     append the L1 output path for every invocation of
@@ -53,22 +61,32 @@ else
     printf '%s' "$input" > "$MOCK_CAPTURE_DIR/l2-stdin.txt"
     printf '%s\n' "$@" > "$MOCK_CAPTURE_DIR/l2-args.txt"
   fi
-  rep=$(printf '%s' "$line2" | sed 's/^Write the report to this literal absolute path: //')
+  rep=$(printf '%s' "$line2" | sed 's/^Report destination (literal absolute path): //')
   if [ "$mode" = "l2_fail" ]; then
     echo "mock: aggregator failed" >&2
     exit 1
   fi
-  # l2_partial: a NON-EMPTY report with no open-questions marker — what a mid-write kill
-  # leaves behind. `-s` cannot tell this from a good report, which is why run.sh checks
-  # for the marker instead.
+  # l2_partial: a NON-EMPTY report with no AUTODREAM_REPORT_END sentinel — what a
+  # mid-output kill leaves behind. run.sh keeps the whole capture as a degraded report;
+  # `-s` cannot tell that from a good report, which is why run.sh checks the marker.
   if [ "$mode" = "l2_partial" ]; then
-    printf '# Autodream — mock\n\n## Top patterns\n\n1. truncated mid-w' > "$rep"
-    echo "mock: partial write"
+    printf '# Autodream — mock\n\n## Top patterns\n\n1. truncated mid-w'
+    echo "mock: partial stdout, no sentinel" >&2
+    exit 0
+  fi
+  # l2_partial_marker: an otherwise complete report (it carries the open-questions
+  # marker report_complete() checks) but no AUTODREAM_REPORT_END sentinel. Report
+  # marker alone must not count as delivery — the sentinel is the completion proof.
+  if [ "$mode" = "l2_partial_marker" ]; then
+    printf '# Autodream — mock\n\nmock aggregate report\n\n<!-- autodream:open-questions=0 -->\n'
     exit 0
   fi
   # The open-questions marker is part of the real contract (PROMPT.md mandates it) and
-  # run.sh now treats its absence as a truncated write, so the mock must emit it too.
-  printf '# Autodream — mock\n\nmock aggregate report\n\n<!-- autodream:open-questions=0 -->\n' > "$rep"
+  # run.sh treats its absence as a truncated report, so the mock's good path emits it
+  # too — on stdout, ending with the AUTODREAM_REPORT_END sentinel the runner strips.
+  printf '# Autodream — mock\n\nmock aggregate report\n\n<!-- autodream:open-questions=0 -->\n'
+  echo "AUTODREAM_REPORT_END"
   echo "report: $rep"
-  echo "mock: 1 session reviewed, 0 findings, 0 edits"
+  echo "sessions reviewed: 1"
+  echo "findings: 0"
 fi

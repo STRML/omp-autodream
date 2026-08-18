@@ -1,6 +1,6 @@
 # omp-autodream
 
-Nightly memory consolidation for the **OMP** harness (Oh My Pi). While you sleep it
+Nightly session review for the **OMP** harness (Oh My Pi). While you sleep it
 reads yesterday's session transcripts and leaves you one short report: the mistakes
 you keep making, where you lost time, and what's worth remembering.
 
@@ -14,15 +14,15 @@ from cc-autodream and still runs on the Claude Code CLI — see
 ## Why
 
 You have dozens of OMP sessions a week. The useful lessons — a wrong assumption you
-made twice, a flag that always trips you up, a fix worth pinning to memory — are
+made twice, a flag that always trips you up, a fix worth keeping — are
 buried in transcripts you'll never reread. OMP starts each session fresh and
 rediscovers the same friction.
 
 omp-autodream does the rereading for you. Every night it looks across **all** of
 yesterday's sessions, ranks what recurs by frequency × severity (so you see the
 patterns, not the one-offs), and writes a dated digest you can skim in a minute. The
-highest-confidence, highest-severity findings get pinned into the relevant project's
-`MEMORY.md`, so the next session already knows.
+report is the whole deliverable — under OMP, Layer 2 performs no memory writes, so
+nothing else in your session corpus is touched.
 
 ## What it uses
 
@@ -246,7 +246,7 @@ see **`codemaps/architecture.md`** and **`CLAUDE.md`**.
   open-questions file opens with your default `.md` app; set `AUTODREAM_OPEN`
   (e.g. `subl`, `code -g`, `open -a Obsidian`) to pick a specific editor.
 - The nightly pipeline runs headless `omp -p` workers in `--approval-mode yolo` (Layer 1
-  workers write findings; the Layer 2 aggregator edits project `MEMORY.md`). Don't run
+  workers write findings; the Layer 2 aggregator writes the daily report). Don't run
   it in a shared environment.
 - **L1 auth:** the `runinfra` key normally lives in the macOS login keychain (via the
   `!security` escape in `~/.omp/agent/models.yml`). At 3am a locked keychain could kill
