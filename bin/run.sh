@@ -563,6 +563,7 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
   < "$SESSIONS_LIST" xargs -P "$FANOUT" -I {} bash -c '
     session="$1"
     hash=$(printf "%s" "$session" | shasum -a 1 | cut -c1-12)
+    t0=$(date +%s)
     output="$FINDINGS_DIR/$hash.json"
     errlog="$output.err"
 
@@ -659,7 +660,7 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
         rm -f "$slimfile"
       fi
       rm -f "$errlog"
-      echo "ok: $session ($hash)"
+      echo "ok: $session ($hash) [$(($(date +%s) - t0))s]"
     else
       [ -n "$slimfile" ] && rm -f "$slimfile"
       # Worker exited without writing findings JSON. Record a diagnostic so the
@@ -677,9 +678,9 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
         lines=$(wc -l < "$session" 2>/dev/null | tr -d " ")
         printf "{\"session_path\":\"%s\",\"error\":\"worker exited without findings JSON after %s rounds\",\"meta\":{\"bytes\":%s,\"lines\":%s,\"slimmed\":%s},\"findings\":[]}\n" \
           "$session" "${AUTODREAM_L1_ROUNDS:-5}" "${sz:-0}" "${lines:-0}" "$([ -n "$slimfile" ] && echo true || echo false)" > "$output"
-        echo "FAIL (metadata stub written): $session ($hash) — see $errlog" >&2
+        echo "FAIL (metadata stub written): $session ($hash) [$(($(date +%s) - t0))s] — see $errlog" >&2
       else
-        echo "FAIL: $session ($hash) — see $errlog" >&2
+        echo "FAIL: $session ($hash) [$(($(date +%s) - t0))s] — see $errlog" >&2
       fi
     fi
   ' _ {}
