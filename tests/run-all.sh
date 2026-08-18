@@ -106,6 +106,10 @@ run_dream(){ # $1=root ; inherits MOCK_MODE/MOCK_CAPTURE_DIR/FANOUT + changelog 
   AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS="${AUTODREAM_L1_ROUNDS:-2}" \
   PROJECTS_DIR="$1/projects" HOME="$1/home" AUTODREAM_DIR="$1/autodream" DREAMS_DIR="$1/dreams" \
   bash "$RUN" "$DATE" > "$1/run.out" 2>&1
+  # The run's own exit code, captured while $? still holds it: the previous bug lived
+  # because nothing asserted it. An unattended run has no other signal for "delivered
+  # nothing", so the exit code is part of the contract.
+  printf '%s' "$?" > "$1/run.exit"
   # An unattended run logs to its file rather than through a pipe, so that stdout carries
   # only a pointer now. Fold the real log in, so every assertion below still reads what a
   # nightly run actually recorded rather than what a tty run happens to echo.
@@ -405,6 +409,12 @@ test_l2_sentinel_gate(){
   ls "$root/dreams/$DATE.md.partial-"* >/dev/null 2>&1 \
     && ok "it was preserved as .partial-<epoch>, not deleted" \
     || no "the sentinel-less capture was lost"
+  # The cron is the only watcher: a delivered-nothing night must not exit 0. The mock's
+  # l2_partial_marker exits 0, so this is where a marker-only completion check would
+  # otherwise report success while the day's report sits in .partial-<epoch>.
+  [ "$(cat "$root/run.exit")" -ne 0 ] \
+    && ok "run exited non-zero: the cron learns the night delivered nothing" \
+    || no "run exited 0 on a delivered-nothing night"
   rm -rf "$root"
 }
 

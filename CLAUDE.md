@@ -107,7 +107,7 @@ launchd facts: `StartCalendarInterval` is anacron-like (runs once on the next wa
 
 run.sh handles it with:
 - **L1 retry loop** (`dispatch_l1` + `l1_missing_count`): re-dispatches only the sessions still missing a findings JSON, up to `AUTODREAM_L1_ROUNDS` (5), calling `wait_for_network` between rounds. The worker is idempotent, so retries are cheap.
-- **L2 retry loop**: retries the aggregator up to `AUTODREAM_L2_ATTEMPTS` (3) until `$REPORT_PATH` is non-empty.
+- **L2 retry loop**: retries the aggregator up to `AUTODREAM_L2_ATTEMPTS` (3) until a capture that is both sentinel-validated (`AUTODREAM_REPORT_END` present) and open-questions-complete lands at `$REPORT_PATH`; a non-empty report without the sentinel is the P1 shape and never counts as a delivery, and a run that never delivers exits non-zero.
 - **Idempotency guard**: at the top of `run()`, if a report already exists for the date it exits in a second (`AUTODREAM_FORCE=1` to rebuild). This is what makes multiple launchd catch-up triggers safe.
 - The plist example schedules several morning triggers (03:15/06:15/09:15/12:15) so a failed-overnight date gets retried on later wakes; the guard no-ops the rest.
 

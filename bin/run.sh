@@ -69,7 +69,18 @@ if [ -n "${PROJECTS_DIR+x}" ]; then
 else
   PROJECTS_DIR="$HOME/.omp/agent/sessions"
 fi
-AUTODREAM_DIR="${AUTODREAM_DIR:-$HOME/.claude/autodream}"
+# The install symlinks the scripts INTO $AUTODREAM_DIR (install.sh), so a bare
+# shell invocation with no env resolves the install dir from this script's own
+# location instead of the legacy ~/.claude/autodream default (the OMP port
+# installs under ~/.omp/agent/autodream). Env still wins; the derived dir is
+# only trusted when it carries an install marker file (install.sh writes both).
+AUTODREAM_DIR="${AUTODREAM_DIR:-}"
+if [ -z "$AUTODREAM_DIR" ]; then
+  AUTODREAM_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+  if [ -z "$AUTODREAM_DIR" ] || { [ ! -f "$AUTODREAM_DIR/config" ] && [ ! -f "$AUTODREAM_DIR/l1-no-advisor.yml" ]; }; then
+    AUTODREAM_DIR="$HOME/.claude/autodream"
+  fi
+fi
 # Advisor-off overlay, passed as --config to every headless worker (L1 + L2) so no
 # worker boots the opus advisor (verified: it fires in print mode otherwise). install.sh
 # writes this file; it must exist before the first worker dispatch.
@@ -135,7 +146,7 @@ if [ -f "$AUTODREAM_DIR/x-credentials" ]; then
   . "$AUTODREAM_DIR/x-credentials" 2>/dev/null || true
   set -u
 fi
-DREAMS_DIR="${DREAMS_DIR:-$HOME/.claude/dreams}"
+DREAMS_DIR="${DREAMS_DIR:-$(dirname "$AUTODREAM_DIR")/dreams}"
 LOG_DIR="$AUTODREAM_DIR/logs"
 FANOUT="${FANOUT:-8}"
 
@@ -647,7 +658,7 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
       --approval-mode yolo \
       --no-session \
       --config "$NO_ADVISOR_CFG" \
-      --model "${AUTODREAM_L1_MODEL:-runinfra/deepseek-v4-flash}" \
+      --model "${AUTODREAM_L1_MODEL:-anthropic/claude-haiku}" \
       --tools=Read,Write \
       --append-system-prompt "Headless triage worker. Read the session transcript and write exactly one findings JSON object, via the Write tool, to the literal output path given on line 2 of the prompt. Those paths are literal strings, not shell variables — never \$-expand them. Print only the literal word done and exit." \
       > /dev/null 2> "$errlog"
@@ -1103,10 +1114,13 @@ PY
   "$skills_inv" "$FINDINGS_DIR/skills-inventory.txt" 2>/dev/null \
     || printf '# skills-inventory.txt unavailable\n' > "$FINDINGS_DIR/skills-inventory.txt"
 
-  # ---- Layer 2: opus aggregate, retried until a report lands ----
+  # ---- Layer 2: opus aggregate, retried until a validated report lands ----
   # The aggregator call can also die to a mid-run sleep (this is what left exit 1 +
-  # "no report" overnight). Retry until $REPORT_PATH is non-empty, waiting for the
-  # network between attempts. Idempotent: a re-run overwrites the report harmlessly.
+  # "no report" overnight). Retry until a capture that is BOTH sentinel-validated
+  # (AUTODREAM_REPORT_END present) and open-questions-complete lands at $REPORT_PATH,
+  # waiting for the network between attempts. A non-empty report is not a delivery: a
+  # marker-bearing capture with no sentinel is the P1 shape and must retry. Idempotent:
+  # a re-run overwrites the report harmlessly.
   # L2 auth is agent.db OAuth (file-based, safe at 3am) — no API key needed.
   AUTODREAM_L2_MODEL="${AUTODREAM_L2_MODEL:-anthropic/claude-opus-5}"
   log "L2 model: $AUTODREAM_L2_MODEL"
@@ -1360,12 +1374,21 @@ PY
   fi
 
   log "===== autodream end: $(date) ====="
-  # A validated delivery is a success no matter what the last L2 attempt's exit code
-  # was; anything short of that reports the aggregator's own status.
-  if [ "$L2_DELIVERED" = "1" ]; then
+  # A validated delivery is the only success, and it is the same predicate the
+  # move-aside and consume gates use: a sentinel-validated capture (L2_DELIVERED) that
+  # also carries the open-questions marker (report_complete). A sentinel-bearing but
+  # marker-less capture is moved to .partial and never consumed, and a fully degraded
+  # night can leave the aggregator's own exit code at 0, so either would return 0 here
+  # and tell the launchd cron -- the only watcher this unattended job has -- that the
+  # night produced a usable report when it produced none. Anything short of validated
+  # keeps the aggregator's status when it was non-zero, else 1.
+  if [ "$L2_DELIVERED" = "1" ] && report_complete; then
     return 0
   fi
-  return "$L2_RC"
+  if [ "${L2_RC:-0}" -ne 0 ]; then
+    return "$L2_RC"
+  fi
+  return 1
 }
 
 # ---- The logger must not be able to take the run down with it ----
