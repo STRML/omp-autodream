@@ -244,6 +244,12 @@ if [ "$AUTODREAM_TRIAGE_SURFACE" = "cmux" ]; then
     fi
     CLAIM_GRACE=900
     CLAIMED=0
+    # Reap stale state so it cannot grow unbounded: claim dirs and confirmed
+    # tokens older than 14 days. `-delete` handles both the empty dir and its
+    # sibling file. Unconditional on --force: the force path is exactly the
+    # retry-after-failure route and must not be the one path that skips the
+    # forest cleanup (all three --force occasions leave the old claim in place).
+    find "$LOGS_DIR" -maxdepth 1 -name 'review-launched-*' -mtime +14 -delete 2>/dev/null || true
     if [ "$FORCE" -eq 0 ]; then
       # Already confirmed -> definitely launched. Skip.
       if [ -e "$LAUNCH_CONFIRMED" ]; then
@@ -266,16 +272,22 @@ if [ "$AUTODREAM_TRIAGE_SURFACE" = "cmux" ]; then
           exit 0
         fi
       fi
-      # Atomic claim: mkdir fails if another invocation won the race.
+      # Atomic claim: mkdir fails if another invocation won the race. But a
+      # failed mkdir is ALSO what a read-only/space-full logs dir produces —
+      # reporting that as "in progress" and exiting 0 silently drops triage.
+      # `mkdir -p $LOGS_DIR` above does not catch an already-existing-but-
+      # unwritable dir, so distinguish the claim's mkdir outcomes: if the
+      # claim dir now exists it was a genuine race (exit 0); otherwise it is
+      # an I/O error (fail loudly).
       if ! mkdir "$LAUNCH_MARKER" 2>/dev/null; then
-        echo "review.sh: $DATE triage launch already in progress by another invocation"
-        exit 0
+        if [ -e "$LAUNCH_MARKER" ]; then
+          echo "review.sh: $DATE triage launch already in progress by another invocation"
+          exit 0
+        fi
+        echo "review.sh: cannot create claim $LAUNCH_MARKER" >&2
+        exit 1
       fi
       CLAIMED=1
-      # Reap stale state so it cannot grow unbounded: claim dirs and confirmed
-      # tokens older than 14 days. `-delete` handles both the empty dir and its
-      # sibling file.
-      find "$LOGS_DIR" -maxdepth 1 -name 'review-launched-*' -mtime +14 -delete 2>/dev/null || true
     fi
     SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
     # Workspace + tab are named after the triaged date (ISO, i.e. the report's
@@ -314,30 +326,46 @@ if [ "$AUTODREAM_TRIAGE_SURFACE" = "cmux" ]; then
       echo "review.sh: cmux workspace create failed (exit $WS_RC); triage not opened" >&2
       exit 1
     fi
+    # cmux returned 0: per the tool's contract a workspace was created. Bind
+    # the confirmed token NOW — before any further parsing — so the dedup fact
+    # is durable regardless of what happens next (a kill between create and
+    # confirm, or a stdout format change). Age-based reclaim must never treat a
+    # created-but-unconfirmed launch as abandoned and spawn a second workspace.
+    # This is unconditional on the claim (a --force run skipped the claim mkdir
+    # but is still a real launch, and round-1 stamped on any successful create).
+    #
+    # Executor race: a concurrent --force rebuild (run.sh:1214) can replace
+    # the report between our hash above and the workspace actually reading it.
+    # Re-check: if the on-disk content changed, the workspace triaged the NEW
+    # report, so bind the confirmed token to the NEW digest (the inner run will
+    # recompute its own key anyway on its next trigger), not the stale one we
+    # launched under. Only the string compare matters; recompute via the same
+    # command as the marker computation.
+    CURRENT_KEY=$(shasum -a 256 "$REPORT" 2>/dev/null | awk '{print $1}')
+    if [ -n "$CURRENT_KEY" ] && [ "$CURRENT_KEY" != "$REPORT_KEY" ]; then
+      echo "review.sh: report changed while launching (digest $REPORT_KEY -> $CURRENT_KEY); binding confirm to current digest" >&2
+      LAUNCH_CONFIRMED="$LOGS_DIR/review-launched-$DATE-$CURRENT_KEY.confirmed"
+    fi
+    # touch failure is warned, not fatal: the workspace IS created at this
+    # point; the unconfirmed claim (if any) is grace-bounded and the next
+    # trigger's reclaim would open a duplicate, so report it loudly but do not
+    # claim the launch failed.
+    if ! touch "$LAUNCH_CONFIRMED"; then
+      echo "review.sh: WARNING could not write confirmed token $LAUNCH_CONFIRMED" >&2
+    fi
     # Pin the tab title to the date. The shell sets a startup title (the cwd) a
     # beat after creation, so rename a few times across that window; with claude's
     # own title updates disabled above, the rename then holds. Detached + best
     # effort so review.sh returns immediately and a failure never affects triage.
+    # WS_REF is cosmetic here — confirmation is already bound above — so an
+    # unparseable/absent ref (cmux stdout changed shape) only skips the title
+    # rename, never the launch.
     WS_REF=$(printf '%s\n' "$WS_OUT" | sed -n 's/.*\(workspace:[0-9][0-9]*\).*/\1/p' | head -1)
     if [ -n "$WS_REF" ]; then
       ( for _ in 1 2 3; do
           sleep 3
           "$CMUX" tab-action --action rename --workspace "$WS_REF" --title "$TAB_TITLE" >/dev/null 2>&1
         done ) &
-    fi
-    # The launch succeeded (create returned 0 AND the workspace ref parsed):
-    # write the confirmed token so later triggers dedup on a real launch. This
-    # is deliberately UNCONDITIONAL on the claim — a --force run skipped the
-    # claim mkdir but is still a real launch, and round-1 stamped on any
-    # successful create. Gating on CLAIMED meant a first force run of the day
-    # left no token, so the next scheduled trigger opened a second workspace.
-    # Requiring the parsed ref (not just rc 0) is the extra guard: a cmux that
-    # exits 0 without producing a workspace does not count as launched.
-    # touch failure (e.g. read-only logs) is reported but not fatal: the
-    # workspace IS open; dropping the claim would make the next trigger open a
-    # duplicate on top of it.
-    if [ -n "$WS_REF" ] && ! touch "$LAUNCH_CONFIRMED" 2>/dev/null; then
-      echo "review.sh: WARNING could not write confirmed token $LAUNCH_CONFIRMED" >&2
     fi
     exit 0
   fi

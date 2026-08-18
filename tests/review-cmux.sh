@@ -229,16 +229,17 @@ test_stale_markers_are_pruned(){
 }
 
 # A confirmed launch past the grace window must STILL be deduped (the age-based
-# reclaim only ever looks at *unconfirmed* claims). Aging the confirmed pair to
-# 2001 makes MARKER_AGE big enough that a naive reclaim would misfire — this
-# pins that confirmation wins over age.
+# reclaim only ever looks at *unconfirmed* claims). Aging the confirmed pair
+# beyond the 900s grace but under the 14-day forest prune makes MARKER_AGE big
+# enough that a naive reclaim would misfire while the (now unconditional) 14-day
+# reap does not scavenge the fixture — pinning that confirmation wins over age.
 test_confirmed_marker_survives_grace(){
   local root; root=$(setup_env)
   mk_report "$root" 2020-01-02 "$REPORT_OPEN"
   run_review "$root" 2020-01-02                      # 1 create, confirmed stamped
   local dir; dir=$(marker_dir "$root" 2020-01-02)
   local conf; conf=$(marker_confirmed "$root" 2020-01-02)
-  touch -t 200101010000 "$dir" "$conf"               # age >> CLAIM_GRACE
+  touch -t "$(date -v-2d +%Y%m%d%H%M.%S)" "$dir" "$conf"   # >900s grace, <14d prune
   run_review "$root" 2020-01-02
   assert_eq "$(cmux_calls "$root")" 1 "confirmed launch is deduped even past the grace window"
 }
@@ -251,7 +252,7 @@ test_abandoned_claim_is_reclaimed(){
   mk_report "$root" 2020-01-02 "$REPORT_OPEN"
   local dir; dir=$(marker_dir "$root" 2020-01-02)
   mkdir -p "$dir"
-  touch -t 200101010000 "$dir"                       # unconfirmed, age >> grace
+  touch -t "$(date -v-2d +%Y%m%d%H%M.%S)" "$dir"     # unconfirmed, >grace, <14d prune
   run_review "$root" 2020-01-02
   assert_eq "$(cmux_calls "$root")" 1 "abandoned claim is reclaimed and the popup opens"
   assert_grep "$root/out" 'reclaiming abandoned claim' "reclaim is reported"
@@ -345,6 +346,28 @@ test_logs_dir_failure_exits_nonzero(){
   assert_grep "$root/out" 'cannot create logs dir' "logs-dir failure is named"
 }
 
+# A logs dir that EXISTS but cannot be written (mkdir -p passes, the claim
+# mkdir fails) must exit non-zero for the I/O error — not report "already in
+# progress" and exit 0, which silently drops triage.
+test_unwritable_claim_dir_fails(){
+  local root; root=$(setup_env)
+  mk_report "$root" 2020-01-02 "$REPORT_OPEN"
+  mkdir -p "$root/autodream/logs"
+  chmod 500 "$root/autodream/logs"                   # owned+r, not writable
+  local rc=0
+  env AUTODREAM_DIR="$root/autodream" \
+    AUTODREAM_CONFIG="$root/nonexistent-config" \
+    AUTODREAM_TRIAGE_SURFACE=cmux \
+    CMUX_BIN="$root/cmux-mock.sh" \
+    CMUX_LOG="$root/cmux.log" \
+    DREAMS_DIR="$root/dreams" \
+    bash "$REVIEW" 2020-01-02 > "$root/out" 2>&1 || rc=$?
+  chmod 700 "$root/autodream/logs"                   # restore so sandbox can rm
+  assert_eq "$rc" 1 "unwritable claim dir exits non-zero (not 'in progress')"
+  assert_grep "$root/out" 'cannot create claim' "claim I/O error is named"
+  assert_eq "$(cmux_calls "$root")" 0 "no cmux launch when the claim could not be written"
+}
+
 # A legacy date-only marker that predates the current report (the date was
 # triaged, then the report rebuilt with new content before upgrade) must NOT be
 # migrated onto the new digest — that would mark unreviewed content confirmed
@@ -362,6 +385,44 @@ test_legacy_marker_stale_is_not_migrated(){
   [ -f "$(marker_confirmed "$root" 2020-01-02)" ] \
     && ok "rebuilt report gets its own confirmed token" \
     || no "rebuilt report has no confirmed token"
+}
+
+# cmux exiting 0 is the creation contract: confirmation is bound immediately
+# even if the stdout ref does not parse (round-4 executor #2: a kill between
+# create and confirm, or a stdout-format change, must NEVER let the age-reclaim
+# open a duplicate). An empty ref only costs the cosmetic tab-title rename.
+test_empty_ref_still_confirms(){
+  local root; root=$(setup_env)
+  mk_report "$root" 2020-01-02 "$REPORT_OPEN"
+  cat > "$root/cmux-noref.sh" <<'MOCK'
+#!/bin/bash
+echo "$@" >> "$CMUX_LOG"              # log so cmux_calls can count us
+echo "created workspace"            # success exit, no workspace:NN ref
+exit 0
+MOCK
+  chmod +x "$root/cmux-noref.sh"
+  local rc=0
+  env AUTODREAM_DIR="$root/autodream" \
+    AUTODREAM_CONFIG="$root/nonexistent-config" \
+    AUTODREAM_TRIAGE_SURFACE=cmux \
+    CMUX_BIN="$root/cmux-noref.sh" \
+    CMUX_LOG="$root/cmux.log" \
+    DREAMS_DIR="$root/dreams" \
+    bash "$REVIEW" 2020-01-02 > "$root/out" 2>&1 || rc=$?
+  assert_eq "$rc" 0 "empty ref on rc-0 still exits 0"
+  [ -f "$(marker_confirmed "$root" 2020-01-02)" ] \
+    && ok "rc-0 confirm is bound regardless of parseable ref" \
+    || no "rc-0 launch left no confirmed token (next trigger could duplicate)"
+  # The bind must hold: a second run for the same report dedups.
+  env AUTODREAM_DIR="$root/autodream" \
+    AUTODREAM_CONFIG="$root/nonexistent-config" \
+    AUTODREAM_TRIAGE_SURFACE=cmux \
+    CMUX_BIN="$root/cmux-noref.sh" \
+    CMUX_LOG="$root/cmux.log" \
+    DREAMS_DIR="$root/dreams" \
+    bash "$REVIEW" 2020-01-02 > "$root/out2" 2>&1 || rc=$?
+  assert_eq "$(cmux_calls "$root")" 1 "confirmed empty-ref launch dedups the next trigger"
+  assert_grep "$root/out2" 'already launched for this report' "dedup notice fired"
 }
 
 # ---------------------------------------------------------------------------
@@ -384,6 +445,8 @@ test_legacy_marker_stale_is_not_migrated
 test_headless_missing_cmux_fails
 test_interactive_missing_cmux_falls_back_inline
 test_logs_dir_failure_exits_nonzero
+test_unwritable_claim_dir_fails
+test_empty_ref_still_confirms
 echo
 echo "----------------------------------------"
 echo "passed: $pass   failed: $fail"

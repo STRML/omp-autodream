@@ -234,10 +234,13 @@ PLIST
   # otherwise pass the install check but be unfindable at runtime.
   local cfg_cmux=""
   if [ -f "$TARGET/config" ]; then
-    # capture an uncommented CMUX_BIN=... line from the config that will ship
-    # with this install (review.sh sources $AUTODREAM_DIR/config at runtime,
-    # so this is the same value the scheduled job will resolve).
-    cfg_cmux=$(sed -n 's/^[[:space:]]*CMUX_BIN=[[:space:]]*//p' "$TARGET/config" | head -1)
+    # Read CMUX_BIN with the SAME semantics review.sh uses at runtime (it
+    # sources this config as Bash): a subshell apply handles $HOME/~ expansion
+    # and quotes correctly. A sed/raw-read would grab literal quote characters
+    # from `CMUX_BIN="$HOME/bin/cmux"` and fail the -x test, wrongly skipping
+    # (and unloading) the review agent for a perfectly valid config.
+    cfg_cmux=$( autodream_cfg_scope=${TARGET}/config; bash -c 'unset CMUX_BIN; . "$1" >/dev/null 2>&1; printf "%s" "${CMUX_BIN:-}"' _ "$autodream_cfg_scope" )
+    cfg_cmux=${cfg_cmux//\"/}
   fi
   CMUX_DEFAULT=/Applications/cmux.app/Contents/Resources/bin/cmux
   CMUX_FOUND=""
@@ -320,7 +323,7 @@ PLIST
   fi
   launchctl bootout   "$domain/$review_label" 2>/dev/null || true
   launchctl bootstrap "$domain" "$review_plist"
-  echo "  scheduled: $review_label  (daily 08:00/09:15/12:15)  -> $review_plist"
+  echo "  scheduled: $review_label  (daily 08:00/09:15/12:15/15:30)  -> $review_plist"
 }
 
 echo
