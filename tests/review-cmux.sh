@@ -387,6 +387,49 @@ test_legacy_marker_stale_is_not_migrated(){
     || no "rebuilt report has no confirmed token"
 }
 
+# A workspace whose embedded claude cannot start is a confirmed dead end: the
+# token would be written on cmux success and every later trigger dedupes on it.
+# Preflight the exact CLAUDE_BIN path we pass into the workspace env.
+test_missing_claude_preflights(){
+  local root; root=$(setup_env)
+  mk_report "$root" 2020-01-02 "$REPORT_OPEN"
+  local rc=0
+  env AUTODREAM_DIR="$root/autodream" \
+    AUTODREAM_CONFIG="$root/nonexistent-config" \
+    AUTODREAM_TRIAGE_SURFACE=cmux \
+    CMUX_BIN="$root/cmux-mock.sh" \
+    CMUX_LOG="$root/cmux.log" \
+    CLAUDE_BIN="$root/nonexistent-claude" \
+    DREAMS_DIR="$root/dreams" \
+    bash "$REVIEW" 2020-01-02 > "$root/out" 2>&1 || rc=$?
+  assert_eq "$rc" 1 "missing claude aborts before launching the workspace"
+  assert_grep "$root/out" 'claude binary not found' "claude-missing is named"
+  assert_eq "$(cmux_calls "$root")" 0 "no workspace created for a missing claude"
+  [ ! -e "$(marker_confirmed "$root" 2020-01-02)" ] \
+    && ok "no confirmed token for a never-launched workspace" \
+    || no "confirmed token written despite preflight abort"
+}
+
+# shasum is the content-digest contract; if it is missing the marker must FAIL
+# CLOSED (exit non-zero) rather than silently regress to seconds-resolution
+# mtime and reintroduce same-second collision dedup bugs.
+test_missing_shasum_fails_closed(){
+  local root; root=$(setup_env)
+  mk_report "$root" 2020-01-02 "$REPORT_OPEN"
+  local rc=0
+  # PATH without /usr/bin hides shasum while keeping bash/coreutils.
+  env AUTODREAM_DIR="$root/autodream" \
+    AUTODREAM_CONFIG="$root/nonexistent-config" \
+    AUTODREAM_TRIAGE_SURFACE=cmux \
+    CMUX_BIN="$root/cmux-mock.sh" \
+    CMUX_LOG="$root/cmux.log" \
+    DREAMS_DIR="$root/dreams" \
+    PATH="$root:/bin" \
+    bash "$REVIEW" 2020-01-02 > "$root/out" 2>&1 || rc=$?
+  assert_eq "$rc" 1 "missing shasum aborts (fail closed)"
+  assert_grep "$root/out" 'shasum unavailable' "shasum-missing is named"
+}
+
 # cmux exiting 0 is the creation contract: confirmation is bound immediately
 # even if the stdout ref does not parse (round-4 executor #2: a kill between
 # create and confirm, or a stdout-format change, must NEVER let the age-reclaim
@@ -447,6 +490,8 @@ test_interactive_missing_cmux_falls_back_inline
 test_logs_dir_failure_exits_nonzero
 test_unwritable_claim_dir_fails
 test_empty_ref_still_confirms
+test_missing_claude_preflights
+test_missing_shasum_fails_closed
 echo
 echo "----------------------------------------"
 echo "passed: $pass   failed: $fail"

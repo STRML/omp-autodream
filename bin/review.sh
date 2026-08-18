@@ -211,9 +211,15 @@ if [ "$AUTODREAM_TRIAGE_SURFACE" = "cmux" ]; then
     REPORT_KEY=$(shasum -a 256 "$REPORT" 2>/dev/null | awk '{print $1}')
     # The assignment's exit status is awk's (0 even on empty input), so a
     # failing/missing shasum must be detected by emptiness, not rc — an empty
-    # key would collapse every report that day to the same marker. Fall back
-    # to the mtime (a failed shasum is the only path that lands here).
-    [ -n "$REPORT_KEY" ] || REPORT_KEY="mtime-$(stat -f %m "$REPORT" 2>/dev/null || echo 0)"
+    # key would collapse every report that day to the same marker. Fail CLOSED
+    # rather than regressing to seconds-resolution mtime: that would silently
+    # reintroduce the exact same-second collision the digest contract exists to
+    # prevent (executor 5.8). shasum ships with macOS; a host without it is a
+    # host that cannot run a content-bound review.
+    if [ -z "$REPORT_KEY" ]; then
+      echo "review.sh: shasum unavailable; cannot compute report digest, aborting triage" >&2
+      exit 1
+    fi
     LAUNCH_MARKER="$LOGS_DIR/review-launched-$DATE-$REPORT_KEY"
     # Confirmation lives as a SIBLING file, not inside the claim dir: the
     # stale-reap below uses `find -delete` (rmdir semantics), which silently
@@ -243,7 +249,6 @@ if [ "$AUTODREAM_TRIAGE_SURFACE" = "cmux" ]; then
       fi
     fi
     CLAIM_GRACE=900
-    CLAIMED=0
     # Reap stale state so it cannot grow unbounded: claim dirs and confirmed
     # tokens older than 14 days. `-delete` handles both the empty dir and its
     # sibling file. Unconditional on --force: the force path is exactly the
@@ -287,7 +292,6 @@ if [ "$AUTODREAM_TRIAGE_SURFACE" = "cmux" ]; then
         echo "review.sh: cannot create claim $LAUNCH_MARKER" >&2
         exit 1
       fi
-      CLAIMED=1
     fi
     SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
     # Workspace + tab are named after the triaged date (ISO, i.e. the report's
@@ -307,6 +311,20 @@ if [ "$AUTODREAM_TRIAGE_SURFACE" = "cmux" ]; then
     # legitimately contain apostrophes (e.g. an install under /tmp/O'Brien),
     # and an unquoted one would break the inner shell parse. $FORCE_ARG is
     # generated here and can only be empty or " --force", so it stays literal.
+    # A workspace that opens but whose embedded claude can't start is a waste:
+    # the confirmed token (below) is written on cmux success, so a missing
+    # CLAUDE_BIN would make every future trigger dedupe on a token whose session
+    # died in the workspace (executor 5.1). Preflight the EXACT path we pass
+    # into the workspace env (CLAUDE_BIN resolves to $HOME/.local/bin/claude by
+    # default, or config/env) — a `command -v` on the basename would accept a
+    # different PATH claude that the workspace env never uses. claude-existing-
+    # but-crashing at startup remains visible in the open workspace; proving the
+    # child actually reached claude would require an async handshake that makes
+    # the trigger block, so this subset is closed and the rest is residual.
+    if [ ! -x "$CLAUDE_BIN" ]; then
+      echo "review.sh: claude binary not found ($CLAUDE_BIN); not launching triage workspace" >&2
+      exit 1
+    fi
     shq(){ printf '%q' "$1"; }
     INNER_CMD="env AUTODREAM_TRIAGE_SURFACE=inline CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 DREAMS_DIR=$(shq "$DREAMS_DIR") CLAUDE_BIN=$(shq "$CLAUDE_BIN") $(shq "$SELF") $(shq "$DATE")$FORCE_ARG"
     WS_OUT=$("$CMUX" workspace create \
@@ -322,7 +340,11 @@ if [ "$AUTODREAM_TRIAGE_SURFACE" = "cmux" ]; then
     # workspace-like output would also satisfy the ref parse below and latch a
     # false marker.
     if [ "$WS_RC" -ne 0 ]; then
-      [ "$CLAIMED" -eq 1 ] && rmdir "$LAUNCH_MARKER" 2>/dev/null || true
+      # Release the claim unconditionally. A --force run skips claim acquisition
+      # but may be retrying over an abandoned claim from a killed normal run
+      # (executor 5.2); that stale claim must be released too, or scheduled
+      # triggers report "already in progress" for the next grace window.
+      rmdir "$LAUNCH_MARKER" 2>/dev/null || true
       echo "review.sh: cmux workspace create failed (exit $WS_RC); triage not opened" >&2
       exit 1
     fi
@@ -334,18 +356,17 @@ if [ "$AUTODREAM_TRIAGE_SURFACE" = "cmux" ]; then
     # This is unconditional on the claim (a --force run skipped the claim mkdir
     # but is still a real launch, and round-1 stamped on any successful create).
     #
-    # Executor race: a concurrent --force rebuild (run.sh:1214) can replace
-    # the report between our hash above and the workspace actually reading it.
-    # Re-check: if the on-disk content changed, the workspace triaged the NEW
-    # report, so bind the confirmed token to the NEW digest (the inner run will
-    # recompute its own key anyway on its next trigger), not the stale one we
-    # launched under. Only the string compare matters; recompute via the same
-    # command as the marker computation.
-    CURRENT_KEY=$(shasum -a 256 "$REPORT" 2>/dev/null | awk '{print $1}')
-    if [ -n "$CURRENT_KEY" ] && [ "$CURRENT_KEY" != "$REPORT_KEY" ]; then
-      echo "review.sh: report changed while launching (digest $REPORT_KEY -> $CURRENT_KEY); binding confirm to current digest" >&2
-      LAUNCH_CONFIRMED="$LOGS_DIR/review-launched-$DATE-$CURRENT_KEY.confirmed"
-    fi
+    # Auditor race: a concurrent --force rebuild can replace $REPORT between
+    # our launch-time hash and the workspace actually reading it. We bind the
+    # confirmed token to the LAUNCH-TIME digest (REPORT_KEY) — the digest we
+    # decided to triage — never re-hash after create to chase the current file.
+    # The child reads the mutable path at spawn, so the parent cannot know
+    # which bytes it consumed; rewriting the token to a post-race digest (an
+    # earlier revision did this) could mark a report B "confirmed" when the
+    # workspace triaged the older A, silently swallowing B's new questions.
+    # Bound to A, a genuine B that the child did not read has no token of its
+    # its own and its own later trigger surfaces it — at worst a duplicate
+    # popup for a same-instant rebuild, never a lost triage.
     # touch failure is warned, not fatal: the workspace IS created at this
     # point; the unconfirmed claim (if any) is grace-bounded and the next
     # trigger's reclaim would open a duplicate, so report it loudly but do not

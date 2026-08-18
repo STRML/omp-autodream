@@ -247,6 +247,16 @@ PLIST
   { [ -n "$cfg_cmux" ] && [ -x "$cfg_cmux" ]; } && CMUX_FOUND="$cfg_cmux"
   { [ -z "$CMUX_FOUND" ] && command -v cmux >/dev/null 2>&1; } && CMUX_FOUND=$(command -v cmux)
   { [ -z "$CMUX_FOUND" ] && [ -x "$CMUX_DEFAULT" ]; } && CMUX_FOUND="$CMUX_DEFAULT"
+  # launchd runs the job with no working directory, so a relative CMUX_BIN that
+  # passed `-x` here (it resolved against the installer's cwd) would fail at
+  # runtime — every trigger hits the headless-fail branch. Refuse relative.
+  if [ -n "$CMUX_FOUND" ] && [ "${CMUX_FOUND#/}" = "$CMUX_FOUND" ]; then
+    echo "  ! cmux at $CMUX_FOUND is relative; review LaunchAgent needs an absolute path" >&2
+    CMUX_FOUND=""
+  fi
+  # XML-escape the value before embedding in the plist: a path containing & or
+  # < breaks the <string> element and plutil/launchctl reject the job.
+  CMUX_FOUND_XML=$(printf '%s' "${CMUX_FOUND:-}" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
   local review_label="${label}-review"
   if [ -z "$CMUX_FOUND" ]; then
     echo "  ! cmux not found (config CMUX_BIN, PATH, or $CMUX_DEFAULT); skipping review LaunchAgent"
@@ -278,6 +288,7 @@ PLIST
         <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>15</integer></dict>
         <dict><key>Hour</key><integer>12</integer><key>Minute</key><integer>15</integer></dict>
         <dict><key>Hour</key><integer>15</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Hour</key><integer>18</integer><key>Minute</key><integer>15</integer></dict>
     </array>
     <key>RunAtLoad</key>
     <false/>
@@ -290,7 +301,7 @@ PLIST
         <key>AUTODREAM_DIR</key><string>$TARGET</string>
         <key>DREAMS_DIR</key><string>$TARGET_PARENT/dreams</string>
         <key>AUTODREAM_TRIAGE_SURFACE</key><string>cmux</string>
-        <key>CMUX_BIN</key><string>$CMUX_FOUND</string>
+        <key>CMUX_BIN</key><string>${CMUX_FOUND_XML}</string>
     </dict>
     <key>StandardOutPath</key>
     <string>$TARGET/logs/review-launch.out.log</string>
@@ -323,7 +334,7 @@ PLIST
   fi
   launchctl bootout   "$domain/$review_label" 2>/dev/null || true
   launchctl bootstrap "$domain" "$review_plist"
-  echo "  scheduled: $review_label  (daily 08:00/09:15/12:15/15:30)  -> $review_plist"
+  echo "  scheduled: $review_label  (daily 08:00/09:15/12:15/15:30/18:15)  -> $review_plist"
 }
 
 echo
