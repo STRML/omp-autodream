@@ -1849,6 +1849,7 @@ test_skills_inventory(){
     '  ignoredSkills:' \
     '    - alpha # documented off' \
     '    - "betaquoted"' \
+    '    - renamed-here' \
     '' \
     '    - gamma' \
     '  toolAllow:' \
@@ -1860,7 +1861,9 @@ test_skills_inventory(){
     "$SK/alpha" "$SK/betaquoted" "$SK/gamma" "$SK/delta" "$SK/off-skill" \
     "$SK/folded-desc" "$SK/block-name" "$SK/dirname-fallback" \
     "$SK/commented-name" "$SK/block-no-value" \
+    "$SK/renamed-here" \
     "$T/home/.claude/plugins/someplugin/skills/plgsku" \
+    "$T/home/.claude/plugins/p1/p2/p3/p4/p5/p6/skills/deep-skill" \
     "$T/home/.claude-ds4/skills/shared-skill" \
     "$T/home/.agents/skills/shared-dup" \
     "$T/home/.config/opencode/skills/oc-skill" \
@@ -1879,6 +1882,15 @@ test_skills_inventory(){
   printf '%s\n' '---' 'name: >-' 'description: survives the name swallow' '---' > "$SK/block-no-value/SKILL.md"
   printf '%s\n' '---' 'name: plgsku' 'description: nested plugin skill' '---' \
     > "$T/home/.claude/plugins/someplugin/skills/plgsku/SKILL.md"
+  # A plugin skill sitting at depth 9 from the plugins root: the old -maxdepth 8 cap
+  # silently dropped files past it, so this must still be found.
+  printf '%s\n' '---' 'name: deep-skill' 'description: far below the plugins root' '---' \
+    > "$T/home/.claude/plugins/p1/p2/p3/p4/p5/p6/skills/deep-skill/SKILL.md"
+  # Excluded by on-disk DIRECTORY name: the ignore list names the dir the operator
+  # sees, and this skill's frontmatter name differs from its directory — the
+  # exclusion must still apply.
+  printf '%s\n' '---' 'name: actual-name' 'description: dir-name ignored' '---' \
+    > "$SK/renamed-here/SKILL.md"
   printf '%s\n' '---' 'name: shared-skill' 'description: from the ds4 bucket' '---' \
     > "$T/home/.claude-ds4/skills/shared-skill/SKILL.md"
   printf '%s\n' '---' 'name: shared-skill' 'description: from the agents root' '---' \
@@ -1910,6 +1922,8 @@ test_skills_inventory(){
   assert_grep   "$T/out.txt" '^triage\tfrontmatter comments stripped$' "inline comments are stripped from name and description"
   assert_grep   "$T/out.txt" '^block-no-value\tsurvives the name swallow$' "an empty block-scalar name falls back to dirname and does not swallow the next key"
   assert_grep   "$T/out.txt" '^plgsku\t' "plugin skill found under plugins/"
+  assert_grep   "$T/out.txt" '^deep-skill\t' "a plugin skill at depth 9 (past the old -maxdepth 8 cap) is found"
+  assert_nogrep "$T/out.txt" '^actual-name\t' "a skill whose on-disk directory name is in ignoredSkills is excluded even when its frontmatter name differs"
   assert_grep   "$T/out.txt" '^oc-skill\t' "opencode root skill listed"
   assert_grep   "$T/out.txt" '^mang\t' "OMP managed-root skill listed"
 
