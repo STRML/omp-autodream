@@ -245,16 +245,21 @@ already_emitted() {                                  # $1=name ; first occurrenc
 }
 
 scan_skill() {                                       # $1=path to SKILL.md ; emit if active
-  local s="$1" name
+  local s="$1" name dir_name
   [ -f "$s" ] || return 0
   read_frontmatter "$s"
   [ "$FM_ENABLED" = 1 ] || return 0
+  dir_name="$(basename "$(dirname "$s")")"
   name="$FM_NAME"
   case "$name" in
     ">"|">-"|"|"|"|-") name="" ;;
   esac
-  [ -n "$name" ] || name="$(basename "$(dirname "$s")")"
+  [ -n "$name" ] || name="$dir_name"
+  # A skill is disabled when its resolved name OR its on-disk directory name is in
+  # skills.ignoredSkills: an operator disables by whichever spelling they see, and a
+  # skill's frontmatter `name:` routinely differs from the directory it lives in.
   in_ignored "$name" && return 0
+  [ "$name" != "$dir_name" ] && in_ignored "$dir_name" && return 0
   already_emitted "$name" && return 0
   emitted="$emitted
 $name"
@@ -290,10 +295,12 @@ tmpfile="$(mktemp "$outdir/skills-inventory.XXXXXX" 2>/dev/null)" || {
     done
     if [ -d "$bucket/plugins" ]; then
       # Plugin skills live at arbitrary depth; `find` + `-path` beats a `*` glob that
-      # cannot cross `/`.
+      # cannot cross `/`. No `-maxdepth` cap: the `*/skills/*/SKILL.md` path shape
+      # already bounds the result set, and a fixed cap silently drops deeper skills
+      # (measured: 4 plugin SKILL.md nested one level past an `-maxdepth 8` cut).
       while IFS= read -r s; do
         scan_skill "$s"
-      done < <(find "$bucket/plugins" -maxdepth 8 -path '*/skills/*/SKILL.md' -type f 2>/dev/null)
+      done < <(find "$bucket/plugins" -path '*/skills/*/SKILL.md' -type f 2>/dev/null)
     fi
   done
 } > "$tmpfile"

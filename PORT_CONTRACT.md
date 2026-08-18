@@ -7,7 +7,7 @@ Cross-slice interfaces for porting cc-autodream to OMP. All slices agree on thes
 - Never invoke `claude` in the OMP variant.
 - Headless invocation pattern per worker:
   `$OMP_BIN --allow-home -p --permission-mode bypassPermissions --no-session-persistence --strict-mcp-config --disable-slash-commands --config "$NO_ADVISOR_CFG" [--model <L1_MODEL>]`
-- Tools grant: keep `--tools Read Write` (L1) and `--tools Glob Read Write Edit` (L2) if omp accepts the same flag; if omp rejects `--tools`, drop it (L1/L2 already get a scoped tool surface via system prompt).
+- Tools grant: L1 workers get `--tools=Read,Write` (read the transcript, write the findings JSON); the L2 aggregator gets `--tools=Glob,Read` — no Write/Edit, because L2 emits the report on stdout only and must never touch files. Both flags are accepted by omp.
 
 ## Advisor-off overlay (REQUIRED on every worker)
 - File: `$AUTODREAM_DIR/l1-no-advisor.yml` (written by install.sh), content:
@@ -34,8 +34,9 @@ Cross-slice interfaces for porting cc-autodream to OMP. All slices agree on thes
 - User-turn timestamps: from the record's own `timestamp` field (ISO).
 - Sidechain/subagent: OMP marks subagent transcripts — use custom_type markers; default `isSidechain:false` unless a `custom` record signals subagent (e.g. `agent`/`subagent` custom types). Keep bias-to-triage on unknown.
 
-## Findings/reports/state — UNCHANGED by the port
-- `findings/<date>/`, `dreams/<date>.md`, `notes.md`, `inbox/`, `run-stats.txt`, report-complete marker `autodream:open-questions=`, L1 idempotency (findings JSON with `.findings` key), retry rounds, SIGPIPE hardening, consume gates. Port does NOT touch these.
+## Findings/reports/state
+- `findings/<date>/`, `dreams/<date>.md`, `notes.md`, `inbox/`, `run-stats.txt`, report-complete marker `autodream:open-questions=`, L1 idempotency (findings JSON with `.findings` key), retry rounds, SIGPIPE hardening, consume gates. The port keeps all of these.
+- L2 report delivery changed: the aggregator has NO Write tool. It prints the report on stdout ending with an `AUTODREAM_REPORT_END` line; run.sh strips everything from the LAST sentinel into `dreams/<date>.md` (atomic tmp+rename) and appends the post-sentinel `report:` + 3-line summary to the run log. A capture is a validated delivery only with the sentinel present AND the `autodream:open-questions=` marker.
 
 ## L1/L2 models
 - L1: `runinfra/deepseek-v4-flash` (env `AUTODREAM_L1_MODEL`, default that).
