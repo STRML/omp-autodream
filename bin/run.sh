@@ -14,6 +14,8 @@
 #
 # Environment overrides (all optional):
 #   OMP_BIN        path to omp CLI                       default: /opt/homebrew/bin/omp
+#   AUTODREAM_L1_ONLY  set 1 to stop after L1: findings + run-stats are written, L2 is
+#                  skipped, nothing is consumed, exit 0                       default: 0
 #   NO_ADVISOR_CFG path to the advisor-off yaml passed as --config to every worker
 #                  (keeps the opus advisor from booting on headless runs)
 #                                                        default: $AUTODREAM_DIR/l1-no-advisor.yml
@@ -715,6 +717,10 @@ unassembled_dates() {
     # Findings JSONs only. A dir holding nothing but *.stats.json sidecars was never
     # triaged, so it has nothing to assemble and is not a failure.
     found=$(find "$d" -maxdepth 1 -type f -name '*.json' ! -name '*.stats.json' 2>/dev/null | head -1)
+    # An L1-only run leaves findings and no report on purpose, and says so with a marker.
+    # Without this the warning fires every night on a host that splits triage from
+    # aggregation, which is how a real warning gets trained into background noise.
+    [ -f "$d/l1-only" ] && continue
     [ -n "$found" ] || continue
     report="$DREAMS_DIR/$date_label.md"
     if [ -s "$report" ] && grep -q 'autodream:open-questions=' "$report" 2>/dev/null; then
@@ -1113,6 +1119,35 @@ PY
   [ -x "$skills_inv" ] || skills_inv="$AUTODREAM_DIR/skills-inventory.sh"
   "$skills_inv" "$FINDINGS_DIR/skills-inventory.txt" 2>/dev/null \
     || printf '# skills-inventory.txt unavailable\n' > "$FINDINGS_DIR/skills-inventory.txt"
+
+  # ---- L1-only: stop here, deliberately, with everything L2 would need on disk ----
+  # This install triages OMP sessions; a Claude install triages Claude sessions. When both
+  # run on one host, the useful division is that each does its own L1 and ONE aggregation
+  # runs over the union — otherwise both pay for an L2 whose report nobody reads, and a
+  # pattern with evidence in both harnesses is split across two reports where neither can
+  # see it. This is the seam for that (see #11).
+  #
+  # Placed after the L2 *inputs* are assembled (findings, run-stats, changelog window,
+  # operator notes, bookmarks, skills inventory) so the findings dir is a complete
+  # aggregation package, and before anything that acts on a report — in particular before
+  # the stale-report move below, which would rename a good report aside for a replacement
+  # this run is never going to write.
+  #
+  # Nothing is consumed: the vault-notes archive, the x-bookmark mark-read and the
+  # open-questions inbox are all gated on a validated report, so they are skipped by
+  # construction. The marker file records that the missing report was intentional, so
+  # unassembled_dates() does not report this date as abandoned every single night.
+  #
+  # AUTODREAM_L2_ATTEMPTS=0 is not a substitute: `seq 1 0` is empty so L2 never runs, but
+  # the run then takes the no-delivery path — WARNING, non-zero exit, and a date that
+  # looks abandoned.
+  if [ "${AUTODREAM_L1_ONLY:-0}" = "1" ]; then
+    : > "$FINDINGS_DIR/l1-only"
+    log "L1-only: findings ready at $FINDINGS_DIR; skipping L2, consuming nothing"
+    log "         assemble with: AUTODREAM_FORCE=1 $AUTODREAM_DIR/run.sh $TARGET_DATE"
+    log "===== autodream end: $(date) ====="
+    return 0
+  fi
 
   # ---- Layer 2: opus aggregate, retried until a validated report lands ----
   # The aggregator call can also die to a mid-run sleep (this is what left exit 1 +

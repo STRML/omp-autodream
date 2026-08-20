@@ -594,6 +594,73 @@ test_session_stats(){
   rm -rf "$root"
 }
 
+# ---- L1-only mode ----
+# For a host running two autodream installs (one per harness), the useful division is:
+# each install triages its own sessions, and ONE aggregation runs over the union. Without
+# a way to stop after L1 that costs an extra L2 per install, every night, for reports
+# nobody reads. AUTODREAM_L2_ATTEMPTS=0 almost does it (`seq 1 0` is empty) but then takes
+# the no-report path: warning logged, non-zero exit, and the date looks abandoned.
+test_l1_only_stops_after_findings(){
+  echo "# L1-only: findings land, no report, exit 0"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  local h; h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
+  AUTODREAM_L1_ONLY=1 run_dream "$root"
+  assert_eq "$(cat "$root/run.exit")" "0" "an intentional stop is not a failure"
+  assert_file    "$(fdir "$root")/$h.json"      "the findings JSON is written"
+  assert_file    "$(fdir "$root")/run-stats.txt" "the self-audit is written"
+  assert_no_file "$root/dreams/$DATE.md"         "no report is produced"
+  assert_grep    "$root/run.out" 'L1-only' "the run says why it stopped"
+  rm -rf "$root"
+}
+
+test_l1_only_consumes_nothing(){
+  echo "# L1-only: no inbox file, nothing archived"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  # A note in the vault inbox is the sharpest probe: the consume gates live after L2, so
+  # returning early must leave it for the run that actually assembles a report.
+  local vault="$root/vault"; mkdir -p "$vault/inbox"
+  printf 'a note for the aggregator\n' > "$vault/inbox/note.md"
+  AUTODREAM_VAULT_DIR="$vault" AUTODREAM_L1_ONLY=1 run_dream "$root"
+  assert_file    "$vault/inbox/note.md" "the vault note stays in the inbox"
+  assert_eq      "$(ls "$root/inbox" 2>/dev/null | wc -l | tr -d ' ')" "0" "no open-questions inbox file"
+  rm -rf "$root"
+}
+
+test_l1_only_date_is_not_reported_abandoned(){
+  echo "# L1-only: an intentionally unassembled date is not flagged as a failure"
+  local root; root=$(setup_env); mk_session "$root" s1
+  # A prior date left by an L1-only run: findings, no report, and the marker that says
+  # the omission was deliberate. Without the marker check this warning would fire every
+  # night on a host that splits triage from aggregation.
+  local prior="$root/autodream/findings/2020-01-01"
+  mkdir -p "$prior"
+  printf '{"session_path":"x","project":"proj-a","findings":[]}\n' > "$prior/aaaaaaaaaaaa.json"
+  : > "$prior/l1-only"
+  run_dream "$root"
+  assert_grep   "$(fdir "$root")/run-stats.txt" 'unassembled_dates: *$' "an L1-only date is not listed"
+  assert_nogrep "$root/run.out" 'findings but no complete report' "and no warning is logged"
+  # Control: the same findings dir WITHOUT the marker is still reported, so the marker is
+  # doing the work rather than the scan having been broken.
+  rm -f "$prior/l1-only" "$root/dreams/$DATE.md"
+  run_dream "$root"
+  assert_grep "$(fdir "$root")/run-stats.txt" 'unassembled_dates: 2020-01-01' "without the marker it is listed"
+  rm -rf "$root"
+}
+
+test_l1_only_then_assemble(){
+  echo "# L1-only: a later normal run assembles the same date without re-triaging"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  AUTODREAM_L1_ONLY=1 run_dream "$root"
+  local h; h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
+  export MOCK_CALL_LOG="$root/calls.txt"; run_dream "$root"; unset MOCK_CALL_LOG
+  assert_file "$root/dreams/$DATE.md" "the report lands on the assembling run"
+  # MOCK_CALL_LOG records one line per L1 invocation. L1 is idempotent, so the assembling
+  # run must spend no worker on an already-triaged session — that is the entire economic
+  # argument for splitting the phases.
+  assert_nogrep "$root/calls.txt" "$h" "no L1 worker ran for the already-triaged session"
+  rm -rf "$root"
+}
+
 test_happy(){
   echo "# happy path"
   local root; root=$(setup_env); mk_session "$root" sess1
@@ -1638,6 +1705,10 @@ test_overlap_not_measured_malformed_output(){
 
 echo "cc-autodream integration tests (mock claude)"
 echo
+test_l1_only_stops_after_findings
+test_l1_only_consumes_nothing
+test_l1_only_date_is_not_reported_abandoned
+test_l1_only_then_assemble
 test_happy
 test_session_stats
 test_unreadable
