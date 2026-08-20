@@ -13,7 +13,8 @@
 #   FANOUT=4 ./run.sh    # tune L1 parallelism (default 8)
 #
 # Environment overrides (all optional):
-#   OMP_BIN        path to omp CLI                       default: /opt/homebrew/bin/omp
+#   OMP_BIN        path to omp CLI    default: resolved from PATH, then $HOME/.bun/bin,
+#                  /opt/homebrew/bin, /usr/local/bin, $HOME/.local/bin, $HOME/.cargo/bin
 #   NO_ADVISOR_CFG path to the advisor-off yaml passed as --config to every worker
 #                  (keeps the opus advisor from booting on headless runs)
 #                                                        default: $AUTODREAM_DIR/l1-no-advisor.yml
@@ -57,7 +58,10 @@
 
 set -u
 
-OMP_BIN="${OMP_BIN:-/opt/homebrew/bin/omp}"
+# Empty means "not yet resolved" — see resolve_omp_bin below. An explicit OMP_BIN (env or
+# config) always wins; otherwise the binary is discovered at run time rather than assumed
+# to sit in Homebrew's prefix.
+OMP_BIN="${OMP_BIN:-}"
 # PROJECTS_DIR's default is applied here AND its explicit-ness is recorded, because the
 # resolution order is SESSION_ROOTS > PROJECTS_DIR(explicit) > autodetect. `:-` can't
 # tell "unset" from "set to the default", and treating the always-present default as
@@ -285,10 +289,45 @@ fi
 
 mkdir -p "$FINDINGS_DIR" "$DREAMS_DIR" "$LOG_DIR" "$WORK_DIR"
 
-export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+# `$HOME/.bun/bin` is here because omp ships via bun as well as Homebrew; a launchd job
+# inherits a minimal PATH, so anything not listed is invisible to the run.
+export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 cd "$HOME" || exit 1
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
+
+# ---- omp binary resolution ----
+# An explicit OMP_BIN (env or config) always wins. Otherwise: PATH first, so a shim, a
+# version manager or a local build is honoured, then the known install prefixes.
+#
+# Hardcoding one prefix fails closed but fails *nightly*: on a host where omp is a bun
+# install (`$HOME/.bun/bin/omp`) the run aborted at "FATAL: omp not found at
+# /opt/homebrew/bin/omp" on every trigger, and the only symptom is a log nobody reads at
+# 03:45. Discovery costs one `command -v` and a handful of `-x` tests.
+# OMP_BIN_CANDIDATES (colon-separated) replaces BOTH the PATH lookup and the built-in
+# prefixes when set. It exists so the search itself is testable: the built-in list holds
+# absolute host paths, so a "nothing found" test would pass or fail depending on whether
+# the developer's own machine happens to have omp in one of them. It doubles as an escape
+# hatch for an install layout nobody anticipated.
+OMP_BIN_CANDIDATES="${OMP_BIN_CANDIDATES:-}"
+resolve_omp_bin() {
+  local c IFS
+  if [ -n "$OMP_BIN_CANDIDATES" ]; then
+    IFS=:
+    for c in $OMP_BIN_CANDIDATES; do
+      [ -n "$c" ] && [ -x "$c" ] && { printf '%s' "$c"; return 0; }
+    done
+    return 1
+  fi
+  if c="$(command -v omp 2>/dev/null)" && [ -x "$c" ]; then
+    printf '%s' "$c"; return 0
+  fi
+  for c in "$HOME/.bun/bin/omp" "/opt/homebrew/bin/omp" "/usr/local/bin/omp" \
+           "$HOME/.local/bin/omp" "$HOME/.cargo/bin/omp" "/opt/local/bin/omp"; do
+    [ -x "$c" ] && { printf '%s' "$c"; return 0; }
+  done
+  return 1
+}
 
 # Wipe the isolated worker bucket. Claude Code's async AI-title generation writes a
 # one-line `{"type":"ai-title",...}` stub into the launch cwd's session bucket even
@@ -733,9 +772,27 @@ run() {
   log "findings:    $FINDINGS_DIR"
   log "report:      $REPORT_PATH"
   log "fanout:      $FANOUT"
-  log "omp:         $OMP_BIN"
+  # Resolve here, not at parse time: this is after the config file has been sourced (so a
+  # config-set OMP_BIN is honoured) and after PATH is exported (so the PATH search sees
+  # the same prefixes the workers will).
+  if [ -z "$OMP_BIN" ]; then
+    OMP_BIN="$(resolve_omp_bin)" || OMP_BIN=""
+    [ -n "$OMP_BIN" ] && log "omp:         $OMP_BIN (resolved)"
+  else
+    log "omp:         $OMP_BIN (explicit)"
+  fi
 
-  [ -x "$OMP_BIN" ] || { log "FATAL: omp not found at $OMP_BIN (set OMP_BIN)"; exit 1; }
+  # Name what was searched. "not found at <one hardcoded path>" sends a reader looking for
+  # a broken install when the real answer is simply a different prefix.
+  [ -n "$OMP_BIN" ] && [ -x "$OMP_BIN" ] || {
+    if [ -n "$OMP_BIN_CANDIDATES" ]; then
+      log "FATAL: omp not found. Searched OMP_BIN_CANDIDATES: $OMP_BIN_CANDIDATES"
+    else
+      log "FATAL: omp not found. Searched PATH ($PATH) and: \$HOME/.bun/bin, /opt/homebrew/bin, /usr/local/bin, \$HOME/.local/bin, \$HOME/.cargo/bin, /opt/local/bin"
+    fi
+    log "       Set OMP_BIN=/path/to/omp in the environment or $AUTODREAM_CONFIG."
+    exit 1
+  }
 
   # ---- Session roots (which $HOME/.claude*/projects dirs we scan) ----
   probe_roots
