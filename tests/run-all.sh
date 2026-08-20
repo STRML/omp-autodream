@@ -100,7 +100,10 @@ run_dream(){ # $1=root ; inherits MOCK_MODE/MOCK_CAPTURE_DIR/FANOUT + changelog 
   # depend on) the REAL host's skill tree. A suite that passes or fails on whatever
   # skills happen to be installed locally is not a suite.
   mkdir -p "$1/home"
-  AUTODREAM_CHANGELOG="${AUTODREAM_CHANGELOG:-0}" OMP_BIN="$MOCK" \
+  # `${OMP_BIN-...}` (no colon) so a test can pass OMP_BIN="" to exercise resolution:
+  # set-but-empty means "resolve", unset still means "use the mock".
+  AUTODREAM_CHANGELOG="${AUTODREAM_CHANGELOG:-0}" OMP_BIN="${OMP_BIN-$MOCK}" \
+  OMP_BIN_CANDIDATES="${OMP_BIN_CANDIDATES-}" \
   AUTODREAM_CONFIG="${AUTODREAM_CONFIG:-$1/autodream/config}" \
   AUTODREAM_CONSUME_DATE="${AUTODREAM_CONSUME_DATE:-$DATE}" \
   AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS="${AUTODREAM_L1_ROUNDS:-2}" \
@@ -594,6 +597,59 @@ test_session_stats(){
   rm -rf "$root"
 }
 
+# ---- omp binary resolution ----
+# The default used to be the literal /opt/homebrew/bin/omp, so a host where omp is a bun
+# install aborted every trigger with "FATAL: omp not found at /opt/homebrew/bin/omp".
+# Discovery now covers PATH and the known prefixes; OMP_BIN stays authoritative.
+#
+# OMP_BIN_CANDIDATES pins the search inside the sandbox. Without it these tests would
+# depend on whether the developer's own machine has omp in one of the absolute prefixes.
+test_omp_bin_resolution(){
+  echo "# omp resolution: explicit wins, discovery finds a bun-style install, absence is named"
+  local root; root=$(setup_env); mk_session "$root" sess1
+
+  # 1. Explicit OMP_BIN is honoured and reported as explicit (run_dream passes the mock).
+  run_dream "$root"
+  assert_grep "$root/run.out" 'omp:.*(explicit)' "an explicit OMP_BIN is used as-is"
+  assert_file "$root/dreams/$DATE.md" "and the run completes"
+
+  # 2. No OMP_BIN: discovery finds it. The candidate path mirrors a bun install, which is
+  #    the layout the hardcoded Homebrew default missed.
+  local root2; root2=$(setup_env); mk_session "$root2" sess1
+  mkdir -p "$root2/home/.bun/bin"; cp "$MOCK" "$root2/home/.bun/bin/omp"
+  OMP_BIN="" OMP_BIN_CANDIDATES="$root2/home/.bun/bin/omp" run_dream "$root2"
+  assert_grep "$root2/run.out" 'omp:.*\.bun/bin/omp (resolved)' "discovery finds a bun-style install"
+  assert_file "$root2/dreams/$DATE.md" "and the run completes on the resolved binary"
+
+  # 3. Nothing anywhere: fail closed, and say what was searched rather than naming one path.
+  local root3; root3=$(setup_env); mk_session "$root3" sess1
+  OMP_BIN="" OMP_BIN_CANDIDATES="$root3/nowhere/omp" run_dream "$root3"
+  assert_grep  "$root3/run.out" 'FATAL: omp not found' "a missing omp still fails closed"
+  assert_grep  "$root3/run.out" 'Searched OMP_BIN_CANDIDATES' "the failure names what it searched"
+  assert_grep  "$root3/run.out" 'Set OMP_BIN=' "and how to fix it"
+  assert_no_file "$root3/dreams/$DATE.md" "no report is produced without an engine"
+
+  # 4. A config-set OMP_BIN is honoured, i.e. resolution runs after the config is sourced.
+  #    This one cannot go through run_dream: the config loader re-applies an `export -p`
+  #    snapshot after sourcing, so an EXPORTED OMP_BIN — even an empty one — deliberately
+  #    beats the config file. Expressing "the environment is silent" therefore requires
+  #    the variable to be genuinely unset, hence `env -u`.
+  local root4; root4=$(setup_env); mk_session "$root4" sess1
+  printf 'OMP_BIN=%s\n' "$MOCK" > "$root4/autodream/config"
+  mkdir -p "$root4/home"
+  env -u OMP_BIN \
+      OMP_BIN_CANDIDATES="$root4/nowhere/omp" \
+      AUTODREAM_CHANGELOG=0 AUTODREAM_CONFIG="$root4/autodream/config" \
+      AUTODREAM_CONSUME_DATE="$DATE" AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 \
+      AUTODREAM_L1_ROUNDS=2 PROJECTS_DIR="$root4/projects" HOME="$root4/home" \
+      AUTODREAM_DIR="$root4/autodream" DREAMS_DIR="$root4/dreams" \
+      bash "$RUN" "$DATE" > "$root4/run.out" 2>&1
+  cat "$root4/autodream/logs/run-$DATE.log" >> "$root4/run.out" 2>/dev/null || true
+  assert_grep "$root4/run.out" 'omp:.*mock' "a config-set OMP_BIN is honoured over discovery"
+  assert_file "$root4/dreams/$DATE.md" "and the run completes"
+
+  rm -rf "$root" "$root2" "$root3" "$root4"
+}
 test_happy(){
   echo "# happy path"
   local root; root=$(setup_env); mk_session "$root" sess1
@@ -1638,6 +1694,7 @@ test_overlap_not_measured_malformed_output(){
 
 echo "cc-autodream integration tests (mock claude)"
 echo
+test_omp_bin_resolution
 test_happy
 test_session_stats
 test_unreadable
