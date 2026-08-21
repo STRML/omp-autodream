@@ -161,6 +161,17 @@ Read the `instructions_given` field from the findings (collected in step 2 below
 
 1. Read the findings directory's `*.json` files (use Glob then Read).
 2. Build an in-memory aggregate: group findings by category, count, sort by (count × severity). Exclude `*.stats.json` sidecars from the findings aggregate. Ignore `compliance_markers` entirely — retired 2026-08-08 after an archive-wide scan found zero real emissions of `RETRY-BUDGET:` / `FETCH-PIVOT:` / `DELEGATED:` / `DIRECT-OK:` in any session ever recorded; the detector was correct and the markers were simply never written, so the telemetry only measured silence. Do NOT report a Compliance-markers line in the Activity snapshot, and do NOT split `tool_loop` sessions by marker presence — report a `tool_loop` pattern on its transcript evidence alone. Older findings still carry non-zero-shaped keys; leave them unread. Also collect the facet fields when present: `outcome` for the Activity-snapshot outcomes line, `underlying_goal` for Per-project notes, and the `instructions_given` lists for the compliance check (see Compliance detection). Ignore `satisfaction_signals` entirely — retired 2026-07-28.
+   **Advisor sidecars.** A finding with `"is_advisor": true` came from an OMP advisor
+   sidecar — a reviewer model tailing a primary session, paired 1:1 with a separately
+   triaged parent transcript in the same session dir. Count these as sessions, but
+   **exclude their `turn_count` from the reported session-turn total** and say so in the
+   activity snapshot (advisors carried 73% of the 2026-08-19 turn count and 0% of its
+   tool calls; an unqualified total is meaningless). Their tool-behavior findings are
+   already suppressed at L1, so any `sandbox_friction`/`tool_loop`/`missed_skill` that
+   still arrives from one is an L1 rule violation — file it under Triage failures rather
+   than ranking it as a pattern. Content findings from advisors rank normally, but
+   attribute them to the parent session's project, and never let an advisor finding and
+   its parent's finding both count toward the same pattern's session count.
 3. Read `<findings-dir>/skills-inventory.txt` (authoritative active skills) and reconcile the built-in binary skills from your session skill surface (Read frontmatter of any you need detail on).
 4. Read `<findings-dir>/changelog-window.md` (Upstream changes) and `<findings-dir>/run-stats.txt` (Autodream self-audit) if present.
 5. Print the complete report to stdout, then a line containing exactly AUTODREAM_REPORT_END.

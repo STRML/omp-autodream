@@ -22,11 +22,27 @@ mtime=$(stat -f %m "$transcript" 2>/dev/null) || {
   exit 1
 }
 
+# OMP advisor sidecars (`__advisor.jsonl`, `__advisor-<name>.jsonl`) are observability
+# records of a reviewer model watching a primary session — not agent sessions. Per omp's
+# advisor-watchdog docs the advisor's default toolset is read/grep/glob only, so
+# `Tool "bash" not available` and `tool_call_count: 0` are its normal shape, not sandbox
+# friction. They also pair 1:1 with a separately-triaged parent transcript in the same
+# session dir, so counting their turns or pairing them for overlap double-counts one
+# session. Flagged here (mechanically, from the filename — no dependence on transcript
+# content a slimming pass might drop) so L1 can restrict its schema and overlap-stats.sh
+# can drop them from the pairing corpus. The stem is reserved by omp, so it cannot
+# collide with a real session. See docs/design/advisor-sidecars-2026-08-21.md.
+case "$(basename "$transcript")" in
+  __advisor.jsonl|__advisor-*.jsonl) is_advisor=true ;;
+  *) is_advisor=false ;;
+esac
+
 mkdir -p "$(dirname "$output")" || exit 1
 
 jq -R -s \
   --argjson transcript_bytes "${bytes:-0}" \
   --argjson transcript_mtime "${mtime:-0}" \
+  --argjson is_advisor "$is_advisor" \
   '
   [
     split("\n")[]
@@ -111,6 +127,7 @@ jq -R -s \
       transcript_bytes: $transcript_bytes,
       transcript_mtime: $transcript_mtime,
       isSidechain: (any($lines[]?; ((.customType? // "") == "agent") or ((.customType? // "") == "subagent"))),
+      is_advisor: $is_advisor,
       user_turn_timestamps: $user_turn_timestamps
     }
   ' "$transcript" > "$output"
