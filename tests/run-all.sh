@@ -565,11 +565,24 @@ test_session_stats(){
   MOCK=1 "$OMP_MOCK" "$fixture" carriers
   "$REPO/bin/session-stats.sh" "$fixture" "$out"
   assert_eq "$(jq -r 'keys | sort | join(",")' "$out")" \
-    "duration_minutes,isSidechain,models_used,tool_call_count,tools_used,transcript_bytes,transcript_mtime,turn_count,user_message_count,user_turn_timestamps" \
+    "duration_minutes,isSidechain,is_advisor,models_used,tool_call_count,tools_used,transcript_bytes,transcript_mtime,turn_count,user_message_count,user_turn_timestamps" \
     "stats output has exactly the specified fields"
   assert_eq "$(jq -r '.user_turn_timestamps | length' "$out")" "0" "no timestamped user turns in this fixture -> empty user_turn_timestamps"
   assert_eq "$(jq -r .user_message_count "$out")" "1" "toolResult records are excluded from user message count"
   assert_eq "$(jq -r .turn_count "$out")" "2" "turn count excludes toolResult records (OMP has no tool-in-user-message carriers)"
+  assert_eq "$(jq -r .is_advisor "$out")" "false" "a normally-named transcript is not an advisor sidecar"
+
+  # Advisor detection is purely by filename — the same bytes under an __advisor name
+  # must flag, so an OMP advisor sidecar can never be triaged as an agent session.
+  cp "$fixture" "$root/__advisor.jsonl"
+  "$REPO/bin/session-stats.sh" "$root/__advisor.jsonl" "$root/adv.stats.json"
+  assert_eq "$(jq -r .is_advisor "$root/adv.stats.json")" "true" "__advisor.jsonl flags is_advisor"
+  cp "$fixture" "$root/__advisor-reviewer.jsonl"
+  "$REPO/bin/session-stats.sh" "$root/__advisor-reviewer.jsonl" "$root/adv2.stats.json"
+  assert_eq "$(jq -r .is_advisor "$root/adv2.stats.json")" "true" "__advisor-<name>.jsonl flags is_advisor"
+  cp "$fixture" "$root/my__advisor.jsonl"
+  "$REPO/bin/session-stats.sh" "$root/my__advisor.jsonl" "$root/adv3.stats.json"
+  assert_eq "$(jq -r .is_advisor "$root/adv3.stats.json")" "false" "a name merely containing __advisor does not flag"
 
   fixture="$root/timestamps.jsonl"; out="$root/timestamps.stats.json"
   MOCK=1 "$OMP_MOCK" "$fixture" timestamps
@@ -1570,6 +1583,23 @@ test_overlap_triple(){
   rm -rf "$root"
 }
 
+test_overlap_excludes_advisor_sidecars(){
+  echo "# overlap: an advisor sidecar tailing its parent must not pair with it"
+  local root; root=$(setup_env)
+  # A@10:00 and B@10:10 genuinely overlap. The advisor carries A's own timestamps,
+  # which is how a real __advisor.jsonl behaves (it tails the primary session), so
+  # counting it would report 3 pairs / 3 sessions for what is 2 sessions of work.
+  mk_timed_session "$root" sessA "2026-07-20T10:00:00Z"
+  mk_timed_session "$root" sessB "2026-07-20T10:10:00Z"
+  mk_timed_session "$root" __advisor "2026-07-20T10:00:00Z"
+  run_dream "$root"
+  local stats="$(fdir "$root")/run-stats.txt"
+  assert_grep "$stats" 'overlap_measured: yes'     "a real overlap measurement happened"
+  assert_grep "$stats" 'overlap_events: 1'         "only the two real sessions pair"
+  assert_grep "$stats" 'sessions_with_overlap: 2'  "the advisor sidecar is not counted as involved"
+  rm -rf "$root"
+}
+
 test_overlap_none(){
   echo "# overlap (#14): sessions more than 30 minutes apart -> both stats 0, keys still present"
   local root; root=$(setup_env)
@@ -1687,6 +1717,7 @@ test_notify_dryrun
 test_runner_dirty_ignores_untracked
 test_overlap_pair
 test_overlap_triple
+test_overlap_excludes_advisor_sidecars
 test_overlap_none
 test_overlap_not_measured_missing_bin
 test_overlap_not_measured_empty_output

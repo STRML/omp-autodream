@@ -26,6 +26,15 @@
 # concurrent human activity, not triage-worthiness, and this script has no visibility
 # into (and does not care about) the gate decision.
 #
+# Advisor exclusion: sidecars with `is_advisor: true` are DROPPED from the corpus.
+# An OMP advisor sidecar is a reviewer model tailing its parent session, so it inherits
+# the parent's user-turn timestamps by construction and overlaps it 100% of the time.
+# Including them made the stat read 90-of-90 sessions on 2026-08-19 and 629-of-629 on
+# 2026-08-20 — a measure that fires on every session carries no information. This is
+# the one exclusion the gate note above does NOT cover: gated sessions are real
+# concurrent human activity that simply wasn't worth triaging, whereas an advisor pair
+# is the same human activity counted twice.
+#
 # Usage: overlap-stats.sh <findings_dir> [window_seconds]   (default window: 1800 = 30 min)
 # Prints a single-line JSON object {"overlap_events":N,"sessions_with_overlap":N} to
 # stdout. Never fails the caller: an empty/missing findings dir yields 0/0.
@@ -48,12 +57,15 @@ fi
 # NDJSON: one {"id":..., "ts":[...]} line per sidecar. Missing/empty user_turn_timestamps
 # (pre-#14 sidecars, or sessions with no timestamped user turns) become [] and simply
 # can't form a pair — jq's has_overlap already short-circuits on an empty array.
+# Advisor sidecars emit no line at all (see the header note). `is_advisor` is absent on
+# pre-2026-08-21 sidecars, and `null != true` keeps them, so old findings dirs pair
+# exactly as they did before.
 build_session_list() {
   local f id
   for f in "$findings_dir"/*.stats.json; do
     [ -e "$f" ] || continue
     id=$(basename "$f" .stats.json)
-    jq -c --arg id "$id" '{id: $id, ts: (.user_turn_timestamps // [])}' "$f" 2>/dev/null
+    jq -c --arg id "$id" 'select(.is_advisor != true) | {id: $id, ts: (.user_turn_timestamps // [])}' "$f" 2>/dev/null
   done
 }
 

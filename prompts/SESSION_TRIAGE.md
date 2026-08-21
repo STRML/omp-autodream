@@ -45,6 +45,23 @@ Quote 1-3 sentences of evidence for every finding. Don't synthesize, don't infer
 
 **MORATORIUM — never emit `assumption_unsurfaced`.** Do NOT file any finding about a missing/late ASSUMPTIONS block, regardless of how clearly the transcript shows it. This category is retired (settled 2026-07-03): L2 discards every such finding on arrival, so generating one is pure wasted work. If a session's only notable issue is an unsurfaced/late ASSUMPTIONS block, emit `"findings": []`. Do not re-route it into another category (e.g. `missed_skill`) either.
 
+**RESTRICTED SCHEMA — advisor sidecars.** If the Precomputed session stats block has
+`"is_advisor": true`, this transcript is an OMP *advisor sidecar*: a reviewer model
+tailing a primary session, not an agent session. Its toolset is `read`/`grep`/`glob`
+only, by design — omp grants an advisor nothing else without an explicit `WATCHDOG.yml`
+roster entry, and none is configured. For these transcripts:
+
+- **NEVER emit `sandbox_friction`, `tool_loop`, or `missed_skill`.** `Tool "bash" not
+  available`, `Tool "write" not available`, and `tool_call_count: 0` are this transcript
+  type's normal shape, not defects. Repeated attempts against those unavailable tools are
+  not `tool_loop` here either. On 2026-08-19 and 2026-08-20 these three categories
+  produced seven false findings, five rated high, and nothing else.
+- **Do emit content findings.** `buggy_code_shipped`, `fabricated_id`, `memory_miss`,
+  `stop_projection`, and `drift_after_compaction` remain in scope — advisor narrative is
+  sometimes the only place a piece of work is visible at all.
+- Set `"is_advisor": true` in the output JSON, and copy `turn_count` verbatim as always.
+  L2 excludes advisor turns from session totals; do not zero or adjust them yourself.
+
 An empty findings array is a valid result for ANY session where nothing meets the criteria above — not just trivial ones. If a substantive session has no real findings, emit `"findings": []`. Don't pad, and don't manufacture a finding to justify the slot.
 
 ## Session facets (pilot fields)
@@ -71,6 +88,7 @@ field; ignore it there too.
   "session_path": "/absolute/path/to/session.jsonl",
   "project": "encoded-cwd-folder-name",
   "started_at": "ISO8601 from first message if present, else file mtime",
+  "is_advisor": false,
   "turn_count": 42,
   "tool_call_count": 87,
   "tools_used": ["Bash", "Read", "Write", "Edit"],
