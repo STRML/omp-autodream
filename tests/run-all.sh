@@ -860,6 +860,43 @@ test_l1_retry(){
   rm -rf "$root"
 }
 
+test_l1_hang_is_bounded(){
+  echo "# a hung L1 worker is killed with its process group instead of wedging the run"
+  # The 2026-08-19 and 2026-08-22 runs each sat for days with every xargs -P slot
+  # held by a worker that never exited: no error, no report. Nothing failed, the
+  # run simply stopped, and launchd would not start a replacement while the label
+  # was still running, so the catch-up triggers were suppressed too.
+  if [ -z "$(command -v timeout || command -v gtimeout)" ]; then
+    echo "  skip - no timeout binary (brew install coreutils)"; return 0
+  fi
+  local root; root=$(setup_env); mk_session "$root" sess1
+  local pidfile="$root/hang-pids.txt"; : > "$pidfile"
+  export MOCK_MODE=l1_hang MOCK_HANG_PIDS="$pidfile" AUTODREAM_L1_TIMEOUT=3 AUTODREAM_L1_ROUNDS=1
+  run_dream "$root"
+  unset MOCK_MODE MOCK_HANG_PIDS AUTODREAM_L1_TIMEOUT AUTODREAM_L1_ROUNDS
+
+  assert_grep "$root/run.out" 'l1 timeout' "run logged the bound it was using"
+  local h; h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
+  assert_grep "$(fdir "$root")/$h.json.err" 'exceeded AUTODREAM_L1_TIMEOUT' \
+    "the timeout is named in the errlog, not left as a generic empty-output failure"
+  assert_grep "$(fdir "$root")/run-stats.txt" 'l1_timed_out: 1' \
+    "run-stats counts the timed-out worker"
+  # The run has to REACH L2 at all. That is the whole regression: before the
+  # timeout, control never returned from dispatch_l1.
+  assert_file "$root/dreams/$DATE.md" "run completed and produced a report despite the hang"
+
+  # The mock's child proves the signal reached the process group. A kill aimed at
+  # the worker alone would leave it alive and reparented to init, which is how 57
+  # node_repl and mnemopi_embed orphans accumulated on the real host.
+  local leaked=0 p
+  while read -r p; do
+    [ -n "$p" ] || continue
+    kill -0 "$p" 2>/dev/null && { leaked=$((leaked + 1)); kill -9 "$p" 2>/dev/null; }
+  done < "$pidfile"
+  assert_eq "$leaked" "0" "the hung worker's child was reaped with the group, not orphaned"
+  rm -rf "$root"
+}
+
 test_idempotency_guard(){
   echo "# existing report short-circuits the run (launchd catch-up no-op)"
   local root; root=$(setup_env); mk_session "$root" sess1
@@ -1652,6 +1689,7 @@ test_self_session_excluded
 test_skip_empty_sessions
 test_skip_empty_disabled
 test_l1_retry
+test_l1_hang_is_bounded
 test_idempotency_guard
 test_self_audit_stats
 test_self_audit_stats_failure_denominator

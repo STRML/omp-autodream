@@ -37,6 +37,8 @@
 #   AUTODREAM_FORCE      set 1 to rebuild even if a report exists    default: 0
 #   AUTODREAM_SLIM_BYTES sessions larger than this are slimmed for L1  default: 262144
 #   AUTODREAM_L1_MODEL   override the L1 triage model                 default: runinfra/deepseek-v4-flash
+#   AUTODREAM_L1_TIMEOUT seconds before an L1 worker is killed with     default: 1200
+#                        its process group; needs timeout or gtimeout on PATH
 #   AUTODREAM_L2_MODEL   override the L2 aggregator model             default: anthropic/claude-opus-5
 #   RUNINFRA_API_KEY     L1 provider key; sourced from $AUTODREAM_DIR/x-credentials (chmod 600)
 #                        when present, else resolved from the login keychain. L2 needs no key
@@ -149,6 +151,19 @@ fi
 DREAMS_DIR="${DREAMS_DIR:-$(dirname "$AUTODREAM_DIR")/dreams}"
 LOG_DIR="$AUTODREAM_DIR/logs"
 FANOUT="${FANOUT:-8}"
+
+# Bound every L1 worker. An omp worker that never exits holds its xargs -P slot
+# forever, so FANOUT hung workers stop the whole run with no error and no report:
+# 2026-08-19 and 2026-08-22 each sat wedged for days with all 8 slots taken by
+# workers blocked on their own node_repl and mnemopi_embed children.
+#
+# GNU timeout, invoked without --foreground, runs the command in a new process
+# group and signals the group, so it reaps those grandchildren. A bare kill on
+# the omp process would leave them parented to init and still running. macOS has
+# no timeout in its base install, so this degrades to unbounded rather than
+# becoming a hard coreutils dependency; run-stats records which way it went.
+AUTODREAM_L1_TIMEOUT="${AUTODREAM_L1_TIMEOUT:-1200}"
+TIMEOUT_BIN="$(command -v timeout || command -v gtimeout || true)"
 
 # Isolated cwd for every `claude --print` worker (see "AI-title stubs" below). The
 # workers all read/write by ABSOLUTE path, so their cwd is functionally irrelevant —
@@ -652,7 +667,7 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
         cat "$FINDINGS_DIR/$hash.stats.json"
         printf "\n\`\`\`\n"
       fi
-    } | "$OMP_BIN" \
+    } | ${TIMEOUT_BIN:+"$TIMEOUT_BIN" -k 30 "$AUTODREAM_L1_TIMEOUT"} "$OMP_BIN" \
       --allow-home \
       -p \
       --approval-mode yolo \
@@ -662,6 +677,14 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
       --tools=Read,Write \
       --append-system-prompt "Headless triage worker. Read the session transcript and write exactly one findings JSON object, via the Write tool, to the literal output path given on line 2 of the prompt. Those paths are literal strings, not shell variables — never \$-expand them. Print only the literal word done and exit." \
       > /dev/null 2> "$errlog"
+    # Index 1 is the omp/timeout side of the pipe; index 0 is the prompt heredoc.
+    # 124 is timeout saying it fired, which is a different fault from a worker
+    # that ran and declined to write, so it gets its own line in the errlog.
+    l1rc="${PIPESTATUS[1]}"
+    if [ "$l1rc" = "124" ] || [ "$l1rc" = "137" ]; then
+      printf "worker exceeded AUTODREAM_L1_TIMEOUT=%ss and was killed with its process group (rc=%s)\n" \
+        "$AUTODREAM_L1_TIMEOUT" "$l1rc" >> "$errlog"
+    fi
 
     if [ -s "$output" ]; then
       # Reported path should be the real session, not the temp slim copy. Then drop
@@ -736,6 +759,11 @@ run() {
   log "omp:         $OMP_BIN"
 
   [ -x "$OMP_BIN" ] || { log "FATAL: omp not found at $OMP_BIN (set OMP_BIN)"; exit 1; }
+  if [ -n "$TIMEOUT_BIN" ]; then
+    log "l1 timeout:  $AUTODREAM_L1_TIMEOUT s via $TIMEOUT_BIN"
+  else
+    log "WARNING: no timeout binary found (brew install coreutils); L1 workers run unbounded and one hang stops the run"
+  fi
 
   # ---- Session roots (which $HOME/.claude*/projects dirs we scan) ----
   probe_roots
@@ -833,6 +861,9 @@ EOF
   # Exported once so both the L1 xargs subshells and the L2 call inherit it.
   export CLAUDE_CODE_DISABLE_CLAUDE_MDS=1 DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1
   export OMP_BIN NO_ADVISOR_CFG RUNINFRA_API_KEY AUTODREAM_L1_MODEL AUTODREAM_DIR FINDINGS_DIR SLIM WORK_DIR
+  # Read by the dispatcher subshell to bound each worker. TIMEOUT_BIN is empty
+  # when no timeout binary exists, which the worker treats as run-unbounded.
+  export TIMEOUT_BIN AUTODREAM_L1_TIMEOUT
   # AUTODREAM_L1_ROUNDS is referenced by the dispatcher subshell to decide
   # whether this is the last retry round (gates the metadata-stub fallback).
   export AUTODREAM_L1_ROUNDS
@@ -1017,6 +1048,12 @@ PY
     # the commit makes the runner's age legible from the artifact itself.
     printf 'runner_commit: %s\n' "$RUNNER_COMMIT"
     printf 'runner_dirty: %s\n' "$RUNNER_DIRTY"
+    # A run with l1_timeout_bin: none is one hung worker away from the silent
+    # multi-day wedge of 2026-08-19 and 2026-08-22, so the absence of the bound
+    # is stated rather than left to be inferred from a missing key.
+    printf 'l1_timeout_secs: %s\n' "$AUTODREAM_L1_TIMEOUT"
+    printf 'l1_timeout_bin: %s\n' "${TIMEOUT_BIN:-none}"
+    printf 'l1_timed_out: %s\n' "$(grep -l 'exceeded AUTODREAM_L1_TIMEOUT' "$FINDINGS_DIR"/*.err 2>/dev/null | wc -l | tr -d ' ')"
     printf 'session_roots: %s\n' "$SESSION_ROOT_COUNT"
     printf 'session_roots_list: %s\n' "$SESSION_ROOTS"
     printf 'sessions_found_raw: %s\n' "$RAW"
