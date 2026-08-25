@@ -888,13 +888,35 @@ test_l1_hang_is_bounded(){
   # The mock's child proves the signal reached the process group. A kill aimed at
   # the worker alone would leave it alive and reparented to init, which is how 57
   # node_repl and mnemopi_embed orphans accumulated on the real host.
-  local leaked=0 p
+  # kill -0 succeeds on a zombie, and a child whose parent just died sits as one
+  # until init reaps it. Checking once immediately would fail a correct kill on
+  # timing alone, so give each pid a bounded grace before calling it leaked.
+  local leaked=0 p i
   while read -r p; do
     [ -n "$p" ] || continue
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+      kill -0 "$p" 2>/dev/null || break
+      sleep 0.5
+    done
     kill -0 "$p" 2>/dev/null && { leaked=$((leaked + 1)); kill -9 "$p" 2>/dev/null; }
   done < "$pidfile"
   assert_eq "$leaked" "0" "the hung worker's child was reaped with the group, not orphaned"
   rm -rf "$root"
+}
+
+test_l1_timeout_must_be_positive(){
+  echo "# a zero or non-numeric L1 timeout is refused at startup, not at 03:15"
+  # GNU timeout reads 0 as "no timeout", so an unvalidated 0 restores the wedge
+  # while the startup log still claims a bound is in force.
+  local root; root=$(setup_env); mk_session "$root" sess1
+  export AUTODREAM_L1_TIMEOUT=0; run_dream "$root"; unset AUTODREAM_L1_TIMEOUT
+  assert_grep "$root/run.out" 'must be greater than 0' "zero timeout is rejected with a reason"
+  assert_no_file "$root/dreams/$DATE.md" "the run refuses to start rather than running unbounded"
+
+  local root2; root2=$(setup_env); mk_session "$root2" sess1
+  export AUTODREAM_L1_TIMEOUT=abc; run_dream "$root2"; unset AUTODREAM_L1_TIMEOUT
+  assert_grep "$root2/run.out" 'must be a positive integer' "a non-numeric timeout is rejected"
+  rm -rf "$root" "$root2"
 }
 
 test_idempotency_guard(){
@@ -1690,6 +1712,7 @@ test_skip_empty_sessions
 test_skip_empty_disabled
 test_l1_retry
 test_l1_hang_is_bounded
+test_l1_timeout_must_be_positive
 test_idempotency_guard
 test_self_audit_stats
 test_self_audit_stats_failure_denominator
