@@ -37,6 +37,11 @@
 #   AUTODREAM_FORCE      set 1 to rebuild even if a report exists    default: 0
 #   AUTODREAM_SLIM_BYTES sessions larger than this are slimmed for L1  default: 262144
 #   AUTODREAM_L1_MODEL   override the L1 triage model                 default: runinfra/deepseek-v4-flash
+#   AUTODREAM_L1_TIMEOUT seconds before an L1 worker is killed with     default: 1200
+#                        its process group; needs timeout or gtimeout on PATH.
+#                        Must be a positive integer (0 would disable the timeout).
+#                        SIGKILL follows 30s after the SIGTERM, so the worst-case
+#                        bound is AUTODREAM_L1_TIMEOUT + 30.
 #   AUTODREAM_L2_MODEL   override the L2 aggregator model             default: anthropic/claude-opus-5
 #   RUNINFRA_API_KEY     L1 provider key; sourced from $AUTODREAM_DIR/x-credentials (chmod 600)
 #                        when present, else resolved from the login keychain. L2 needs no key
@@ -149,6 +154,30 @@ fi
 DREAMS_DIR="${DREAMS_DIR:-$(dirname "$AUTODREAM_DIR")/dreams}"
 LOG_DIR="$AUTODREAM_DIR/logs"
 FANOUT="${FANOUT:-8}"
+
+# Bound every L1 worker. An omp worker that never exits holds its xargs -P slot
+# forever, so FANOUT hung workers stop the whole run with no error and no report:
+# 2026-08-19 and 2026-08-22 each sat wedged for days with all 8 slots taken by
+# workers blocked on their own node_repl and mnemopi_embed children.
+#
+# GNU timeout, invoked without --foreground, runs the command in a new process
+# group and signals the group, so it reaps those grandchildren. A bare kill on
+# the omp process would leave them reparented (to launchd on macOS) and running.
+# macOS ships no timeout in its base install, so this degrades to unbounded rather
+# than becoming a hard coreutils dependency; run-stats records which way it went.
+# TIMEOUT_BIN itself is resolved further down, after the PATH augmentation.
+AUTODREAM_L1_TIMEOUT="${AUTODREAM_L1_TIMEOUT:-1200}"
+# GNU timeout treats a duration of 0 as "no timeout", so an unvalidated 0 restores
+# the exact hang this bounds while the startup log still reports a timeout is set.
+# A non-numeric value is worse: timeout rejects it and every worker fails. Refuse
+# both at startup rather than discovering it at 03:15.
+case "$AUTODREAM_L1_TIMEOUT" in
+  ''|*[!0-9]*) echo "FATAL: AUTODREAM_L1_TIMEOUT must be a positive integer (got '$AUTODREAM_L1_TIMEOUT')" >&2; exit 1 ;;
+  *) [ "$AUTODREAM_L1_TIMEOUT" -gt 0 ] || { echo "FATAL: AUTODREAM_L1_TIMEOUT must be greater than 0 (0 disables the timeout entirely)" >&2; exit 1; } ;;
+esac
+# SIGKILL grace after the SIGTERM. The worst-case bound is therefore
+# AUTODREAM_L1_TIMEOUT + L1_KILL_GRACE, not AUTODREAM_L1_TIMEOUT.
+L1_KILL_GRACE=30
 
 # Isolated cwd for every `claude --print` worker (see "AI-title stubs" below). The
 # workers all read/write by ABSOLUTE path, so their cwd is functionally irrelevant —
@@ -286,6 +315,12 @@ fi
 mkdir -p "$FINDINGS_DIR" "$DREAMS_DIR" "$LOG_DIR" "$WORK_DIR"
 
 export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+
+# Resolved AFTER the PATH augmentation above, like git and python3 are. Resolving
+# it earlier meant a run started from a minimal PATH found no gtimeout and quietly
+# degraded to unbounded, which is the one outcome this whole change exists to
+# prevent. The degrade is still announced, but it should not happen by accident.
+TIMEOUT_BIN="$(command -v timeout || command -v gtimeout || true)"
 cd "$HOME" || exit 1
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
@@ -643,6 +678,19 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
     # Launch from the isolated worker cwd so any AI-title stub lands in $WORK_BUCKET,
     # not the real session bucket. All paths below are absolute, so cd is safe here.
     cd "$WORK_DIR" 2>/dev/null || true
+    # An array rather than ${TIMEOUT_BIN:+...}: both behave correctly, including for
+    # a path with spaces, but the array says plainly that this is an optional argv
+    # prefix. Set OUTSIDE the brace group below — a brace group in a pipeline runs
+    # in a subshell, so an assignment made in there is invisible to the right-hand
+    # side and the wrapper would silently disappear.
+    l1wrap=()
+    [ -n "$TIMEOUT_BIN" ] && l1wrap=("$TIMEOUT_BIN" -k "$L1_KILL_GRACE" "$AUTODREAM_L1_TIMEOUT")
+    # Stamped here, NOT reused from t0. t0 is taken before validation, the noise
+    # gate and slimming, so a large transcript can burn real time before timeout
+    # is even launched; counting that as worker runtime lets an intrinsic 124 or
+    # 137 clear the elapsed check with no deadline having fired. Only the interval
+    # timeout itself was running can answer that question.
+    l1start=$(date +%s)
     {
       printf "Session transcript to analyze (literal absolute path): %s\n" "$readpath"
       printf "Write your findings JSON to this literal absolute path: %s\n\n" "$output"
@@ -652,7 +700,7 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
         cat "$FINDINGS_DIR/$hash.stats.json"
         printf "\n\`\`\`\n"
       fi
-    } | "$OMP_BIN" \
+    } | "${l1wrap[@]}" "$OMP_BIN" \
       --allow-home \
       -p \
       --approval-mode yolo \
@@ -662,6 +710,38 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
       --tools=Read,Write \
       --append-system-prompt "Headless triage worker. Read the session transcript and write exactly one findings JSON object, via the Write tool, to the literal output path given on line 2 of the prompt. Those paths are literal strings, not shell variables — never \$-expand them. Print only the literal word done and exit." \
       > /dev/null 2> "$errlog"
+    # Index 1 is the omp/timeout side of the pipe; index 0 is the brace group.
+    # 124 is timeout reporting that it fired; 137 is 128+SIGKILL, which is what the
+    # -k grace period escalates to. Only trust 137 as a timeout when the wrapper is
+    # actually in the pipeline: with no timeout binary, an OOM-killed omp returns
+    # 137 too, and calling that a timeout would be a lie the stats then repeat.
+    l1rc="${PIPESTATUS[1]}"
+    # Elapsed is the positive evidence that the deadline actually fired. The exit
+    # code alone cannot say so: GNU timeout propagates the exit status of the child,
+    # so a worker that exits 124 by itself, or that the OOM killer SIGKILLs at second
+    # zero, arrives here looking identical to a real timeout. Verified against
+    # coreutils 9.11 on this host — a self-killed child returned 137 after 0s
+    # under a 100s bound. Without this, an OOM would be deleted, retried, and
+    # counted as a timeout, which is the same class of lie this commit removes.
+    # Second resolution leaves a one-second boundary window in which a child that
+    # exits 124 or 137 by itself at exactly the deadline is read as a timeout.
+    # /bin/bash here is 3.2, which has no EPOCHREALTIME, and the residual window
+    # is one second wide against a bound of twenty minutes.
+    l1elapsed=$(($(date +%s) - l1start))
+    if [ -n "$TIMEOUT_BIN" ] && { [ "$l1rc" = "124" ] || [ "$l1rc" = "137" ]; } \
+       && [ "$l1elapsed" -ge "$AUTODREAM_L1_TIMEOUT" ]; then
+      printf "worker exceeded AUTODREAM_L1_TIMEOUT=%ss and was killed with its process group (rc=%s)\n" \
+        "$AUTODREAM_L1_TIMEOUT" "$l1rc" >> "$errlog"
+      # The errlog cannot carry this fact: it is truncated by the next retry and
+      # deleted outright whenever the worker leaves any output, so a timeout that
+      # later succeeds, or that wrote something before dying, would vanish from the
+      # stats. The ledger is per-run and append-only, so neither can erase it.
+      printf "%s\n" "$hash" >> "$FINDINGS_DIR/l1-timeouts.txt"
+      # A worker killed mid-write leaves a truncated findings JSON. That is not a
+      # result: kept, it reads as success, deletes the errlog, and feeds partial
+      # input to L2. Drop it so this session retries like any other failure.
+      rm -f "$output"
+    fi
 
     if [ -s "$output" ]; then
       # Reported path should be the real session, not the temp slim copy. Then drop
@@ -736,6 +816,11 @@ run() {
   log "omp:         $OMP_BIN"
 
   [ -x "$OMP_BIN" ] || { log "FATAL: omp not found at $OMP_BIN (set OMP_BIN)"; exit 1; }
+  if [ -n "$TIMEOUT_BIN" ]; then
+    log "l1 timeout:  $AUTODREAM_L1_TIMEOUT s via $TIMEOUT_BIN"
+  else
+    log "WARNING: no timeout binary found (brew install coreutils); L1 workers run unbounded and one hang stops the run"
+  fi
 
   # ---- Session roots (which $HOME/.claude*/projects dirs we scan) ----
   probe_roots
@@ -833,9 +918,17 @@ EOF
   # Exported once so both the L1 xargs subshells and the L2 call inherit it.
   export CLAUDE_CODE_DISABLE_CLAUDE_MDS=1 DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1
   export OMP_BIN NO_ADVISOR_CFG RUNINFRA_API_KEY AUTODREAM_L1_MODEL AUTODREAM_DIR FINDINGS_DIR SLIM WORK_DIR
+  # Read by the dispatcher subshell to bound each worker. TIMEOUT_BIN is empty
+  # when no timeout binary exists, which the worker treats as run-unbounded.
+  export TIMEOUT_BIN AUTODREAM_L1_TIMEOUT L1_KILL_GRACE
   # AUTODREAM_L1_ROUNDS is referenced by the dispatcher subshell to decide
   # whether this is the last retry round (gates the metadata-stub fallback).
   export AUTODREAM_L1_ROUNDS
+
+  # Truncate the timeout ledger here rather than where FINDINGS_DIR is created:
+  # this point is past the idempotency guard, so a catch-up trigger that no-ops on
+  # an already-reported date cannot erase the ledger the real run wrote.
+  : > "$FINDINGS_DIR/l1-timeouts.txt"
 
   clean_work_bucket  # start clean: drop any stub left by a prior run's workers
 
@@ -1017,6 +1110,16 @@ PY
     # the commit makes the runner's age legible from the artifact itself.
     printf 'runner_commit: %s\n' "$RUNNER_COMMIT"
     printf 'runner_dirty: %s\n' "$RUNNER_DIRTY"
+    # A run with l1_timeout_bin: none is one hung worker away from the silent
+    # multi-day wedge of 2026-08-19 and 2026-08-22, so the absence of the bound
+    # is stated rather than left to be inferred from a missing key.
+    printf 'l1_timeout_secs: %s\n' "$AUTODREAM_L1_TIMEOUT"
+    printf 'l1_timeout_bin: %s\n' "${TIMEOUT_BIN:-none}"
+    # Counted from the per-run ledger, not from surviving *.err files: an .err is
+    # truncated by the next retry and deleted whenever the worker leaves output, so
+    # counting them undercounts a timeout that later succeeded — and a stale .err
+    # from an earlier run of the same date overcounts a clean one.
+    printf 'l1_timed_out: %s\n' "$(sort -u "$FINDINGS_DIR/l1-timeouts.txt" 2>/dev/null | grep -c . || true)"
     printf 'session_roots: %s\n' "$SESSION_ROOT_COUNT"
     printf 'session_roots_list: %s\n' "$SESSION_ROOTS"
     printf 'sessions_found_raw: %s\n' "$RAW"
