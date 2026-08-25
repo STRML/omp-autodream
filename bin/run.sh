@@ -13,7 +13,8 @@
 #   FANOUT=4 ./run.sh    # tune L1 parallelism (default 8)
 #
 # Environment overrides (all optional):
-#   OMP_BIN        path to omp CLI                       default: /opt/homebrew/bin/omp
+#   OMP_BIN        path to omp CLI      default: resolved from PATH, then
+#                  ~/.local/bin, ~/.bun/bin, /opt/homebrew/bin, /usr/local/bin
 #   NO_ADVISOR_CFG path to the advisor-off yaml passed as --config to every worker
 #                  (keeps the opus advisor from booting on headless runs)
 #                                                        default: $AUTODREAM_DIR/l1-no-advisor.yml
@@ -62,7 +63,6 @@
 
 set -u
 
-OMP_BIN="${OMP_BIN:-/opt/homebrew/bin/omp}"
 # PROJECTS_DIR's default is applied here AND its explicit-ness is recorded, because the
 # resolution order is SESSION_ROOTS > PROJECTS_DIR(explicit) > autodetect. `:-` can't
 # tell "unset" from "set to the default", and treating the always-present default as
@@ -314,7 +314,40 @@ fi
 
 mkdir -p "$FINDINGS_DIR" "$DREAMS_DIR" "$LOG_DIR" "$WORK_DIR"
 
-export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+# The caller's PATH comes FIRST, with the known install prefixes appended as a
+# floor. This line used to REPLACE PATH outright, which is what made "resolve omp
+# the way the shell does" impossible no matter how the resolution below was
+# written: whatever the caller had on PATH was discarded one line before
+# `command -v` ran, so an interactive run and the nightly could disagree about
+# which omp exists and neither could see the other's. Appending keeps the reason
+# the replacement existed at all -- launchd hands the job a minimal PATH that has
+# neither omp nor git -- while letting an explicit caller win, which is what the
+# shell would do.
+export PATH="${PATH:+$PATH:}$HOME/.cargo/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+
+# Resolve omp the way the shell does: PATH first, then the known install prefixes.
+# Hardcoding /opt/homebrew/bin here meant the nightly could run a DIFFERENT binary
+# from the one `which omp` reports, with no sign anywhere that the two had drifted.
+# On 2026-08-25 that was a real 17.3.7-vs-18.0.4 split that cost half of every L1
+# round to provider 400s, and nothing in the log or run-stats said which omp ran.
+# An explicit OMP_BIN still wins, for pinning a specific build.
+OMP_CANDIDATES=(
+  "$HOME/.local/bin/omp"
+  "$HOME/.bun/bin/omp"
+  /opt/homebrew/bin/omp
+  /usr/local/bin/omp
+)
+if [ -z "${OMP_BIN:-}" ]; then
+  OMP_BIN="$(command -v omp 2>/dev/null || true)"
+fi
+if [ -z "${OMP_BIN:-}" ]; then
+  for _cand in "${OMP_CANDIDATES[@]}"; do
+    [ -x "$_cand" ] && { OMP_BIN="$_cand"; break; }
+  done
+fi
+OMP_BIN="${OMP_BIN:-omp}"
+OMP_VERSION="$("$OMP_BIN" --version 2>/dev/null | head -1 | tr -d '\r')"
+OMP_VERSION="${OMP_VERSION:-unknown}"
 
 # Resolved AFTER the PATH augmentation above, like git and python3 are. Resolving
 # it earlier meant a run started from a minimal PATH found no gtimeout and quietly
@@ -813,9 +846,13 @@ run() {
   log "findings:    $FINDINGS_DIR"
   log "report:      $REPORT_PATH"
   log "fanout:      $FANOUT"
-  log "omp:         $OMP_BIN"
+  log "omp:         $OMP_BIN ($OMP_VERSION)"
 
-  [ -x "$OMP_BIN" ] || { log "FATAL: omp not found at $OMP_BIN (set OMP_BIN)"; exit 1; }
+  if [ ! -x "$OMP_BIN" ]; then
+    log "FATAL: omp not found. Searched PATH and: ${OMP_CANDIDATES[*]}"
+    log "       Set OMP_BIN to pin one explicitly."
+    exit 1
+  fi
   if [ -n "$TIMEOUT_BIN" ]; then
     log "l1 timeout:  $AUTODREAM_L1_TIMEOUT s via $TIMEOUT_BIN"
   else
@@ -1113,6 +1150,12 @@ PY
     # A run with l1_timeout_bin: none is one hung worker away from the silent
     # multi-day wedge of 2026-08-19 and 2026-08-22, so the absence of the bound
     # is stated rather than left to be inferred from a missing key.
+    # Which omp actually ran. Absent this, a binary that drifts from the one on the
+    # developer's PATH is invisible: on 2026-08-25 the nightly ran 17.3.7 while the
+    # shell resolved 18.0.4, half of every L1 round died to provider 400s, and
+    # nothing on disk recorded which build produced them.
+    printf 'omp_bin: %s\n' "$OMP_BIN"
+    printf 'omp_version: %s\n' "$OMP_VERSION"
     printf 'l1_timeout_secs: %s\n' "$AUTODREAM_L1_TIMEOUT"
     printf 'l1_timeout_bin: %s\n' "${TIMEOUT_BIN:-none}"
     # Counted from the per-run ledger, not from surviving *.err files: an .err is

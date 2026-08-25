@@ -100,7 +100,10 @@ run_dream(){ # $1=root ; inherits MOCK_MODE/MOCK_CAPTURE_DIR/FANOUT + changelog 
   # depend on) the REAL host's skill tree. A suite that passes or fails on whatever
   # skills happen to be installed locally is not a suite.
   mkdir -p "$1/home"
-  AUTODREAM_CHANGELOG="${AUTODREAM_CHANGELOG:-0}" OMP_BIN="$MOCK" \
+  # OMP_BIN uses ${VAR-default} (no colon) so a caller that exports it EMPTY keeps the
+  # empty value: that is how the resolution test asks run.sh to find omp on PATH instead
+  # of being handed the mock. Every other test leaves it unset and still gets the mock.
+  AUTODREAM_CHANGELOG="${AUTODREAM_CHANGELOG:-0}" OMP_BIN="${OMP_BIN-$MOCK}" \
   AUTODREAM_CONFIG="${AUTODREAM_CONFIG:-$1/autodream/config}" \
   AUTODREAM_CONSUME_DATE="${AUTODREAM_CONSUME_DATE:-$DATE}" \
   AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS="${AUTODREAM_L1_ROUNDS:-2}" \
@@ -857,6 +860,28 @@ test_l1_retry(){
   assert_file "$(fdir "$root")/$h.json"  "flaky session produced findings on retry"
   assert_grep "$root/run.out" 'round 2'  "a second L1 round ran"
   assert_file "$root/dreams/$DATE.md"    "report still produced"
+  rm -rf "$root"
+}
+
+test_omp_resolution_and_provenance(){
+  echo "# omp is resolved from PATH like the shell, and the run records which build ran"
+  # The nightly used to hardcode /opt/homebrew/bin/omp while the shell resolved a
+  # different install. On 2026-08-25 that was a 17.3.7 vs 18.0.4 split: half of every
+  # L1 round died to provider 400s and nothing on disk said which binary produced them.
+  local root; root=$(setup_env); mk_session "$root" sess1
+  # A shim earlier on PATH must win over any hardcoded prefix.
+  local shim="$root/shim"; mkdir -p "$shim"
+  cp "$MOCK" "$shim/omp"
+  printf '#!/bin/bash\nif [ "$1" = "--version" ]; then echo "omp/99.9.9-shim"; exit 0; fi\nexec %s "$@"\n' "$MOCK" > "$shim/omp"
+  chmod +x "$shim/omp"
+
+  PATH="$shim:$PATH" OMP_BIN="" run_dream "$root"
+
+  assert_grep "$root/run.out" 'omp/99.9.9-shim' "the run logs the resolved binary and its version"
+  assert_grep "$(fdir "$root")/run-stats.txt" 'omp_version: omp/99.9.9-shim' \
+    "run-stats records the version, so a drifted binary is visible from the artifact"
+  assert_grep "$(fdir "$root")/run-stats.txt" "omp_bin: $shim/omp" \
+    "run-stats records which binary ran"
   rm -rf "$root"
 }
 
@@ -1739,6 +1764,7 @@ test_skip_empty_sessions
 test_skip_empty_disabled
 test_l1_retry
 test_l1_hang_is_bounded
+test_omp_resolution_and_provenance
 test_intrinsic_124_is_not_a_timeout
 test_l1_timeout_must_be_positive
 test_idempotency_guard
