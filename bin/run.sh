@@ -685,6 +685,12 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
     # side and the wrapper would silently disappear.
     l1wrap=()
     [ -n "$TIMEOUT_BIN" ] && l1wrap=("$TIMEOUT_BIN" -k "$L1_KILL_GRACE" "$AUTODREAM_L1_TIMEOUT")
+    # Stamped here, NOT reused from t0. t0 is taken before validation, the noise
+    # gate and slimming, so a large transcript can burn real time before timeout
+    # is even launched; counting that as worker runtime lets an intrinsic 124 or
+    # 137 clear the elapsed check with no deadline having fired. Only the interval
+    # timeout itself was running can answer that question.
+    l1start=$(date +%s)
     {
       printf "Session transcript to analyze (literal absolute path): %s\n" "$readpath"
       printf "Write your findings JSON to this literal absolute path: %s\n\n" "$output"
@@ -717,7 +723,11 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
     # coreutils 9.11 on this host — a self-killed child returned 137 after 0s
     # under a 100s bound. Without this, an OOM would be deleted, retried, and
     # counted as a timeout, which is the same class of lie this commit removes.
-    l1elapsed=$(($(date +%s) - t0))
+    # Second resolution leaves a one-second boundary window in which a child that
+    # exits 124 or 137 by itself at exactly the deadline is read as a timeout.
+    # /bin/bash here is 3.2, which has no EPOCHREALTIME, and the residual window
+    # is one second wide against a bound of twenty minutes.
+    l1elapsed=$(($(date +%s) - l1start))
     if [ -n "$TIMEOUT_BIN" ] && { [ "$l1rc" = "124" ] || [ "$l1rc" = "137" ]; } \
        && [ "$l1elapsed" -ge "$AUTODREAM_L1_TIMEOUT" ]; then
       printf "worker exceeded AUTODREAM_L1_TIMEOUT=%ss and was killed with its process group (rc=%s)\n" \

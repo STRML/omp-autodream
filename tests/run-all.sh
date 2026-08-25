@@ -904,6 +904,33 @@ test_l1_hang_is_bounded(){
   rm -rf "$root"
 }
 
+test_intrinsic_124_is_not_a_timeout(){
+  echo "# a worker that exits 124 or 137 on its own is not recorded as a timeout"
+  # GNU timeout propagates the exit status of the child, so a worker that exits 124
+  # by itself, or that the OOM killer SIGKILLs, reaches the caller looking identical
+  # to a fired deadline. Only the elapsed interval separates them, and it has to be
+  # measured from the launch of timeout rather than from the top of the worker, or
+  # preprocessing time closes the gap on a short bound.
+  if [ -z "$(command -v timeout || command -v gtimeout)" ]; then
+    echo "  skip - no timeout binary (brew install coreutils)"; return 0
+  fi
+  local root; root=$(setup_env); mk_session "$root" sess1
+  export MOCK_MODE=l1_exit124 AUTODREAM_L1_TIMEOUT=900 AUTODREAM_L1_ROUNDS=1
+  run_dream "$root"
+  unset MOCK_MODE AUTODREAM_L1_TIMEOUT AUTODREAM_L1_ROUNDS
+
+  assert_grep "$(fdir "$root")/run-stats.txt" 'l1_timed_out: 0' \
+    "an intrinsic 124 well inside the bound is not counted as a timeout"
+  local h errf; h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
+  errf="$(fdir "$root")/$h.json.err"
+  if grep -q 'exceeded AUTODREAM_L1_TIMEOUT' "$errf" 2>/dev/null; then
+    no "the errlog claims a timeout that never happened"
+  else
+    ok "the errlog does not claim a timeout that never happened"
+  fi
+  rm -rf "$root"
+}
+
 test_l1_timeout_must_be_positive(){
   echo "# a zero or non-numeric L1 timeout is refused at startup, not at 03:15"
   # GNU timeout reads 0 as "no timeout", so an unvalidated 0 restores the wedge
@@ -1712,6 +1739,7 @@ test_skip_empty_sessions
 test_skip_empty_disabled
 test_l1_retry
 test_l1_hang_is_bounded
+test_intrinsic_124_is_not_a_timeout
 test_l1_timeout_must_be_positive
 test_idempotency_guard
 test_self_audit_stats
