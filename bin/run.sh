@@ -162,9 +162,10 @@ FANOUT="${FANOUT:-8}"
 #
 # GNU timeout, invoked without --foreground, runs the command in a new process
 # group and signals the group, so it reaps those grandchildren. A bare kill on
-# the omp process would leave them parented to init and still running. macOS has
-# no timeout in its base install, so this degrades to unbounded rather than
-# becoming a hard coreutils dependency; run-stats records which way it went.
+# the omp process would leave them reparented (to launchd on macOS) and running.
+# macOS ships no timeout in its base install, so this degrades to unbounded rather
+# than becoming a hard coreutils dependency; run-stats records which way it went.
+# TIMEOUT_BIN itself is resolved further down, after the PATH augmentation.
 AUTODREAM_L1_TIMEOUT="${AUTODREAM_L1_TIMEOUT:-1200}"
 # GNU timeout treats a duration of 0 as "no timeout", so an unvalidated 0 restores
 # the exact hang this bounds while the startup log still reports a timeout is set.
@@ -174,7 +175,6 @@ case "$AUTODREAM_L1_TIMEOUT" in
   ''|*[!0-9]*) echo "FATAL: AUTODREAM_L1_TIMEOUT must be a positive integer (got '$AUTODREAM_L1_TIMEOUT')" >&2; exit 1 ;;
   *) [ "$AUTODREAM_L1_TIMEOUT" -gt 0 ] || { echo "FATAL: AUTODREAM_L1_TIMEOUT must be greater than 0 (0 disables the timeout entirely)" >&2; exit 1; } ;;
 esac
-TIMEOUT_BIN="$(command -v timeout || command -v gtimeout || true)"
 # SIGKILL grace after the SIGTERM. The worst-case bound is therefore
 # AUTODREAM_L1_TIMEOUT + L1_KILL_GRACE, not AUTODREAM_L1_TIMEOUT.
 L1_KILL_GRACE=30
@@ -315,6 +315,12 @@ fi
 mkdir -p "$FINDINGS_DIR" "$DREAMS_DIR" "$LOG_DIR" "$WORK_DIR"
 
 export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+
+# Resolved AFTER the PATH augmentation above, like git and python3 are. Resolving
+# it earlier meant a run started from a minimal PATH found no gtimeout and quietly
+# degraded to unbounded, which is the one outcome this whole change exists to
+# prevent. The degrade is still announced, but it should not happen by accident.
+TIMEOUT_BIN="$(command -v timeout || command -v gtimeout || true)"
 cd "$HOME" || exit 1
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
@@ -698,13 +704,22 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
       --tools=Read,Write \
       --append-system-prompt "Headless triage worker. Read the session transcript and write exactly one findings JSON object, via the Write tool, to the literal output path given on line 2 of the prompt. Those paths are literal strings, not shell variables — never \$-expand them. Print only the literal word done and exit." \
       > /dev/null 2> "$errlog"
-    # Index 1 is the omp/timeout side of the pipe; index 0 is the prompt heredoc.
+    # Index 1 is the omp/timeout side of the pipe; index 0 is the brace group.
     # 124 is timeout reporting that it fired; 137 is 128+SIGKILL, which is what the
     # -k grace period escalates to. Only trust 137 as a timeout when the wrapper is
     # actually in the pipeline: with no timeout binary, an OOM-killed omp returns
     # 137 too, and calling that a timeout would be a lie the stats then repeat.
     l1rc="${PIPESTATUS[1]}"
-    if [ -n "$TIMEOUT_BIN" ] && { [ "$l1rc" = "124" ] || [ "$l1rc" = "137" ]; }; then
+    # Elapsed is the positive evidence that the deadline actually fired. The exit
+    # code alone cannot say so: GNU timeout propagates the exit status of the child,
+    # so a worker that exits 124 by itself, or that the OOM killer SIGKILLs at second
+    # zero, arrives here looking identical to a real timeout. Verified against
+    # coreutils 9.11 on this host — a self-killed child returned 137 after 0s
+    # under a 100s bound. Without this, an OOM would be deleted, retried, and
+    # counted as a timeout, which is the same class of lie this commit removes.
+    l1elapsed=$(($(date +%s) - t0))
+    if [ -n "$TIMEOUT_BIN" ] && { [ "$l1rc" = "124" ] || [ "$l1rc" = "137" ]; } \
+       && [ "$l1elapsed" -ge "$AUTODREAM_L1_TIMEOUT" ]; then
       printf "worker exceeded AUTODREAM_L1_TIMEOUT=%ss and was killed with its process group (rc=%s)\n" \
         "$AUTODREAM_L1_TIMEOUT" "$l1rc" >> "$errlog"
       # The errlog cannot carry this fact: it is truncated by the next retry and
