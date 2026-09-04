@@ -16,6 +16,11 @@ WRITER="$REPO/bin/autodream-note.sh"
 PASS=0
 FAIL=0
 SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/notes-path.XXXXXX")"
+
+# vault-notes.sh defaults AUTODREAM_CONFIG to $AUTODREAM_DIR/config and sources it.
+# Every other suite pins this; without it a developer whose real config points
+# AUTODREAM_VAULT_DIR at a live Obsidian vault has these rows reaching into it.
+export AUTODREAM_CONFIG="$SANDBOX/nonexistent-config"
 trap 'rm -rf "$SANDBOX"' EXIT
 
 ok()   { PASS=$((PASS + 1)); printf '  ok   %s\n' "$1"; }

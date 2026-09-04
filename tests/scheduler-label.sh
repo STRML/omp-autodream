@@ -303,5 +303,31 @@ else
   nope "a real scheduling failure is reported as a failure, not as 'in place'" "output: $(tail -5 "$SANDBOX/fail.out")"
 fi
 
+# --- the shipped template must be adoptable by our own ownership check --------
+# It used `bash -lc "$HOME/.../run.sh"`. bash expands $HOME at runtime so the job
+# ran, but norm_dir resolves the literal string, never matched, and a job
+# hand-installed from this repo's own template got a second one scheduled beside
+# it on the next ./install.sh. Copy the template the way its own instructions
+# say to and check the helper adopts it.
+reset_sandbox
+TEMPLATE="$REPO/launchd/com.user.omp-autodream.plist.example"
+if [ -f "$TEMPLATE" ]; then
+  # Strip the leading comment block the .example carries above <?xml.
+  sed -n '/<?xml/,$p' "$TEMPLATE" \
+    | sed -e "s|/Users/REPLACE_WITH_USERNAME/.omp/agent/autodream|$OMP|g" \
+          -e "s|/Users/REPLACE_WITH_USERNAME|$SANDBOX|g" \
+          -e "s|<string>com.user.omp-autodream</string>|<string>$DEFAULT</string>|" \
+    > "$LA/$DEFAULT.plist"
+  if plutil -lint "$LA/$DEFAULT.plist" >/dev/null 2>&1; then
+    run_sut "$OMP"
+    assert_eq "$DEFAULT" "$SUT_OUT" "a job installed from the shipped template is adopted, not duplicated"
+    assert_eq "0" "$SUT_RC" "the shipped template is not read as a foreign conflict"
+  else
+    nope "the shipped template renders a valid plist" "plutil rejected the filled-in template"
+  fi
+else
+  nope "the shipped template exists" "$TEMPLATE missing"
+fi
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

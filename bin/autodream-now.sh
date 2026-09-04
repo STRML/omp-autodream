@@ -65,10 +65,12 @@ AUTODREAM_DIR="${AUTODREAM_DIR:-}"
 if [ -z "$AUTODREAM_DIR" ]; then
   AUTODREAM_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
   if [ -z "$AUTODREAM_DIR" ] || { [ ! -f "$AUTODREAM_DIR/config" ] && [ ! -f "$AUTODREAM_DIR/l1-no-advisor.yml" ]; }; then
-    AUTODREAM_DIR="$HOME/.claude/autodream"
+    # This port's default, not the shared idiom's legacy ~/.claude/autodream:
+    # running straight from the checkout used to land here and still should.
+    AUTODREAM_DIR="$HOME/.omp/agent/autodream"
   fi
 fi
-DREAMS_DIR="${DREAMS_DIR:-$HOME/.omp/agent/dreams}"
+DREAMS_DIR="${DREAMS_DIR:-$(dirname "$AUTODREAM_DIR")/dreams}"
 mkdir -p "$AUTODREAM_DIR/logs"
 
 # Target date: explicit arg, else "yesterday" computed exactly like run.sh does —

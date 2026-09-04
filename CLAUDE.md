@@ -61,7 +61,7 @@ All under `$AUTODREAM_DIR` (install.sh's target, `~/.omp/agent/autodream/`) exce
 - `logs/run-YYYY-MM-DD.log` — full run log (run.sh tees here). `logs/launchd.{out,err}.log` — launchd's capture.
 - `dreams/YYYY-MM-DD.md` (default `$(dirname "$AUTODREAM_DIR")/dreams`, so `~/.omp/agent/dreams/`) — the final report.
 
-Scripts/prompts are symlinked into `~/.omp/agent/autodream/` by `install.sh`, so editing the repo copy takes effect immediately. The installed launchd job is `com.<user>.omp-autodream` (not the `com.user.*` example label).
+Scripts/prompts are symlinked into `~/.omp/agent/autodream/` by `install.sh`, so editing the repo copy takes effect immediately. The installed launchd job defaults to `com.<user>.omp-autodream` (not the `com.user.*` example label). It is a default rather than a fixed name: `scheduler-label.sh` adopts whatever label a prior install of *this* directory used, so a renamed job keeps its name across re-installs.
 
 `install.sh` also installs that scheduled job by default (unless `--no-schedule`): it generates the plist with auto-detected label/PATH/dirs, then `bootout`+`bootstrap`s it. `RunAtLoad` is false, so install *arms* the schedule without firing a run; the four morning triggers (03:15/06:15/09:15/12:15) match the example plist. It does not run `pmset` (sudo) — it only prints the `pmset repeat wake` recommendation. The `launchd/*.example` file is kept as a hand-editable fallback.
 

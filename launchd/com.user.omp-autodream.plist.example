@@ -35,8 +35,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>-lc</string>
-        <string>$HOME/.omp/agent/autodream/run.sh</string>
+        <string>/Users/REPLACE_WITH_USERNAME/.omp/agent/autodream/run.sh</string>
     </array>
 
     <!-- Several catch-up triggers; the idempotency guard makes all-but-one a no-op. -->
