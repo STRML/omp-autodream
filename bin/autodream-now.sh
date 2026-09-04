@@ -55,7 +55,19 @@ RUN_SH="$BIN_DIR/run.sh"
 # ------------------------------------------------------------- state locations --
 # Defaults mirror run.sh's own defaults; honor the same env overrides so a
 # customized install (different AUTODREAM_DIR / DREAMS_DIR) still works.
-AUTODREAM_DIR="${AUTODREAM_DIR:-$HOME/.omp/agent/autodream}"
+# Resolve the install dir from our own location, the same idiom as the siblings.
+# scheduler-label.sh decides ownership by comparing a plist's runner dir against
+# this value, so a hardcoded default never matched a custom-path install
+# (./install.sh /custom) and the .ondemand label silently left that install's
+# namespace. Unresolved BASH_SOURCE on purpose: the symlink's own directory is
+# the install dir, while BIN_DIR below resolves through to the repo.
+AUTODREAM_DIR="${AUTODREAM_DIR:-}"
+if [ -z "$AUTODREAM_DIR" ]; then
+  AUTODREAM_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+  if [ -z "$AUTODREAM_DIR" ] || { [ ! -f "$AUTODREAM_DIR/config" ] && [ ! -f "$AUTODREAM_DIR/l1-no-advisor.yml" ]; }; then
+    AUTODREAM_DIR="$HOME/.claude/autodream"
+  fi
+fi
 DREAMS_DIR="${DREAMS_DIR:-$HOME/.omp/agent/dreams}"
 mkdir -p "$AUTODREAM_DIR/logs"
 

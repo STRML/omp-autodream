@@ -90,6 +90,21 @@ run_sut() { # run_sut <target> -> sets SUT_OUT / SUT_RC
   SUT_ERR="$(cat "$SANDBOX/err")"
 }
 
+# install.sh runs `chmod +x "$REPO_DIR/bin/"*.sh` against the live checkout, so
+# the rows below that drive the real installer change this working tree's file
+# modes as a side effect. Snapshot them and put them back.
+MODES_SNAPSHOT="$(mktemp "${TMPDIR:-/tmp}/scheduler-label-modes.XXXXXX")"
+find "$REPO/bin" -name '*.sh' -exec stat -f '%p %N' {} \; > "$MODES_SNAPSHOT" 2>/dev/null
+stat -f '%p %N' "$REPO/install.sh" >> "$MODES_SNAPSHOT" 2>/dev/null
+restore_modes() {
+  [ -s "$MODES_SNAPSHOT" ] || return 0
+  while read -r mode path; do
+    [ -e "$path" ] && chmod "${mode: -4}" "$path" 2>/dev/null
+  done < "$MODES_SNAPSHOT"
+  unlink "$MODES_SNAPSHOT" 2>/dev/null
+}
+trap 'cleanup; restore_modes' EXIT
+
 printf 'scheduler-label\n'
 
 # --- row: no autodream plist exists at all ---------------------------------

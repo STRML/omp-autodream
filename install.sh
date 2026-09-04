@@ -157,7 +157,7 @@ install_schedule() {
   local domain
   domain="gui/$(id -u)"
 
-  cat > "$target_plist" <<PLIST
+  cat > "$target_plist" <<PLIST || { echo "  ERROR: could not write $target_plist" >&2; return 1; }
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -296,7 +296,7 @@ PLIST
     return 0
   fi
   local review_plist="$la_dir/$review_label.plist"
-  cat > "$review_plist" <<PLIST
+  cat > "$review_plist" <<PLIST || { echo "  ERROR: could not write $review_plist" >&2; return 1; }
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">

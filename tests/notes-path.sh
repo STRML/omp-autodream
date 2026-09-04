@@ -54,17 +54,29 @@ else
 fi
 
 # --- the reader agrees with the writer, which is the whole point --------------
-# vault-notes.sh resolves NOTES_FILE as $AUTODREAM_DIR/notes.md; assert the
-# writer's target matches that expression for the same AUTODREAM_DIR.
-READER_EXPR="$(grep -m1 'NOTES_FILE=' "$REPO/bin/vault-notes.sh")"
-case "$READER_EXPR" in
-  *'$AUTODREAM_DIR/notes.md'*) ok "vault-notes.sh reads \$AUTODREAM_DIR/notes.md" ;;
-  *) nope "vault-notes.sh reads \$AUTODREAM_DIR/notes.md" "found: $READER_EXPR" ;;
+# Behavioural, not a source-grep. Both scripts contain the string
+# "$AUTODREAM_DIR/notes.md", so matching that expression passes even when the two
+# resolve AUTODREAM_DIR to different directories - which is exactly the bug. Run
+# both from their installed location with no env and compare the actual file.
+INSTALL3="$SANDBOX/omp3/autodream"
+mkdir -p "$INSTALL3"
+: > "$INSTALL3/config"
+ln -s "$WRITER" "$INSTALL3/autodream-note.sh"
+ln -s "$REPO/bin/vault-notes.sh" "$INSTALL3/vault-notes.sh"
+
+( unset AUTODREAM_DIR; bash "$INSTALL3/autodream-note.sh" "seam note" ) >/dev/null 2>&1
+READER_SAYS="$( unset AUTODREAM_DIR; bash "$INSTALL3/vault-notes.sh" status 2>/dev/null | grep -m1 'notes file' )"
+
+case "$READER_SAYS" in
+  *"$INSTALL3/notes.md"*) ok "the reader names the same file the writer wrote, with no env set" ;;
+  *) nope "the reader names the same file the writer wrote, with no env set" "reader said: ${READER_SAYS:-<no notes-file line>}" ;;
 esac
-if grep -q 'NOTES="\${AUTODREAM_NOTES_FILE:-\$AUTODREAM_DIR/notes.md}"' "$WRITER"; then
-  ok "autodream-note.sh writes the same expression"
+
+# And the note itself has to be visible to the reader's file, not merely adjacent.
+if [ -s "$INSTALL3/notes.md" ] && grep -q "seam note" "$INSTALL3/notes.md"; then
+  ok "the note landed in the install dir both halves resolve to"
 else
-  nope "autodream-note.sh writes the same expression" "writer does not resolve via AUTODREAM_DIR"
+  nope "the note landed in the install dir both halves resolve to" "missing from $INSTALL3/notes.md"
 fi
 
 # --- no hardcoded legacy path outside the documented fallback ----------------

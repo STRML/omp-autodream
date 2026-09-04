@@ -52,7 +52,20 @@
 #   AUTODREAM_ICLOUD_WAIT seconds to wait for dataless files to materialize   default 30
 set -euo pipefail
 
-AUTODREAM_DIR="${AUTODREAM_DIR:-$HOME/.claude/autodream}"
+# Resolve the install dir from our own location, the same idiom as run.sh,
+# notify.sh, review.sh and autodream-note.sh. Hardcoding a default here made the
+# reader disagree with the writer whenever this ran outside run.sh's exported
+# environment: `vault-notes.sh status`, the command whose whole job is to say
+# whether the note surface is wired, reported a file the writer never touches.
+# BASH_SOURCE is deliberately NOT symlink-resolved - install.sh symlinks this
+# into $TARGET, so the link's own directory IS the install dir.
+AUTODREAM_DIR="${AUTODREAM_DIR:-}"
+if [ -z "$AUTODREAM_DIR" ]; then
+  AUTODREAM_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+  if [ -z "$AUTODREAM_DIR" ] || { [ ! -f "$AUTODREAM_DIR/config" ] && [ ! -f "$AUTODREAM_DIR/l1-no-advisor.yml" ]; }; then
+    AUTODREAM_DIR="$HOME/.claude/autodream"
+  fi
+fi
 
 # Source the config here too, not only in run.sh. `status` exists to be run by hand, and
 # a status command that reports "vault: not configured" about a vault the user configured
