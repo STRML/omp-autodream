@@ -47,7 +47,7 @@ the sessions had moved to the other buckets. The fix is multi-root scanning:
 
 ## Where state lives
 
-All under `$AUTODREAM_DIR` (default `~/.claude/autodream/`) except the reports:
+All under `$AUTODREAM_DIR` (install.sh's target, `~/.omp/agent/autodream/`) except the reports. With no env set, `run.sh` resolves the dir from its own location and only falls back to `~/.claude/autodream` when that derived dir carries no install marker (`bin/run.sh:82-88`) — a legacy last resort, not the install default:
 
 - `findings/YYYY-MM-DD/*.json` — Layer 1 output, one per session (keyed by a 12-char sha1 of the session path). `*.json.err` is a worker's stderr on failure.
 - `findings/YYYY-MM-DD/sessions.txt` (+ `.raw`) — the enumerated session list (`.raw` is pre-self-filter).
@@ -59,7 +59,7 @@ All under `$AUTODREAM_DIR` (default `~/.claude/autodream/`) except the reports:
 - `root-choices.conf` — the per-folder index decision (`~/.claude-ds4/projects=index`), written by `bin/root-probe.sh` at install time. The primary `~/.claude/projects` is always indexed.
 - `cache/claude-code/` — persistent clone of `anthropics/claude-code` for the changelog.
 - `logs/run-YYYY-MM-DD.log` — full run log (run.sh tees here). `logs/launchd.{out,err}.log` — launchd's capture.
-- `dreams/YYYY-MM-DD.md` (default `~/.claude/dreams/`) — the final report.
+- `dreams/YYYY-MM-DD.md` (default `$(dirname "$AUTODREAM_DIR")/dreams`, so `~/.omp/agent/dreams/`) — the final report.
 
 Scripts/prompts are symlinked into `~/.omp/agent/autodream/` by `install.sh`, so editing the repo copy takes effect immediately. The installed launchd job is `com.<user>.omp-autodream` (not the `com.user.*` example label).
 
@@ -143,7 +143,7 @@ What still has no root cause is who SIGTERMs `tee`. It was not `claude --print` 
 
 `PROMPT.md` reads exactly one notes path, `findings/<date>/operator-notes.md`, and `bin/vault-notes.sh` writes it by merging every capture surface. Adding a surface is a change to that script and never to the prompt. Today there are two:
 
-- `~/.claude/autodream/notes.md`, appended by `autodream-note.sh`. Terminal-only, unchanged, still the right thing for an agent leaving itself a note mid-session.
+- `~/.omp/agent/autodream/notes.md`, appended by `autodream-note.sh`. Terminal-only, unchanged, still the right thing for an agent leaving itself a note mid-session.
 - `$AUTODREAM_VAULT_DIR/inbox/*.md`, one file per note. This is the surface that gets used away from the keyboard — Obsidian mobile, Shortcuts, a share sheet, anything that writes a file into a synced folder. Optional YAML frontmatter `expires: YYYY-MM-DD`; expired notes are dropped at collect time so the prompt keeps exactly one expiry format to parse (the `- [added] (expires DATE)` lines).
 
 Consumed inbox files move to `processed/<date>/` and the report is copied to `reports/<date>.md` for phone reading. Both steps are gated on a **non-empty** report, deliberately stricter than the `-f` check that encloses them: archiving a note the aggregator never read destroys the only copy, silently and unrecoverably. The manifest exists for the same reason — `collect` records which files it read and `archive` moves only those, so a note written during the ten minutes a run takes is not swallowed unread.
@@ -216,7 +216,7 @@ A run killed during L2 leaves a complete findings dir and no report, and every s
 
 ### Which code actually ran (`runner_commit`)
 
-`install.sh` symlinks `~/.claude/autodream/*.sh` straight at the repo working tree, so the nightly executes whatever is checked out at 03:15. A tree behind origin runs old code even though the fix is merged and the PR is green. This has cost data twice: the 2026-07-24 `overlap-stats.sh` dangle, and a tree stuck on a local commit from 2026-07-20 to 2026-07-24 that wrote four nights of `run-stats.txt` with no `oversized_*` / `gated` / `overlap_*` keys at all.
+`install.sh` symlinks `~/.omp/agent/autodream/*.sh` straight at the repo working tree, so the nightly executes whatever is checked out at 03:15. A tree behind origin runs old code even though the fix is merged and the PR is green. This has cost data twice: the 2026-07-24 `overlap-stats.sh` dangle, and a tree stuck on a local commit from 2026-07-20 to 2026-07-24 that wrote four nights of `run-stats.txt` with no `oversized_*` / `gated` / `overlap_*` keys at all.
 
 `run-stats.txt` therefore carries `runner_commit` + `runner_dirty` (#29). The diagnostic that matters: a `run-stats.txt` that is *missing keys*, rather than holding suspicious values, means an old runner — not a stat that didn't apply. Both times it took a reflog dig to establish that.
 
@@ -225,8 +225,8 @@ A run killed during L2 leaves a complete findings dir and no report, and every s
 ## Running / rerunning a date
 
 ```
-~/.claude/autodream/run.sh 2026-05-29        # process a date
-AUTODREAM_FORCE=1 ~/.claude/autodream/run.sh 2026-05-29   # rebuild despite an existing report
+~/.omp/agent/autodream/run.sh 2026-05-29        # process a date
+AUTODREAM_FORCE=1 ~/.omp/agent/autodream/run.sh 2026-05-29   # rebuild despite an existing report
 ```
 To reprocess cleanly (e.g. after the corpus changed), delete that date's findings dir AND report first, then run; otherwise idempotency reuses old findings and the guard skips. Env knobs are documented in `run.sh`'s header and the README.
 
@@ -235,13 +235,13 @@ To reprocess cleanly (e.g. after the corpus changed), delete that date's finding
 A full run routinely exceeds 10 minutes, so launching `run.sh` from a foreground/background context that has a time cap (a Claude Code background Bash task, an ssh session that may drop) gets it killed mid-flight. `bin/autodream-now.sh` sidesteps this by handing the run to **launchd**, which owns the process — no time cap, survives the caller disconnecting.
 
 ```
-~/.claude/autodream/autodream-now.sh                  # yesterday, now
-~/.claude/autodream/autodream-now.sh 2026-05-29 --force   # specific date, rebuild
-~/.claude/autodream/autodream-now.sh 2026-05-29 --watch   # tail run log until report lands
-~/.claude/autodream/autodream-now.sh 2026-05-29 --dry-run # print plist + commands, run nothing
+~/.omp/agent/autodream/autodream-now.sh                  # yesterday, now
+~/.omp/agent/autodream/autodream-now.sh 2026-05-29 --force   # specific date, rebuild
+~/.omp/agent/autodream/autodream-now.sh 2026-05-29 --watch   # tail run log until report lands
+~/.omp/agent/autodream/autodream-now.sh 2026-05-29 --dry-run # print plist + commands, run nothing
 ```
 
-How it works: it writes a transient one-shot LaunchAgent (`<base-label>.ondemand`, `RunAtLoad`) into `$AUTODREAM_DIR`, `bootout`s any prior instance, then `bootstrap`s it so launchd runs `run.sh <date>` once and the job exits. `RunAtLoad` is the *only* trigger — it deliberately does not also `kickstart`, or a fast run (e.g. the idempotency no-op) would fire twice. It never touches the scheduled nightly job. Everything is auto-detected: it resolves its own symlink to find `run.sh`, picks the scheduled plist whose `ProgramArguments` reference `run.sh` (not the sibling `*-review` job) to borrow its label namespace, and detects uid + the `claude`/`git` dirs for the agent's PATH — so it is not specific to one user or host. The default date is computed with plain `date -v-1d`, exactly like run.sh (no TZ override). `--force` maps to `AUTODREAM_FORCE=1`; the caller's `AUTODREAM_DIR`/`DREAMS_DIR` are passed through. Progress is in `$AUTODREAM_DIR/logs/run-<date>.log`; the agent's own stdout/stderr go to `logs/ondemand.{out,err}.log`.
+How it works: it writes a transient one-shot LaunchAgent (`<base-label>.ondemand`, `RunAtLoad`) into `$AUTODREAM_DIR`, `bootout`s any prior instance, then `bootstrap`s it so launchd runs `run.sh <date>` once and the job exits. `RunAtLoad` is the *only* trigger — it deliberately does not also `kickstart`, or a fast run (e.g. the idempotency no-op) would fire twice. It never touches the scheduled nightly job. Everything is auto-detected: it resolves its own symlink to find `run.sh`, gets its label namespace from `bin/scheduler-label.sh` (which will not hand back another install's label — see #14 above), and detects uid + the `claude`/`git` dirs for the agent's PATH — so it is not specific to one user or host. The default date is computed with plain `date -v-1d`, exactly like run.sh (no TZ override). `--force` maps to `AUTODREAM_FORCE=1`; the caller's `AUTODREAM_DIR`/`DREAMS_DIR` are passed through. Progress is in `$AUTODREAM_DIR/logs/run-<date>.log`; the agent's own stdout/stderr go to `logs/ondemand.{out,err}.log`.
 
 When you (the agent) need to kick off a run, prefer this over a background Bash task — fire it, then poll `dreams/<date>.md` instead of holding a long task open.
 

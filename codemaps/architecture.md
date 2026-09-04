@@ -71,8 +71,8 @@ All optional; full list (with defaults) is documented in `bin/run.sh`'s header. 
 | `CLAUDE_BIN` | `$HOME/.local/bin/claude` | path to `claude` CLI |
 | `SESSION_ROOTS` | autodetected | colon-separated dirs to scan for session JSONLs (every `$HOME/.claude*/projects`). Wins over `PROJECTS_DIR` |
 | `PROJECTS_DIR` | `$HOME/.claude/projects` | single root, kept for compat (one dir); `WORK_BUCKET` isolation is keyed off this |
-| `AUTODREAM_DIR` | `$HOME/.claude/autodream` | scripts + runtime state |
-| `DREAMS_DIR` | `$HOME/.claude/dreams` | where reports are written |
+| `AUTODREAM_DIR` | `$HOME/.omp/agent/autodream` | scripts + runtime state |
+| `DREAMS_DIR` | `$HOME/.omp/agent/dreams` | where reports are written |
 | `FANOUT` | `8` | L1 parallelism |
 | `AUTODREAM_FORCE` | `0` | `1` rebuilds even if a report exists |
 | `AUTODREAM_CHANGELOG` | `1` | `0` skips the upstream-changelog check |

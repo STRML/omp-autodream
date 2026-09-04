@@ -246,5 +246,39 @@ else
   nope "a refused schedule still installs the symlinks" "run.sh symlink missing"
 fi
 
+# --- a REAL scheduling failure must still fail the install ------------------
+# The refusal path returns non-zero, so the caller has to swallow it. Swallowing
+# every non-zero return instead would convert a broken plist or a failed
+# bootstrap into an exit-0 install that claims everything is in place - the same
+# silent-success shape as #14. Simulate one with a launchctl shim that fails.
+reset_sandbox
+unset LAUNCH_AGENTS_DIR
+FAKE_HOME="$SANDBOX/home"
+mkdir -p "$FAKE_HOME/Library/LaunchAgents" "$SANDBOX/shim"
+cat > "$SANDBOX/shim/launchctl" <<'SHIM'
+#!/bin/bash
+case "$1" in
+  bootstrap) echo "bootstrap: simulated failure" >&2; exit 5 ;;
+  *) exit 0 ;;
+esac
+SHIM
+chmod +x "$SANDBOX/shim/launchctl"
+
+HOME="$FAKE_HOME" PATH="$SANDBOX/shim:$PATH" \
+  bash "$REPO/install.sh" "$SANDBOX/omp" >"$SANDBOX/fail.out" 2>&1
+FAIL_RC=$?
+
+if [ "$FAIL_RC" -ne 0 ]; then
+  ok "a failed launchctl bootstrap fails the install (exit $FAIL_RC)"
+else
+  nope "a failed launchctl bootstrap fails the install" "install.sh exited 0 on a broken schedule"
+fi
+
+if grep -qi "Schedule FAILED" "$SANDBOX/fail.out"; then
+  ok "a real scheduling failure is reported as a failure, not as 'in place'"
+else
+  nope "a real scheduling failure is reported as a failure, not as 'in place'" "output: $(tail -5 "$SANDBOX/fail.out")"
+fi
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

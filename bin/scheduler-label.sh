@@ -59,8 +59,10 @@ label=""
 conflict=""
 for plist in "$LA_DIR"/*autodream*.plist; do
   [ -e "$plist" ] || continue
-  # .ondemand is autodream-now's transient sibling; adopting its label would
-  # nest a second .ondemand suffix onto it.
+  # .ondemand is autodream-now's transient sibling. It writes that plist to
+  # $AUTODREAM_DIR rather than here, so this glob does not normally see one;
+  # the skip is for a copy someone dropped in by hand, where adopting it would
+  # nest a second .ondemand suffix onto the label.
   case "$plist" in *.ondemand.plist) continue ;; esac
   rdir="$(runner_dir_of "$plist")" || continue
   l="$("$PLISTBUDDY" -c 'Print :Label' "$plist" 2>/dev/null)" || continue

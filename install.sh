@@ -205,7 +205,14 @@ PLIST
   # Clear any prior instance, then bootstrap. RunAtLoad is false, so this arms the
   # schedule without firing a run now.
   launchctl bootout   "$domain/$label" 2>/dev/null || true
-  launchctl bootstrap "$domain" "$target_plist"
+  # Guarded explicitly rather than left to `set -e`: the caller invokes this
+  # function as `install_schedule || rc=$?` to catch the exit-3 refusal, and that
+  # form disables errexit for the entire body. An unguarded failure here would
+  # print "scheduled:" over a job that was never bootstrapped.
+  launchctl bootstrap "$domain" "$target_plist" || {
+    echo "  ERROR: launchctl bootstrap failed for $label ($target_plist)" >&2
+    return 1
+  }
   echo "  scheduled: $label  (daily 03:15/06:15/09:15/12:15)  -> $target_plist"
 
   # ---- Review triage LaunchAgent ----
@@ -356,16 +363,31 @@ PLIST
     }
   fi
   launchctl bootout   "$domain/$review_label" 2>/dev/null || true
-  launchctl bootstrap "$domain" "$review_plist"
+  launchctl bootstrap "$domain" "$review_plist" || {
+    echo "  ERROR: launchctl bootstrap failed for $review_label ($review_plist)" >&2
+    return 1
+  }
   echo "  scheduled: $review_label  (daily 08:00/09:15/12:15/15:30/18:15)  -> $review_plist"
 }
 
 echo
 if [ "$SCHEDULE" = 1 ] && command -v launchctl >/dev/null 2>&1; then
   echo "Installing nightly schedule (launchd):"
-  # A refused schedule (a foreign job on our label) leaves the symlinks installed
-  # and the run usable by hand; set -e must not turn it into a failed install.
-  install_schedule || echo "  Schedule not installed (exit $?). Everything else is in place." >&2
+  # Only the REFUSAL (exit 3) is survivable: a foreign job holds our label, the
+  # symlinks are installed and the run still works by hand. install_schedule's
+  # other non-zero returns are real scheduling failures - a plist that fails
+  # plutil -lint, a launchctl bootstrap that did not take - and before this
+  # helper existed `set -e` made every one of them a failed install. Swallowing
+  # those would report "everything is in place" over exactly the silent-broken-
+  # schedule state that #14 cost 18 days to notice.
+  schedule_rc=0
+  install_schedule || schedule_rc=$?
+  if [ "$schedule_rc" -eq 3 ]; then
+    echo "  Schedule not installed: another install holds our label. Everything else is in place." >&2
+  elif [ "$schedule_rc" -ne 0 ]; then
+    echo "  Schedule FAILED (exit $schedule_rc). The symlinks are installed; the schedule is not." >&2
+    exit "$schedule_rc"
+  fi
   echo
   echo "  Guarantee the Mac is awake for the 03:15 trigger (launchd won't wake it):"
   echo "    sudo pmset repeat wake MTWRFSU 03:10:00"
