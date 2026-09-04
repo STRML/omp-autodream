@@ -61,9 +61,23 @@ All under `$AUTODREAM_DIR` (default `~/.claude/autodream/`) except the reports:
 - `logs/run-YYYY-MM-DD.log` — full run log (run.sh tees here). `logs/launchd.{out,err}.log` — launchd's capture.
 - `dreams/YYYY-MM-DD.md` (default `~/.claude/dreams/`) — the final report.
 
-Scripts/prompts are symlinked into `~/.claude/autodream/` by `install.sh`, so editing the repo copy takes effect immediately. The installed launchd job is `com.samuelreed.autodream` (not the `com.user.*` example label).
+Scripts/prompts are symlinked into `~/.omp/agent/autodream/` by `install.sh`, so editing the repo copy takes effect immediately. The installed launchd job is `com.<user>.omp-autodream` (not the `com.user.*` example label).
 
-`install.sh` also installs that scheduled job by default (unless `--no-schedule`): it generates the plist with auto-detected label/PATH/dirs (same detection as `autodream-now.sh` — reuses an existing `*autodream*` plist's label if present, else synthesizes `com.<user>.autodream`), then `bootout`+`bootstrap`s it. `RunAtLoad` is false, so install *arms* the schedule without firing a run; the four morning triggers (03:15/06:15/09:15/12:15) match the example plist. It does not run `pmset` (sudo) — it only prints the `pmset repeat wake` recommendation. The `launchd/*.example` file is kept as a hand-editable fallback.
+`install.sh` also installs that scheduled job by default (unless `--no-schedule`): it generates the plist with auto-detected label/PATH/dirs, then `bootout`+`bootstrap`s it. `RunAtLoad` is false, so install *arms* the schedule without firing a run; the four morning triggers (03:15/06:15/09:15/12:15) match the example plist. It does not run `pmset` (sudo) — it only prints the `pmset repeat wake` recommendation. The `launchd/*.example` file is kept as a hand-editable fallback.
+
+### The label is owned by a runner, not by a name (#14)
+
+`bin/scheduler-label.sh` decides which launchd label this install owns. `install.sh` and `bin/autodream-now.sh` both call it, and the reason it exists is that they used to answer the question separately and got it wrong the same way.
+
+The old rule was "adopt the label of any `*autodream*.plist` whose body mentions `run.sh`". cc-autodream's plist mentions `run.sh`, because every autodream plist does. So installing this repo on a host that already ran cc-autodream adopted `com.<user>.autodream` and rewrote that job to invoke the OMP runner. Nothing failed: the OMP nightly ran fine, `launchctl print` reported a healthy job exiting 0, and `~/.claude/dreams` simply stopped gaining files. It went 18 days before anyone noticed, and only because the reports were missed, never because a check fired.
+
+Three rules replace it, and each one is a row in `tests/scheduler-label.sh`:
+
+- **Ownership is the runner, not the label.** A plist is ours only when its `ProgramArguments` invoke `run.sh` under *this* install's directory. Compare resolved paths, not strings — a trailing slash or a symlinked parent makes a raw compare miss our own plist, and the miss is silent, yielding a fresh label per re-install rather than an error.
+- **Our own label still wins when it is not the default.** A re-install adopts whatever label the previous install used, so a user who renamed the job does not get a second one.
+- **A conflict on the default name is refused, not resolved.** If `com.<user>.omp-autodream` is already held by a plist running someone else's runner, the helper exits 3 and `install.sh` skips scheduling. The symlinks still install, so the run stays usable by hand. Not `AUTODREAM_DIR` — a hand-written plist may carry no environment block, but it always names its program.
+
+The helper prints a label on every path, including the refusal. `autodream-now.sh` only borrows the namespace (it suffixes `.ondemand`, which cannot collide), so it ignores the status; `install.sh` writes the plist, so it must not.
 
 ## How claude is invoked — the lean-query pattern (do not use `--bare`)
 

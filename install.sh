@@ -123,20 +123,17 @@ install_schedule() {
   local la_dir="$HOME/Library/LaunchAgents"
   mkdir -p "$la_dir"
 
-  # Reuse an existing autodream label if one is already installed (keeps the
-  # namespace stable across re-installs and shared with autodream-now's .ondemand
-  # sibling); else synthesize com.<user>.autodream. Match the plist that runs
-  # run.sh — not siblings like *-review.
-  local label="" plist l
-  for plist in "$la_dir"/*autodream*.plist; do
-    [ -e "$plist" ] || continue
-    case "$plist" in *.ondemand.plist) continue ;; esac
-    /usr/bin/grep -q 'run\.sh' "$plist" 2>/dev/null || continue
-    if l="$(/usr/libexec/PlistBuddy -c 'Print :Label' "$plist" 2>/dev/null)"; then
-      label="$l"; break
-    fi
-  done
-  [ -n "$label" ] || label="com.$(id -un | tr -dc 'a-zA-Z0-9').autodream"
+  # Which label this install owns. scheduler-label.sh reuses our own prior label
+  # when there is one (so a re-install stays idempotent), never adopts a plist
+  # that runs someone else's run.sh, and exits 3 rather than overwrite a foreign
+  # job holding our default name. See #14: matching on the string "run.sh" alone
+  # took over cc-autodream's job on this host and killed it for 18 days.
+  local label="" rc=0
+  label="$("$REPO_DIR/bin/scheduler-label.sh" "$TARGET")" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "  Skipping the schedule. Fix the conflict above, or re-run with --no-schedule." >&2
+    return "$rc"
+  fi
 
   # launchd agents start with a minimal PATH; seed it with the dirs of the tools
   # the pipeline shells out to (claude, git, bash) plus the usual suspects.
@@ -366,14 +363,16 @@ PLIST
 echo
 if [ "$SCHEDULE" = 1 ] && command -v launchctl >/dev/null 2>&1; then
   echo "Installing nightly schedule (launchd):"
-  install_schedule
+  # A refused schedule (a foreign job on our label) leaves the symlinks installed
+  # and the run usable by hand; set -e must not turn it into a failed install.
+  install_schedule || echo "  Schedule not installed (exit $?). Everything else is in place." >&2
   echo
   echo "  Guarantee the Mac is awake for the 03:15 trigger (launchd won't wake it):"
   echo "    sudo pmset repeat wake MTWRFSU 03:10:00"
 elif [ "$SCHEDULE" = 1 ]; then
   echo "Skipping schedule: launchctl not found (not macOS?). See launchd/ for the template."
 else
-  echo "Skipping schedule (--no-schedule). See launchd/com.user.autodream.plist.example to add one."
+  echo "Skipping schedule (--no-schedule). See launchd/com.user.omp-autodream.plist.example to add one."
 fi
 
 echo

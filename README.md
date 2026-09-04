@@ -111,7 +111,7 @@ scheduled wake:
 sudo pmset repeat wake MTWRFSU 03:10:00
 ```
 
-The hand-editable template lives at `launchd/com.user.autodream.plist.example` if you'd
+The hand-editable template lives at `launchd/com.user.omp-autodream.plist.example` if you'd
 rather install the job yourself.
 
 ## Running it by hand

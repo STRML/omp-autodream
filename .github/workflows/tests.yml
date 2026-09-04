@@ -36,6 +36,9 @@ jobs:
       - name: run-all
         run: bash tests/run-all.sh
 
+      - name: scheduler-label
+        run: bash tests/scheduler-label.sh
+
       - name: cookie-cadence
         run: bash tests/cookie-cadence.sh
 

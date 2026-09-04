@@ -5,7 +5,7 @@ Token-lean map of cc-autodream. See `CLAUDE.md` for the decisions and gotchas be
 ## Data flow
 
 ```
-launchd (com.samuelreed.autodream, several morning triggers)
+launchd (com.<user>.omp-autodream, several morning triggers)
       │
       ▼
 bin/run.sh  TARGET_DATE
@@ -39,7 +39,8 @@ bin/run.sh  TARGET_DATE
 | File | Role |
 |---|---|
 | `bin/run.sh` | orchestrator: guard, enumerate+filter, L1 retry loop, changelog, L2 retry loop, notify |
-| `bin/autodream-now.sh` | run NOW via a transient one-shot launchd agent (escapes the ~10-min cap on bg tasks/ssh). `[DATE] [--force] [--watch] [--dry-run]`. RunAtLoad only (no kickstart → no double run); picks the scheduled plist that runs `run.sh` for its label namespace |
+| `bin/autodream-now.sh` | run NOW via a transient one-shot launchd agent (escapes the ~10-min cap on bg tasks/ssh). `[DATE] [--force] [--watch] [--dry-run]`. RunAtLoad only (no kickstart → no double run); borrows its label namespace from `scheduler-label.sh` and suffixes `.ondemand` |
+| `bin/scheduler-label.sh` | which launchd label this install owns. Ownership is the `run.sh` a plist invokes, not the label it carries; refuses (exit 3) rather than overwrite a foreign job on our default name (#14). Called by `install.sh` and `autodream-now.sh` |
 | `bin/prune-self-sessions.sh` | self-session predicate (single source of truth): list / `--delete` / `--filter` |
 | `bin/oversized-gate.sh` | recompute the #12 measurement gate over a trailing window from the sidecars/findings on disk (`--days N`, or explicit findings dirs). Recovers dates whose `run-stats.txt` predates the counters; artifacts only, no model calls |
 | `bin/root-probe.sh` | detect the `~/.claude*/projects` buckets and decide which to index. `--consolidated`/`--unindexed`/`--list` (read-only, nightly), `--ask`/`--default-index` (install-time; writes root-choices.conf + the managed `SESSION_ROOTS` config section). Artifacts only, no model calls |
@@ -49,9 +50,10 @@ bin/run.sh  TARGET_DATE
 | `prompts/PROMPT.md` | L2 prompt: report sections incl. Upstream changes + Autodream self-audit |
 | `tests/run-all.sh` | integration tests for `run.sh` vs `mock-claude.sh` (offline) |
 | `tests/review-skip.sh` | tests for `review.sh`'s skip/launch decision (offline; inline mock claude) |
+| `tests/scheduler-label.sh` | label-ownership rows from #14: sandboxed LaunchAgents dir, shimmed launchctl, drives the real `install.sh` refusal path |
 | `tests/mock-claude.sh` | stand-in claude; modes: good / l1_incomplete / l1_flaky |
-| `launchd/com.user.autodream.plist.example` | schedule (multi-trigger catch-up + pmset note) |
-| `install.sh` | symlink scripts/prompts into `~/.claude/autodream/`; by default also generates + bootstraps the nightly launchd schedule (auto-detected label/PATH/dirs; `--no-schedule` to skip) |
+| `launchd/com.user.omp-autodream.plist.example` | schedule (multi-trigger catch-up + pmset note) |
+| `install.sh` | symlink scripts/prompts into `~/.omp/agent/autodream/`; by default also generates + bootstraps the nightly launchd schedule (label from `scheduler-label.sh`, auto-detected PATH/dirs; `--no-schedule` to skip). A refused label skips scheduling and still installs the symlinks |
 
 ## Key invariants
 

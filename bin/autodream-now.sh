@@ -71,19 +71,13 @@ fi
 # --------------------------------------------------------------- launchd label --
 UID_NUM="$(id -u)"
 DOMAIN="gui/$UID_NUM"
-# Reuse the base label from the installed scheduled job so the transient label sits
-# in the same namespace. Pick the plist that actually runs run.sh — not siblings
-# like *-review (review.sh). Otherwise synthesize one.
-BASE_LABEL=""
-for plist in "$HOME"/Library/LaunchAgents/*autodream*.plist; do
-  [ -e "$plist" ] || continue
-  case "$plist" in *.ondemand.plist) continue ;; esac
-  /usr/bin/grep -q 'run\.sh' "$plist" 2>/dev/null || continue
-  if l="$(/usr/libexec/PlistBuddy -c 'Print :Label' "$plist" 2>/dev/null)"; then
-    BASE_LABEL="$l"; break
-  fi
-done
-[ -n "$BASE_LABEL" ] || BASE_LABEL="com.$(id -un | tr -dc 'a-zA-Z0-9').autodream"
+# Reuse the base label from OUR installed scheduled job so the transient label sits
+# in the same namespace. scheduler-label.sh owns that decision for install.sh too;
+# it will not hand back a label belonging to another autodream install (#14). A
+# conflict on the default name is not fatal here - we only borrow the namespace,
+# and .ondemand suffixed onto it is a distinct label either way.
+BASE_LABEL="$("$BIN_DIR/scheduler-label.sh" "$AUTODREAM_DIR" 2>/dev/null || true)"
+[ -n "$BASE_LABEL" ] || BASE_LABEL="com.$(id -un | tr -dc 'a-zA-Z0-9').omp-autodream"
 LABEL="${BASE_LABEL}.ondemand"
 PLIST="$AUTODREAM_DIR/${LABEL}.plist"
 

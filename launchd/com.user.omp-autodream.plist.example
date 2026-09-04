@@ -18,11 +18,11 @@
     sudo pmset repeat wake MTWRFSU 03:10:00
 
   Install:
-    cp launchd/com.user.autodream.plist.example \
-       ~/Library/LaunchAgents/com.user.autodream.plist
+    cp launchd/com.user.omp-autodream.plist.example \
+       ~/Library/LaunchAgents/com.user.omp-autodream.plist
     # Edit the plist: replace REPLACE_WITH_USERNAME and any paths that differ.
-    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.autodream.plist
-    launchctl kickstart -k gui/$(id -u)/com.user.autodream    # run now to test
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.omp-autodream.plist
+    launchctl kickstart -k gui/$(id -u)/com.user.omp-autodream    # run now to test
 
   Logs land at $HOME/.claude/autodream/logs/launchd.{out,err}.log and
   $HOME/.claude/autodream/logs/run-YYYY-MM-DD.log.
@@ -30,7 +30,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.user.autodream</string>
+    <string>com.user.omp-autodream</string>
 
     <key>ProgramArguments</key>
     <array>
