@@ -239,6 +239,14 @@ else
   nope "install.sh reports why the schedule was skipped" "output: $(tail -5 "$SANDBOX/install.out")"
 fi
 
+# A refusal must not then advise arming a wake schedule for the job it declined
+# to install. The logic state and what the user is told have to agree.
+if grep -q 'pmset repeat wake' "$SANDBOX/install.out"; then
+  nope "a refused schedule does not advise pmset" "install.out still prints the wake advice"
+else
+  ok "a refused schedule does not advise pmset"
+fi
+
 # The symlinks must still be there - a refused schedule is not a failed install.
 if [ -L "$SANDBOX/omp/autodream/run.sh" ]; then
   ok "a refused schedule still installs the symlinks"

@@ -39,6 +39,9 @@ jobs:
       - name: scheduler-label
         run: bash tests/scheduler-label.sh
 
+      - name: notes-path
+        run: bash tests/notes-path.sh
+
       - name: cookie-cadence
         run: bash tests/cookie-cadence.sh
 

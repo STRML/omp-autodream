@@ -388,9 +388,14 @@ if [ "$SCHEDULE" = 1 ] && command -v launchctl >/dev/null 2>&1; then
     echo "  Schedule FAILED (exit $schedule_rc). The symlinks are installed; the schedule is not." >&2
     exit "$schedule_rc"
   fi
-  echo
-  echo "  Guarantee the Mac is awake for the 03:15 trigger (launchd won't wake it):"
-  echo "    sudo pmset repeat wake MTWRFSU 03:10:00"
+  # Only advise the wake schedule when there is a job to wake for. Printing it
+  # after a refusal tells the user to arm a 03:15 wake for a trigger that was
+  # deliberately not installed.
+  if [ "$schedule_rc" -eq 0 ]; then
+    echo
+    echo "  Guarantee the Mac is awake for the 03:15 trigger (launchd won't wake it):"
+    echo "    sudo pmset repeat wake MTWRFSU 03:10:00"
+  fi
 elif [ "$SCHEDULE" = 1 ]; then
   echo "Skipping schedule: launchctl not found (not macOS?). See launchd/ for the template."
 else

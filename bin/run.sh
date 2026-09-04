@@ -25,8 +25,9 @@
 #                  that exists is scanned (primary always first) — each CLAUDE_CONFIG_DIR
 #                  profile keeps its own projects/ bucket, so one-dir scanning silently
 #                  missed sessions recorded under ~/.claude-nous, ~/.claude-ds4, ...
-#   AUTODREAM_DIR  scripts + prompts + state           default: $HOME/.claude/autodream
-#   DREAMS_DIR     where final reports are written     default: $HOME/.claude/dreams
+#   AUTODREAM_DIR  scripts + prompts + state           default: this script's own dir
+#                  when it carries an install marker, else $HOME/.claude/autodream
+#   DREAMS_DIR     where final reports are written     default: $(dirname AUTODREAM_DIR)/dreams
 #   FANOUT         L1 parallelism                      default: 8
 #   AUTODREAM_CHANGELOG  set 0 to skip the upstream-changelog check  default: 1
 #   CLAUDE_CODE_REPO     persistent cache for the claude-code clone  default: $AUTODREAM_DIR/cache/claude-code
