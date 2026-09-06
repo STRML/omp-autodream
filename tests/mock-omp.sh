@@ -88,6 +88,22 @@ case "$fixture" in
       '{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}' \
       '{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"end"}]}}'
     ;;
+  skills)
+    # Skill invocation vs skill authoring, which the pipeline used to conflate.
+    # OMP records an invocation as a custom_message of customType "skill-prompt"
+    # whose content opens with the bracket line below; manage_skill toolCalls
+    # create/update/delete skills and never run one. One skill is invoked twice
+    # (dedup) and two are authored, so the counts cannot coincide by accident.
+    emit \
+      '{"type":"message","message":{"role":"user","content":[{"type":"text","text":"/triage"}]}}' \
+      '{"type":"custom_message","customType":"skill-prompt","content":"[IMPORTANT: User invoked the \"triage\" skill; follow its instructions. Full skill below.]\n\n# Triage\n"}' \
+      '{"type":"custom_message","customType":"skill-prompt","content":"[IMPORTANT: User invoked the \"triage\" skill; follow its instructions. Full skill below.]\n\n# Triage\n"}' \
+      '{"type":"custom_message","customType":"skill-prompt","content":"[IMPORTANT: User invoked the \"deslop\" skill; follow its instructions. Full skill below.]\n\n# Deslop\n"}' \
+      '{"type":"custom_message","customType":"eager-task-prelude","content":"[IMPORTANT: User invoked the \"not-a-skill\" skill]"}' \
+      '{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","name":"manage_skill","arguments":{"action":"create","name":"rs3-gui-navigation"}}]}}' \
+      '{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","name":"manage_skill","arguments":{"action":"update","name":"update-omp-fork"}}]}}' \
+      '{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","name":"bash","arguments":{"cmd":"ls"}}]}}'
+    ;;
   *)
     echo "mock-omp.sh: unknown fixture <$fixture>" >&2
     exit 2

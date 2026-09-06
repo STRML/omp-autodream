@@ -125,7 +125,20 @@ run.sh handles it with:
 - **Idempotency guard**: at the top of `run()`, if a report already exists for the date it exits in a second (`AUTODREAM_FORCE=1` to rebuild). This is what makes multiple launchd catch-up triggers safe.
 - The plist example schedules several morning triggers (03:15/06:15/09:15/12:15) so a failed-overnight date gets retried on later wakes; the guard no-ops the rest.
 
-`net_up` checks reachability of `api.anthropic.com` (any HTTP code beats `000`). Disable the wait with `AUTODREAM_NETCHECK=0` (tests set this).
+`net_up` checks reachability of `api.anthropic.com` (any HTTP code beats `000`). Disable the wait with `AUTODREAM_NETCHECK=0` (tests set this); `AUTODREAM_NETCHECK_CAP` (1800s) bounds each wait.
+
+### A dead network used to read as a transcript problem (2026-09-04)
+
+`wait_for_network` gave up after its cap and logged "proceeding anyway", which meant dispatching a full round of workers at a host with no route. Each one died in about 9 seconds having written nothing, and the runner retried the same dead network five times. The report that came out of it blamed the transcripts: `oversized_errored/oversized_total` read 3/4, which is the threshold that opens issue #12. Re-running those three transcripts by hand against a live network produced findings for all three in 73-78 seconds. Nothing in the artifacts could tell the two failures apart, because the worker's diagnosis went to `/dev/null` and the `.err` kept only the word `Working...` that omp puts on stderr.
+
+Four things changed, and each is a test in `tests/run-all.sh`:
+
+- **The check happens before dispatch, including on round 1.** The overnight failure is a Mac that slept through its trigger, so round 1 is the round most likely to run with no route, and it was the only round nothing checked.
+- **`wait_for_network` returns non-zero when it gives up**, and the caller defers the date: no L2, no report, exit 1. The findings already written stay on disk, the worker is idempotent, and a later catch-up trigger picks up exactly what is still missing. Writing a report from a dead-network run is worse than writing none — it looks complete and ships open questions drawn from a quarter of the corpus.
+- **The worker's stdout is captured**, and the `.err` records the exit code plus the last 40 lines. A provider refusal and a killed process no longer read identically.
+- **A failure with no route is ledgered** in `l1-netdown.txt` (same lifetime and reasoning as `l1-timeouts.txt`), one `<hash> <round> <true|false>` line per classified failure, and **no findings stub is written for it**. Leaving the slot empty is what makes the retry work: a stub carries a `.findings` key, `jq -e` counts an empty array as present, so a stub would mark the session done, drop `MISSING` to zero, stop the deferral, and make every later run skip the session forever. Because an outage now leaves no findings file, it cannot reach `oversized_errored` either — the exclusion counter an earlier draft added was dead on arrival and is gone. `run-stats.txt` carries `network_down_seconds` / `network_deferred` for L1 and `network_down_seconds_l2` / `network_deferred_l2` appended after the aggregator, and `PROMPT.md` tells the self-audit to read all four before diagnosing capacity.
+
+The trap to avoid when reading a future run: `l1_missing_after_retries: 0` and `l1_timed_out: 0` do not rule out the network. Workers that fail instantly leave no timeout, and the last round leaves a metadata stub rather than a missing slot, so both keys read clean through a total outage. That is the reasoning that made the 2026-09-04 self-audit say "this was not the network".
 
 ### The logger could kill the run, and did (2026-08-02)
 
@@ -213,6 +226,19 @@ The noise gate's own sidecar read still biases to triage on an unparseable sidec
 A run killed during L2 leaves a complete findings dir and no report, and every surface that would have said so is downstream of the death: `notify.sh` never runs, so there is not even a quiet banner. The catch-up triggers cannot cover it either, because launchd will not start a second instance of a label that is already running — a run slow enough to span its own catch-up window converts those triggers into nothing at all. 2026-07-26 sat unassembled for two days and was found during an unrelated investigation; 2026-08-01 repeated it.
 
 `unassembled_dates()` sweeps the trailing week at the top of `run()` — deliberately *above* the idempotency guard, so a catch-up trigger that no-ops for today still reports older abandoned dates. It lists dates holding findings JSONs (sidecar-only dirs were never triaged and are not failures) whose report is missing or marker-less, and the result goes to the log and to `run-stats.txt`, which puts it in the next morning's report. The data was never the problem: `autodream-now.sh <date>` rebuilds one in minutes because the findings survive and it skips straight to L2.
+
+### Skill invocation is measured, not judged (2026-09-05)
+
+`skills_invoked` used to be a field the L1 model filled in by reading the transcript, and the 2026-09-04 report used it to conclude that a ~200-skill inventory never fires: 3,988 tool calls, `skills_invoked: []`. The same session called `manage_skill` ten times. Those calls create, update and delete skills; none of them runs one, so both readings of that transcript were wrong in opposite directions.
+
+`bin/session-stats.sh` now derives three fields mechanically, alongside `tool_call_count`:
+
+- `skills_invoked` / `skills_invoked_count` — from `custom_message` records of `customType: "skill-prompt"`, whose content opens `[IMPORTANT: User invoked the "<name>" skill; ...]`. That record is the **only** trace a skill invocation leaves in an OMP transcript. There is no skill tool call, and the transcript format has exactly three `customType` values (`tool_execution_start`, `session_exit`, `vibe-session-lifecycle`), none of them skill-related. Verified across all 204 transcripts in the store on 2026-09-05: 7 such records, 100% matching the pattern, 2 distinct skills, 6 sessions.
+- `skills_authored` — skill names from `manage_skill` toolCall arguments. Across those same 204 transcripts the only actions ever seen are `create`, `update` and `delete`.
+
+`SESSION_TRIAGE.md` tells the worker to copy all three from the precomputed stats block and never to infer an invocation from `manage_skill`; `PROMPT.md` tells the aggregator to report authored skills on their own line.
+
+The general rule this is an instance of: a facet the report will reason about quantitatively belongs in the deterministic sidecar, not in the model prompt. `compliance_markers` was retired for measuring silence; this one was worse, because it measured silence and the report believed it.
 
 ### Which code actually ran (`runner_commit`)
 

@@ -35,7 +35,8 @@
 #   AUTODREAM_L1_ROUNDS  max L1 retry rounds for missing sessions    default: 5
 #   AUTODREAM_L2_ATTEMPTS max L2 attempts to produce a report        default: 3
 #   AUTODREAM_RETRY_WAIT seconds to pause between retry rounds       default: 60
-#   AUTODREAM_NETCHECK   set 0 to skip waiting-for-network on retry  default: 1
+#   AUTODREAM_NETCHECK   set 0 to skip the pre-dispatch network check default: 1
+#   AUTODREAM_NETCHECK_CAP seconds to wait for a route before deferring default: 1800
 #   AUTODREAM_FORCE      set 1 to rebuild even if a report exists    default: 0
 #   AUTODREAM_SLIM_BYTES sessions larger than this are slimmed for L1  default: 262144
 #   AUTODREAM_L1_MODEL   override the L1 triage model                 default: runinfra/deepseek-v4-flash
@@ -551,19 +552,49 @@ report_complete() {
 }
 
 net_up() { # exit 0 if the API host is reachable (any HTTP code beats "000" = no route)
-  local code
-  code=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' https://api.anthropic.com/ 2>/dev/null)
+  local code rc
+  code=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' https://api.anthropic.com/ 2>/dev/null); rc=$?
+  # 127 is "not found" and 126 is "found but not executable". Both mean the shell could
+  # not run curl at all — absent, not executable.
+  # That is "the check cannot answer", not "the host is down", and reading it as down
+  # made a machine without curl wait out the full cap and defer a healthy run, every
+  # run, for a reason nothing reported. Bias to up: a wrong "up" costs one round of
+  # workers, a wrong "down" costs the whole date. Checking the exit status rather than
+  # `command -v` also covers a curl that is present but unrunnable.
+  { [ "$rc" -eq 127 ] || [ "$rc" -eq 126 ]; } && return 0
   [ -n "$code" ] && [ "$code" != "000" ]
 }
 
-wait_for_network() { # block until net_up (capped); no-op when AUTODREAM_NETCHECK=0
+# Seconds this run spent blocked on wait_for_network, summed across rounds. Reported in
+# run-stats.txt so the self-audit can tell an outage from a transcript problem — on
+# 2026-09-04 it could not, and blamed 90 minutes of dead network on oversized transcripts.
+NET_DOWN_SECONDS=0
+
+wait_for_network() { # 0 = network is up, 1 = gave up after the cap; no-op when AUTODREAM_NETCHECK=0
   [ "${AUTODREAM_NETCHECK:-1}" != "0" ] || return 0
-  local waited=0 cap="${AUTODREAM_NETCHECK_CAP:-1800}"
+  local waited=0 step cap="${AUTODREAM_NETCHECK_CAP:-1800}"
+  # A non-numeric cap makes every [ "$waited" -ge "$cap" ] test error out, and an erroring
+  # test reads as false — so the give-up branch became unreachable and the bound that was
+  # supposed to limit the wait removed it instead.
+  case "$cap" in ''|*[!0-9]*) log "AUTODREAM_NETCHECK_CAP='$cap' is not a number; using 1800"; cap=1800 ;; esac
   while ! net_up; do
-    [ "$waited" -ge "$cap" ] && { log "network still down after ~${cap}s of checks; proceeding anyway"; return 0; }
+    if [ "$waited" -ge "$cap" ]; then
+      NET_DOWN_SECONDS=$((NET_DOWN_SECONDS + waited))
+      log "network still down after ~${waited}s of checks (cap ${cap}s)"
+      # Was `return 0` — "proceeding anyway". Proceeding meant dispatching a full round
+      # of workers at a host with no route, which fails every one of them in ~9s and
+      # burns a retry round to learn nothing. The caller now defers the date instead.
+      return 1
+    fi
     log "waiting for network to return... (${waited}s)"
-    sleep 15; waited=$((waited + 15))
+    # Never sleep past the cap. A fixed 15s step meant any cap below 15 still waited a
+    # full 15 seconds, so the wait overran the bound it was handed and reported a
+    # network_down_seconds larger than the configured maximum.
+    step=$(( cap - waited )); [ "$step" -gt 15 ] && step=15
+    sleep "$step"; waited=$(( waited + step ))
   done
+  NET_DOWN_SECONDS=$((NET_DOWN_SECONDS + waited))
+  return 0
 }
 
 l1_missing_count() { # count sessions in $SESSIONS_LIST that still have no findings JSON
@@ -571,7 +602,14 @@ l1_missing_count() { # count sessions in $SESSIONS_LIST that still have no findi
   while IFS= read -r s; do
     [ -n "$s" ] || continue
     h=$(printf "%s" "$s" | shasum -a 1 | cut -c1-12)
-    jq -e .findings "$FINDINGS_DIR/$h.json" >/dev/null 2>&1 || m=$((m + 1))
+    # Same check the dispatcher applies on the way out. `jq -e .findings` is truthy for
+    # a STRING or an OBJECT, so {"findings":"oops"} counted as a finished session here and
+    # reached L2 as a result instead of being retried. `arrays` emits nothing for a
+    # non-array, so jq -e exits non-zero. Written this way rather than as
+    # `(.findings | type) == "array"` because the dispatcher copy lives inside a
+    # single-quoted `bash -c` body where a single quote silently breaks the quoting, and
+    # two checks that must agree should be readable as the same check.
+    jq -e ".findings | arrays" "$FINDINGS_DIR/$h.json" >/dev/null 2>&1 || m=$((m + 1))
   done < "$SESSIONS_LIST"
   printf '%s' "$m"
 }
@@ -646,12 +684,25 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
     t0=$(date +%s)
     output="$FINDINGS_DIR/$hash.json"
     errlog="$output.err"
+    # The worker printed its whole diagnosis to stdout and this used to be /dev/null, so
+    # every failure looked the same: an .err holding the single line "Working..." and a
+    # hand-written sentence from the runner. On 2026-09-04 that hid a dead network behind
+    # three transcripts that were fine, and the report blamed their size. Kept only when
+    # the worker fails; deleted with the errlog on success.
+    outlog="$output.out"
 
-    # Idempotent, but validate: a non-empty file that is malformed or lacks a
-    # top-level findings key is NOT a completed triage (a worker that emitted
-    # garbage JSON). Treat it as missing so this pass re-dispatches it, rather
-    # than letting it count as done and feed broken records to L2.
-    jq -e .findings "$output" >/dev/null 2>&1 && exit 0
+    # Idempotent, but validate: a non-empty file that is malformed, lacks a top-level
+    # findings key, or carries one of the wrong TYPE is NOT a completed triage. Treat it
+    # as missing so this pass re-dispatches it, rather than letting it count as done and
+    # feed broken records to L2.
+    #
+    # The three sites that answer "is this a finished triage" must agree, or a file can
+    # be done to one and missing to another and never get rewritten by anyone:
+    # here (dispatcher, inbound), l1_missing_count (parent), and the outbound check after
+    # the worker exits. A partial fix left this site on `jq -e .findings`, which is truthy
+    # for a string or an object, so a stale {"findings":"oops"} was skipped on every
+    # retry while the parent counted it missing, and L2 aggregated it anyway.
+    jq -e ".findings | arrays" "$output" >/dev/null 2>&1 && exit 0
 
     # Validate the session is readable BEFORE spawning a worker. A path that find
     # enumerated but that is gone/unreadable by dispatch time otherwise sends the
@@ -743,7 +794,7 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
       --model "${AUTODREAM_L1_MODEL:-anthropic/claude-haiku}" \
       --tools=Read,Write \
       --append-system-prompt "Headless triage worker. Read the session transcript and write exactly one findings JSON object, via the Write tool, to the literal output path given on line 2 of the prompt. Those paths are literal strings, not shell variables — never \$-expand them. Print only the literal word done and exit." \
-      > /dev/null 2> "$errlog"
+      > "$outlog" 2> "$errlog"
     # Index 1 is the omp/timeout side of the pipe; index 0 is the brace group.
     # 124 is timeout reporting that it fired; 137 is 128+SIGKILL, which is what the
     # -k grace period escalates to. Only trust 137 as a timeout when the wrapper is
@@ -777,6 +828,19 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
       rm -f "$output"
     fi
 
+    # Non-empty is not the same as valid. A worker that writes malformed JSON, or JSON
+    # with no .findings key, used to take the success branch below: both diagnostics were
+    # deleted and the file was left for L2. The dispatcher validates .findings on its way
+    # IN, so the next round would re-run the session — but by then the exit code, the
+    # stdout capture and the omp log tail that explained the failure were already gone,
+    # and on the final round the malformed file simply reached the aggregator. Validate
+    # the same way on the way out, so a bad write is a failure with its evidence intact.
+    if [ -s "$output" ] && ! jq -e ".findings | arrays" "$output" >/dev/null 2>&1; then
+      printf "worker wrote output with no usable .findings key; treating as a failure\n" >> "$errlog"
+      head -c 2000 "$output" >> "$errlog" 2>/dev/null
+      rm -f "$output"
+    fi
+
     if [ -s "$output" ]; then
       # Reported path should be the real session, not the temp slim copy. Then drop
       # the slim file (regenerable; keeps the findings dir clean).
@@ -784,13 +848,81 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
         sed -i "" "s#$slimfile#$session#g" "$output" 2>/dev/null || true
         rm -f "$slimfile"
       fi
-      rm -f "$errlog"
+      rm -f "$errlog" "$outlog"
       echo "ok: $session ($hash) [$(($(date +%s) - t0))s]"
     else
       [ -n "$slimfile" ] && rm -f "$slimfile"
       # Worker exited without writing findings JSON. Record a diagnostic so the
       # failure is visible.
       printf "worker produced no findings JSON for %s (incomplete run: omp exited without writing output)\n" "$session" >> "$errlog"
+      # The three facts that were missing every time this fired. Without the exit code
+      # a provider refusal and a killed process read identically, and without the stdout
+      # capture the entire diagnosis went to /dev/null while the .err kept the one line
+      # the worker happened to put on stderr.
+      printf "worker exit code: %s after %ss\n" "$l1rc" "$l1elapsed" >> "$errlog"
+      if [ -s "$outlog" ]; then
+        printf -- "--- worker stdout, last 40 lines ---\n" >> "$errlog"
+        tail -n 40 "$outlog" >> "$errlog"
+      else
+        printf "worker stdout was empty\n" >> "$errlog"
+      fi
+      rm -f "$outlog"
+      # omp keeps its own log, and for one whole class of death that log is the ONLY
+      # trace. A worker killed during startup localhost provider discovery exits 0 with
+      # empty stdout and nothing but "Working..." on stderr, so the exit code and stdout
+      # captured just above say nothing at all. Its last line is "model discovery failed
+      # for provider" where a healthy worker reaches "provider proxy resolved". Seen
+      # 2026-09-06: 18 workers across three rounds, all of them.
+      # Attribution is by mtime, not pid. The worker runs in a foreground pipeline so
+      # there is no job id to read, and with FANOUT workers in parallel the newest log
+      # may belong to a sibling. In this failure mode every worker dies the same way, so
+      # a sibling log is still the right hint — the line says so rather than implying it
+      # is certainly this one.
+      # -newer against a reference file, not -newermt with an @epoch: the @ form is a GNU
+      # findutils extension that BSD find rejects with "Can not parse date/time", and the
+      # 2>/dev/null here would have swallowed that forever. Verified on this host: the
+      # rewritten find in an interactive shell is bfs, which accepts @epoch, so an
+      # interactive check agrees while the nightly quietly never fires.
+      # find returns traversal order, not mtime order, so this is AN omp log touched
+      # during this round, not the newest one. With FANOUT workers in parallel it may
+      # belong to a sibling. Say that rather than sorting: in this failure mode every
+      # worker dies the same way, so any of their logs answers the question, and a sort
+      # would buy precision the label cannot honestly promise anyway.
+      omplog=$(find "$HOME/.omp/logs" -maxdepth 1 -name "omp.*.log" -newer "$FINDINGS_DIR/l1-round.ref" 2>/dev/null | head -n 1)
+      if [ -n "$omplog" ]; then
+        printf -- "--- an omp log touched during this round, may belong to a sibling worker: %s ---\n" "$omplog" >> "$errlog"
+        tail -n 20 "$omplog" >> "$errlog" 2>/dev/null
+      fi
+      # Was the host reachable at the moment this worker failed? Nothing recorded that,
+      # so a failure caused by a sleeping Mac was indistinguishable from a transcript the
+      # worker could not digest, and the oversized gate below counted it as evidence for
+      # issue #12 that it is not. One curl, only on the failure path.
+      # Three states, not two. An absent curl reports nothing and exits 127, which the
+      # first version read as "no route" — so a host without curl would have had EVERY
+      # worker failure excluded from the oversized gate, permanently and invisibly.
+      # unknown is not netdown: it never ledgers and never suppresses the stub.
+      netdown=unknown
+      netcode=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" https://api.anthropic.com/ 2>/dev/null)
+      netrc=$?
+      if [ "$netrc" -eq 127 ] || [ "$netrc" -eq 126 ]; then
+        printf "curl could not be run here (exit %s: not found, or not executable); this failure is unclassified, not an outage\n" "$netrc" >> "$errlog"
+      elif [ -z "$netcode" ] || [ "$netcode" = "000" ]; then
+        netdown=true
+      else
+        netdown=false
+      fi
+      if [ "$netdown" = "true" ]; then
+        printf "no route to api.anthropic.com when this worker failed (curl http_code=%s)\n" "${netcode:-000}" >> "$errlog"
+      fi
+      # Ledger every classified failure, with its round, and never rewrite a line. A
+      # bare hash was wrong: the ledger is truncated once per RUN, so a round-1 outage
+      # entry survived into round 5 and excluded a round-5 failure that had a completely
+      # different cause. Readers take the HIGHEST round recorded for a hash, so the last
+      # attempt is the one that counts. Append-only keeps the parallel xargs subshells
+      # from racing, same as l1-timeouts.txt.
+      if [ "$netdown" != "unknown" ]; then
+        printf "%s %s %s\n" "$hash" "${AUTODREAM_CURRENT_ROUND:-1}" "$netdown" >> "$FINDINGS_DIR/l1-netdown.txt"
+      fi
       # On the FINAL retry round, fall back to a metadata-only findings stub so
       # the session is visible to L1_ERRORED and the L2 aggregator instead of
       # disappearing into a silent .err file (the old behavior, which the
@@ -798,9 +930,23 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
       # Earlier rounds leave $output absent so the next round can retry; only
       # the last round writes the stub. AUTODREAM_L1_ROUNDS comes through the
       # environment (exported below).
-      if [ "${AUTODREAM_CURRENT_ROUND:-1}" -ge "${AUTODREAM_L1_ROUNDS:-5}" ]; then
+      #
+      # EXCEPT when the network was down. A stub satisfies l1_missing_count (it carries
+      # a .findings key, and jq -e counts an empty array as present), so writing one for
+      # an outage marks the session DONE: MISSING drops to zero, the parent never defers,
+      # L2 publishes a report on an outage-short corpus, and the next run skips the
+      # session forever because its slot is filled. That is the exact 2026-09-04 failure
+      # this change exists to stop, reintroduced one layer down. Leaving the slot empty
+      # is what makes the retry work; the run defers instead of disappearing quietly, so
+      # the 2026-06-11 silent-failure concern is answered by the deferral, not the stub.
+      if [ "$netdown" = "true" ]; then
+        echo "FAIL (network down; no stub, left for a later run): $session ($hash) [$(($(date +%s) - t0))s] — see $errlog" >&2
+      elif [ "${AUTODREAM_CURRENT_ROUND:-1}" -ge "${AUTODREAM_L1_ROUNDS:-5}" ]; then
         sz=$(wc -c < "$session" 2>/dev/null | tr -d " ")
         lines=$(wc -l < "$session" 2>/dev/null | tr -d " ")
+        # No network_down field here on purpose: this branch is unreachable when the
+        # network was down, so the flag could only ever be written false. A field that
+        # cannot vary is a field every reader has to check and no reader can learn from.
         printf "{\"session_path\":\"%s\",\"error\":\"worker exited without findings JSON after %s rounds\",\"meta\":{\"bytes\":%s,\"lines\":%s,\"slimmed\":%s},\"findings\":[]}\n" \
           "$session" "${AUTODREAM_L1_ROUNDS:-5}" "${sz:-0}" "${lines:-0}" "$([ -n "$slimfile" ] && echo true || echo false)" > "$output"
         echo "FAIL (metadata stub written): $session ($hash) [$(($(date +%s) - t0))s] — see $errlog" >&2
@@ -967,6 +1113,10 @@ EOF
   # this point is past the idempotency guard, so a catch-up trigger that no-ops on
   # an already-reported date cannot erase the ledger the real run wrote.
   : > "$FINDINGS_DIR/l1-timeouts.txt"
+  # Same lifetime and the same reason: which workers failed while the host had no route,
+  # one `<hash> <round> <true|false>` line per classified failure. This is what tells the
+  # loop below that a corpus is outage-short rather than finished.
+  : > "$FINDINGS_DIR/l1-netdown.txt"
 
   clean_work_bucket  # start clean: drop any stub left by a prior run's workers
 
@@ -982,22 +1132,54 @@ EOF
   L1_START=$(date +%s)
   L1_ROUNDS="${AUTODREAM_L1_ROUNDS:-5}"
   MISSING=$COUNT
+  # Set when a round could not be dispatched because the host had no route. The run
+  # then stops before L2 and writes no report, so the date stays unassembled and a
+  # later catch-up trigger retries it against a live network. Writing a report from a
+  # dead-network run is worse than writing none: it looks complete, it ships open
+  # questions, and its own self-audit has no way to tell that the corpus is missing.
+  NET_DEFERRED=no
+  LAST_ROUND_RUN=0
   for round in $(seq 1 "$L1_ROUNDS"); do
+    # Check BEFORE dispatching, including on round 1 — the overnight failure is a Mac
+    # that slept through its trigger, so round 1 is the round most likely to run at a
+    # host with no route, and it is the only round nothing used to check.
+    if ! wait_for_network; then
+      NET_DEFERRED=yes
+      log "L1 round $round not dispatched: no route to the API. Deferring $TARGET_DATE for a later run."
+      break
+    fi
     log "L1 triage round $round/$L1_ROUNDS (fanout=$FANOUT)..."
     # The dispatcher's subshell reads this to decide whether the last-round
     # metadata-stub fallback should fire for sessions that produced no output.
     export AUTODREAM_CURRENT_ROUND="$round"
+    # Reference file for the omp-log capture in the failure path: "modified since this
+    # round started". Touched per round so a later round does not match a stale log.
+    : > "$FINDINGS_DIR/l1-round.ref"
     dispatch_l1
+    LAST_ROUND_RUN="$round"
     MISSING=$(l1_missing_count)
     L1_DONE=$(findings_json_count)
     log "L1 round $round: $L1_DONE done, $MISSING still missing"
     [ "$MISSING" -eq 0 ] && break
     if [ "$round" -lt "$L1_ROUNDS" ]; then
       log "L1 retrying $MISSING missing session(s) after a network/sleep check..."
-      wait_for_network
       sleep "${AUTODREAM_RETRY_WAIT:-60}"
     fi
   done
+  # Decide the outage question AFTER the retry budget, not during it. Breaking out of the
+  # loop on the first network-flavoured worker failure threw away the whole point of the
+  # retry loop: one transient DNS timeout mid-round would defer the date for three hours
+  # instead of riding out the flap on the next round, which is exactly what
+  # wait_for_network was built to do. Two conditions, both required — sessions are still
+  # missing, AND the last round that actually dispatched saw a no-route failure. A run
+  # that recovered and finished its corpus is not deferred no matter how bad round 1 was.
+  if [ "$MISSING" -gt 0 ] && [ "$LAST_ROUND_RUN" -gt 0 ] \
+     && [ -s "$FINDINGS_DIR/l1-netdown.txt" ] \
+     && awk -v r="$LAST_ROUND_RUN" '$2 == r && $3 == "true" { found = 1 } END { exit !found }' \
+          "$FINDINGS_DIR/l1-netdown.txt"; then
+    NET_DEFERRED=yes
+    log "L1 finished with $MISSING session(s) missing and round $LAST_ROUND_RUN failing with no route — deferring $TARGET_DATE for a later run"
+  fi
   L1_ELAPSED=$(( $(date +%s) - L1_START ))
   L1_OK=$(findings_json_count)
   L1_FAIL=$(ls -1 "$FINDINGS_DIR"/*.json.err 2>/dev/null | wc -l | tr -d " ")
@@ -1046,6 +1228,11 @@ EOF
   # transcript_bytes. The noise gate's own read is deliberately left alone: it already
   # biases to triage on an unreadable sidecar (worst case, a wasted model call), and the
   # only thing missing there was the signal, which this counter now supplies.
+  #
+  # A worker that failed with no route to the API says nothing about transcript size, and
+  # counting it here is how 2026-09-04 read 3/4 as an oversize failure rate and opened
+  # issue #12 on an outage. That is handled upstream now: an outage leaves the session
+  # unstubbed and defers the run, so it never reaches these counters at all.
   OVERSIZED_TOTAL=0
   OVERSIZED_ERRORED=0
   STATS_SIDECARS_UNPARSEABLE=0
@@ -1069,6 +1256,11 @@ EOF
     if [ "$sz" -gt "${AUTODREAM_SLIM_BYTES:-262144}" ]; then
       OVERSIZED_TOTAL=$((OVERSIZED_TOTAL + 1))
       findingsfile="$FINDINGS_DIR/$hash.json"
+      # No network-down subtraction here. An outage now leaves the slot EMPTY rather than
+      # stubbed, so a network failure can never reach this branch — there is no findings
+      # file to carry an "error" key. The exclusion this loop briefly grew was dead the
+      # moment the stub was suppressed, and a counter that can only ever read 0 tells the
+      # self-audit nothing while implying it was measured.
       if [ -f "$findingsfile" ] && grep -q '"error":' "$findingsfile" 2>/dev/null; then
         OVERSIZED_ERRORED=$((OVERSIZED_ERRORED + 1))
       fi
@@ -1115,6 +1307,36 @@ PY
   else
     log "python3 not found; skipping project-field normalization (L2 grouping may show dupes)"
   fi
+
+  # ---- Enforce the mechanical skill fields from the sidecars ----
+  # Deliberately NOT inside the python3 block above. The prompt asks the worker to copy
+  # these from the precomputed stats, but asking is not enforcing, and gating enforcement
+  # on an optional interpreter meant that on a host without python3 the pipeline quietly
+  # returned to believing whatever the model wrote — the exact failure this replaced.
+  # jq is already a hard dependency of this script, so this cannot silently degrade.
+  # Absent sidecar keys leave the worker values alone, so a findings dir written by an
+  # older runner is not rewritten with invented zeroes.
+  SKILLS_ENFORCED=0
+  for fjson in "$FINDINGS_DIR"/*.json; do
+    case "$fjson" in *.stats.json) continue ;; esac
+    [ -s "$fjson" ] || continue
+    sidecar="${fjson%.json}.stats.json"
+    [ -s "$sidecar" ] || continue
+    jq -e ".findings | arrays" "$fjson" >/dev/null 2>&1 || continue
+    skilltmp="$fjson.skills.tmp"
+    if jq --slurpfile sc "$sidecar" '
+          . as $f
+          | (($sc[0]) // {}) as $st
+          | reduce ("skills_invoked", "skills_invoked_count", "skills_authored", "skills_invoked_counts") as $k
+              ($f; if ($st | has($k)) then .[$k] = $st[$k] else . end)
+        ' "$fjson" > "$skilltmp" 2>/dev/null && [ -s "$skilltmp" ]; then
+      mv "$skilltmp" "$fjson"
+      SKILLS_ENFORCED=$((SKILLS_ENFORCED + 1))
+    else
+      rm -f "$skilltmp"
+    fi
+  done
+  log "enforced mechanical skill fields from sidecars on $SKILLS_ENFORCED findings file(s)"
 
   # ---- Self-audit stats: runtime telemetry only the runner can see ----
   # The aggregator can't observe its own machinery — which sessions were autodream's
@@ -1179,7 +1401,10 @@ PY
     # silent worker death, slim leftovers) shows up here. Always >= 0; if
     # nonzero, the aggregator should investigate even when l1_missing=0.
     printf 'sessions_dropped_after_failures: %s\n' "$DROPPED_AFTER_FAILURES"
-    printf 'l1_rounds_used: %s\n' "$round"
+    # LAST_ROUND_RUN, not $round: the loop variable is assigned before the pre-dispatch
+    # network check, so a round-1 outage that never dispatched anything reported one
+    # round used. A stat that counts a round nobody ran is worse than no stat.
+    printf 'l1_rounds_used: %s\n' "$LAST_ROUND_RUN"
     printf 'l1_rounds_max: %s\n' "$L1_ROUNDS"
     printf 'l1_findings_written: %s\n' "$L1_OK"
     printf 'l1_findings_with_error: %s\n' "$L1_ERRORED"
@@ -1187,6 +1412,31 @@ PY
     # for the gate meaning (M/N >= 5% over a trailing week opens issue #12).
     printf 'oversized_total: %s\n' "$OVERSIZED_TOTAL"
     printf 'oversized_errored: %s\n' "$OVERSIZED_ERRORED"
+    # Network health for this run. network_down_seconds is time spent blocked in
+    # wait_for_network across all rounds; network_deferred says the run stopped before L2
+    # because a round could not be dispatched at all, which means this date has findings
+    # that are incomplete on purpose and a later run should rebuild it.
+    # These two cover L1 only: run-stats.txt is closed before the L2 aggregator runs, and
+    # L2 has its own retry loop that can wait on the network for just as long. The L2 side
+    # is appended after that loop as network_down_seconds_l2 / network_deferred_l2 rather
+    # than restated here, so neither key is ever written twice with different values.
+    printf 'network_down_seconds: %s\n' "$NET_DOWN_SECONDS"
+    printf 'network_deferred: %s\n' "$NET_DEFERRED"
+    # Reconciles the two network measurements, which sit at different moments and are
+    # read as if they disagreed. network_down_seconds is time the runner spent blocked
+    # BETWEEN rounds; the per-worker network_down flag is one curl at the instant a
+    # worker failed. A flapping network makes the first large and the second false for
+    # every worker, and that is not a contradiction — both probes are the same curl to
+    # the same host, so they can only differ by when they ran. The 2026-09-05 report
+    # spent a section arguing one of the two detectors had to be wrong; naming the
+    # flap here is cheaper than having that argument again.
+    if [ "$NET_DOWN_SECONDS" -gt 0 ] \
+       && ! awk '$3 == "true" { found = 1 } END { exit !found }' \
+              "$FINDINGS_DIR/l1-netdown.txt" 2>/dev/null; then
+      printf 'network_flapped: yes\n'
+    else
+      printf 'network_flapped: no\n'
+    fi
     # Sidecar health (#27): how many of sessions_triaged had a stats sidecar that was
     # missing, empty, or carried no numeric transcript_bytes. Every consumer of the
     # sidecars degrades when this is non-zero — `gated` under-counts (an unreadable
@@ -1213,6 +1463,32 @@ PY
     # noticed the next morning instead of during an unrelated investigation two days on.
     printf 'unassembled_dates: %s\n' "${UNASSEMBLED:-}"
   } > "$FINDINGS_DIR/run-stats.txt"
+
+  # Baseline for the L2-scoped network keys appended after the aggregator loop.
+  NET_DOWN_SECONDS_PRE_L2="$NET_DOWN_SECONDS"
+
+  # ---- Defer the date when the network never came back ----
+  # Stop above L2 rather than aggregating a corpus we know is short. The findings written
+  # so far stay on disk and the worker is idempotent, so a later catch-up trigger picks up
+  # exactly the sessions that are still missing. Writing no report is what makes that
+  # happen: the idempotency guard at the top of run() keys on the report existing, and
+  # unassembled_dates() reports this date until one does. Placed after run-stats.txt so
+  # the deferral itself is on the record.
+  # Nothing below this line is skipped for any other reason, so keep the test narrow —
+  # only a round that could not be dispatched at all defers, never a slow or partial one.
+  if [ "$NET_DEFERRED" = "yes" ]; then
+    log "deferring $TARGET_DATE: the network did not return, so L2 would summarize $((COUNT - MISSING)) of $COUNT sessions"
+    log "a later run will retry the $MISSING session(s) still missing; findings so far are kept"
+    # PROMPT.md tells the aggregator to read all four network keys, so all four must
+    # exist on every path that writes run-stats.txt. This return jumps over the post-L2
+    # append, and an absent key is the one thing the self-audit cannot interpret — it
+    # cannot tell "L2 never ran" from "an older runner wrote this file". L2 did not run,
+    # so its waits are zero and its deferral is no; say so explicitly.
+    printf 'network_down_seconds_l2: 0\n' >> "$FINDINGS_DIR/run-stats.txt"
+    printf 'network_deferred_l2: no\n' >> "$FINDINGS_DIR/run-stats.txt"
+    clean_work_bucket
+    return 1
+  fi
 
   # ---- Upstream changelog window (writes changelog-window.md for L2 to read) ----
   changelog_window
@@ -1384,11 +1660,35 @@ PY
       log "L2 attempt $attempt wrote no report (exit $L2_RC)"
     fi
     if [ "$attempt" -lt "$L2_ATTEMPTS" ]; then
-      wait_for_network
+      # wait_for_network now reports failure rather than proceeding anyway, and this
+      # caller used to discard that. Spending the remaining L2 attempts against a host
+      # with no route produces nothing but a later exit, and leaves network_deferred
+      # reading `no` because only the L1 loop ever set it.
+      if ! wait_for_network; then
+        NET_DEFERRED=yes
+        log "L2 retry not attempted: no route to the API — deferring $TARGET_DATE for a later run"
+        break
+      fi
       sleep "${AUTODREAM_RETRY_WAIT:-60}"
     fi
   done
   clean_work_bucket  # all workers have exited; remove their AI-title stubs
+
+  # L2-scoped network health. Appended rather than folded into the block above, which was
+  # already closed before the aggregator ran: an 1800s wait inside the L2 retry loop was
+  # invisible in a file claiming to report this run's network_down_seconds.
+  # Classify the LAST attempt too. The probe above only runs between attempts, so an
+  # outage that arrives before the final attempt was never seen: attempts 1 and 2 fail
+  # with the route up, the route drops, attempt 3 fails, and the run recorded
+  # network_deferred_l2: no — contradicting what PROMPT.md tells the aggregator an
+  # L2-only outage looks like. Only probe when L2 actually failed; a delivered report
+  # needs no explanation and should not pay for a network call.
+  if [ "$L2_DELIVERED" != "1" ] && ! net_up; then
+    NET_DEFERRED=yes
+    log "L2 produced no report and the API is unreachable — recording this as a network deferral"
+  fi
+  printf 'network_down_seconds_l2: %s\n' "$(( NET_DOWN_SECONDS - NET_DOWN_SECONDS_PRE_L2 ))" >> "$FINDINGS_DIR/run-stats.txt"
+  printf 'network_deferred_l2: %s\n' "$NET_DEFERRED" >> "$FINDINGS_DIR/run-stats.txt"
 
   L2_ELAPSED=$(( $(date +%s) - L2_START ))
   log "L2 done in ${L2_ELAPSED}s (exit $L2_RC, $attempt attempt(s))"

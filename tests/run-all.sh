@@ -100,13 +100,24 @@ run_dream(){ # $1=root ; inherits MOCK_MODE/MOCK_CAPTURE_DIR/FANOUT + changelog 
   # depend on) the REAL host's skill tree. A suite that passes or fails on whatever
   # skills happen to be installed locally is not a suite.
   mkdir -p "$1/home"
+  # The worker failure path probes the network with a real curl, so every test with a
+  # failing worker started making real outbound calls at 5s apiece — the suite promises
+  # it never touches the network, and a promise that decays silently is worse than none.
+  # Default every run to a curl that reports a reachable host; the tests that care about
+  # an outage set TEST_CURL_SHIMMED=1 and put their own shim on PATH first.
+  if [ -z "${TEST_CURL_SHIMMED:-}" ]; then
+    mkdir -p "$1/shim-default"
+    printf '#!/bin/bash\nprintf %s "200"\n' "'%s'" > "$1/shim-default/curl"
+    chmod +x "$1/shim-default/curl"
+    PATH="$1/shim-default:$PATH"
+  fi
   # OMP_BIN uses ${VAR-default} (no colon) so a caller that exports it EMPTY keeps the
   # empty value: that is how the resolution test asks run.sh to find omp on PATH instead
   # of being handed the mock. Every other test leaves it unset and still gets the mock.
   AUTODREAM_CHANGELOG="${AUTODREAM_CHANGELOG:-0}" OMP_BIN="${OMP_BIN-$MOCK}" \
   AUTODREAM_CONFIG="${AUTODREAM_CONFIG:-$1/autodream/config}" \
   AUTODREAM_CONSUME_DATE="${AUTODREAM_CONSUME_DATE:-$DATE}" \
-  AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS="${AUTODREAM_L1_ROUNDS:-2}" \
+  AUTODREAM_NETCHECK="${AUTODREAM_NETCHECK:-0}" AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS="${AUTODREAM_L1_ROUNDS:-2}" \
   PROJECTS_DIR="$1/projects" HOME="$1/home" AUTODREAM_DIR="$1/autodream" DREAMS_DIR="$1/dreams" \
   bash "$RUN" "$DATE" > "$1/run.out" 2>&1
   # The run's own exit code, captured while $? still holds it: the previous bug lived
@@ -568,7 +579,7 @@ test_session_stats(){
   MOCK=1 "$OMP_MOCK" "$fixture" carriers
   "$REPO/bin/session-stats.sh" "$fixture" "$out"
   assert_eq "$(jq -r 'keys | sort | join(",")' "$out")" \
-    "duration_minutes,isSidechain,models_used,tool_call_count,tools_used,transcript_bytes,transcript_mtime,turn_count,user_message_count,user_turn_timestamps" \
+    "duration_minutes,isSidechain,models_used,skills_authored,skills_invoked,skills_invoked_count,skills_invoked_counts,tool_call_count,tools_used,transcript_bytes,transcript_mtime,turn_count,user_message_count,user_turn_timestamps" \
     "stats output has exactly the specified fields"
   assert_eq "$(jq -r '.user_turn_timestamps | length' "$out")" "0" "no timestamped user turns in this fixture -> empty user_turn_timestamps"
   assert_eq "$(jq -r .user_message_count "$out")" "1" "toolResult records are excluded from user message count"
@@ -594,6 +605,19 @@ test_session_stats(){
   assert_eq "$(jq -r .tool_call_count "$out")" "3" "sidechain tool calls are counted mechanically"
   assert_eq "$(jq -r '.tools_used | join(",")' "$out")" "Bash,Read,Write" "sidechain tools are sorted and unique"
   assert_eq "$(jq -r .isSidechain "$out")" "true" "sidechain marker is copied"
+
+  # Skill invocation is measured, not guessed. The 2026-09-04 report concluded the
+  # ~200-skill inventory never fires, from a session that called manage_skill ten
+  # times — those calls wrote skills, they did not run any, and skills_invoked was a
+  # field the L1 model filled in by eye. In OMP an invocation leaves exactly one
+  # custom_message of customType "skill-prompt"; nothing else does.
+  fixture="$root/skills.jsonl"; out="$root/skills.stats.json"
+  MOCK=1 "$OMP_MOCK" "$fixture" skills
+  "$REPO/bin/session-stats.sh" "$fixture" "$out"
+  assert_eq "$(jq -r '.skills_invoked | join(",")' "$out")" "deslop,triage" "invoked skills are read from skill-prompt records, unique and sorted"
+  assert_eq "$(jq -r .skills_invoked_count "$out")" "3" "the count keeps repeat invocations the unique list drops"
+  assert_eq "$(jq -r '.skills_authored | join(",")' "$out")" "rs3-gui-navigation,update-omp-fork" "manage_skill calls are reported as authoring, not invocation"
+  assert_eq "$(jq -r '.skills_invoked | index("not-a-skill") // "absent"' "$out")" "absent" "a non-skill custom_message that quotes the same phrasing is ignored"
   rm -rf "$root"
 }
 
@@ -2070,7 +2094,248 @@ test_skills_inventory_python_failure_exits_1(){
   rm -rf "$T"
 }
 
+# ---- Network failures must not read as transcript failures (2026-09-04) --------------
+# On 2026-09-04 the Mac had no route at 03:15. Every worker died in ~9s, the runner
+# retried them five times against the same dead network, and the report that came out
+# blamed transcript size: oversized_errored/oversized_total was 3/4, which is the
+# threshold that opens issue #12. Re-running those three transcripts by hand later, with
+# a live network, produced findings for all three in 73-78s. Nothing in the artifacts
+# could have told the two apart, so these tests pin the three signals that now can.
+
+# A curl that always answers with one HTTP code, so net_up can be steered without a
+# network. 000 is what curl reports when there is no route, which is exactly what net_up
+# tests for.
+shim_curl(){ # $1=sandbox root, $2=http_code to report
+  mkdir -p "$1/shim"
+  printf '#!/bin/bash\nprintf %s "%s"\n' "'%s'" "$2" > "$1/shim/curl"
+  chmod +x "$1/shim/curl"
+  printf '%s' "$1/shim"
+}
+
+test_network_down_defers_the_date(){
+  echo "# a round that cannot be dispatched defers the date instead of reporting on a short corpus"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  local shim; shim=$(shim_curl "$root" 000)
+  # CAP=0 makes wait_for_network give up on its first check, so the test never sleeps.
+  TEST_CURL_SHIMMED=1   PATH="$shim:$PATH" AUTODREAM_NETCHECK=1 AUTODREAM_NETCHECK_CAP=0 run_dream "$root"
+  local h; h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
+  assert_eq      "$(cat "$root/run.exit")" "1"         "a deferred run exits non-zero"
+  assert_no_file "$root/dreams/$DATE.md"               "no report is written from a dead-network run"
+  assert_no_file "$(fdir "$root")/$h.json"             "no worker was dispatched at all"
+  assert_grep    "$(fdir "$root")/run-stats.txt" 'network_deferred: yes' "run-stats records the deferral"
+  assert_grep    "$root/run.out" 'Deferring'           "the log says the date was deferred"
+  rm -rf "$root"
+}
+
+test_route_lost_after_the_precheck_still_defers(){
+  echo "# a route lost AFTER the pre-dispatch check must defer, not publish a short corpus"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  local shim; shim=$(shim_curl "$root" 000)
+  local h; h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
+  # NETCHECK=0 skips the pre-dispatch check, which is precisely the gap: the check only
+  # proves the route was up when the round started. The worker then fails while the
+  # failure-path probe sees no route — the round-5 shape from 2026-09-04.
+  # ROUNDS=1 means this is also the final round, where the stub used to be written.
+  export MOCK_MODE=l1_incomplete
+  TEST_CURL_SHIMMED=1   PATH="$shim:$PATH" AUTODREAM_NETCHECK=0 AUTODREAM_SLIM_BYTES=10 AUTODREAM_L1_ROUNDS=1 run_dream "$root"
+  unset MOCK_MODE
+  local stats="$(fdir "$root")/run-stats.txt"
+  # No stub. A stub carries a .findings key, and jq -e counts an empty array as present,
+  # so writing one marks the session done: MISSING hits zero, the run stops deferring, and
+  # the next run skips the session forever because its slot is filled.
+  assert_no_file "$(fdir "$root")/$h.json"   "no findings stub is written for a network-down failure"
+  assert_no_file "$root/dreams/$DATE.md"     "no report is published on an outage-short corpus"
+  assert_eq      "$(cat "$root/run.exit")" "1" "the run exits non-zero"
+  assert_grep    "$stats" 'network_deferred: yes'   "run-stats records the post-dispatch deferral"
+  assert_grep    "$stats" 'oversized_errored: 0'    "an unstubbed session cannot reach the oversized-error counter"
+  assert_grep    "$(fdir "$root")/$h.json.err" 'no route to api.anthropic.com' ".err names the real cause"
+  # Ledger carries hash + round + verdict so a later round can overrule an earlier one.
+  assert_grep    "$(fdir "$root")/l1-netdown.txt" "^$h 1 true\$" "the ledger records the round and the verdict"
+  rm -rf "$root"
+}
+
+test_missing_curl_is_not_read_as_an_outage(){
+  echo "# a host without curl must not have every failure classified as a network outage"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  local h; h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
+  # An empty shim dir placed FIRST on PATH cannot hide curl, so hide it by pointing PATH
+  # at a dir holding only the binaries run.sh needs. Simpler and more honest: a curl that
+  # does not exist is simulated by a shim that exits 127 the way a missing command does.
+  mkdir -p "$root/nocurl"
+  printf '#!/bin/bash\nexit 127\n' > "$root/nocurl/curl"; chmod +x "$root/nocurl/curl"
+  export MOCK_MODE=l1_incomplete
+  TEST_CURL_SHIMMED=1   PATH="$root/nocurl:$PATH" AUTODREAM_NETCHECK=0 AUTODREAM_SLIM_BYTES=10 AUTODREAM_L1_ROUNDS=1 run_dream "$root"
+  unset MOCK_MODE
+  # A curl that cannot run answers nothing. Classifying that as an outage would defer
+  # every date forever on a machine without curl, so the failure stays unclassified: no
+  # ledger entry, no deferral, and the .err says why rather than leaving it to inference.
+  assert_grep    "$(fdir "$root")/$h.json.err" 'curl could not be run here' ".err says the check could not answer"
+  assert_nogrep  "$(fdir "$root")/l1-netdown.txt" "^$h " "an unclassifiable failure is never ledgered as an outage"
+  assert_grep    "$(fdir "$root")/run-stats.txt" 'network_deferred: no' "and it does not defer the date"
+  rm -rf "$root"
+}
+
+test_a_transient_outage_is_ridden_out_not_deferred(){
+  echo "# a network blip in one round must burn a retry, not defer the whole date"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  # A curl that reports no route on its first call and a reachable host afterwards. The
+  # first version of this fix broke out of the retry loop the moment any worker failed
+  # with a network flavour, which threw the retry budget away: one transient DNS timeout
+  # deferred the date for three hours instead of succeeding on round 2.
+  mkdir -p "$root/shim"
+  printf '#!/bin/bash\nc="$root/shim/n"\nn=$(cat "$c" 2>/dev/null || echo 0)\necho $((n+1)) > "$c"\nif [ "$n" -lt 1 ]; then printf %s "000"; else printf %s "200"; fi\n' "'%s'" "'%s'" \
+    | sed "s|\$root|$root|g" > "$root/shim/curl"
+  chmod +x "$root/shim/curl"
+  # l1_flaky fails the first dispatch per session and succeeds on the retry, so round 1
+  # fails while curl says no route and round 2 succeeds while it says 200.
+  export MOCK_MODE=l1_flaky
+  TEST_CURL_SHIMMED=1 PATH="$root/shim:$PATH" AUTODREAM_NETCHECK=0 AUTODREAM_L1_ROUNDS=2 run_dream "$root"
+  unset MOCK_MODE
+  local h; h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
+  assert_file "$(fdir "$root")/$h.json"  "the retry succeeded rather than being cut short"
+  assert_file "$root/dreams/$DATE.md"    "a recovered run still publishes its report"
+  assert_grep "$(fdir "$root")/run-stats.txt" 'network_deferred: no' "a blip that recovered is not a deferral"
+  rm -rf "$root"
+}
+
+test_no_curl_does_not_defer_a_healthy_run(){
+  echo "# a host without curl must not defer every run for 1800s of unanswerable checks"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  # net_up ran curl unconditionally and read its empty output as "no route", so a machine
+  # without curl looped to the full cap and deferred a run that was working fine. The
+  # worker-failure path grew the command -v guard first; net_up did not have it.
+  mkdir -p "$root/shim"
+  printf '#!/bin/bash\nexit 127\n' > "$root/shim/curl"; chmod +x "$root/shim/curl"
+  # NETCHECK=1 with a tiny cap: if the guard is missing this defers, and fast.
+  TEST_CURL_SHIMMED=1 PATH="$root/shim:$PATH" AUTODREAM_NETCHECK=1 AUTODREAM_NETCHECK_CAP=0 run_dream "$root"
+  assert_file "$root/dreams/$DATE.md" "the run completed instead of deferring on an unrunnable check"
+  assert_grep "$(fdir "$root")/run-stats.txt" 'network_deferred: no' "an unanswerable check is not an outage"
+  rm -rf "$root"
+}
+
+test_skill_fields_are_enforced_from_the_sidecar(){
+  echo "# a worker that ignores the precomputed skill stats gets overwritten, not believed"
+  local root; root=$(setup_env)
+  # A session that really did invoke a skill. mock-claude always writes skills_invoked:[]
+  # (see write_findings), which is exactly the worker behaviour that produced the
+  # 2026-09-04 "zero skills across 3,988 tool calls" claim. The runner must not take it.
+  local f="$root/projects/proj-a/sess1.jsonl"
+  printf '%s\n' \
+    '{"type":"message","message":{"role":"user","content":[{"type":"text","text":"/triage"}]}}' \
+    '{"type":"message","message":{"role":"user","content":[{"type":"text","text":"keep going"}]}}' \
+    '{"type":"custom_message","customType":"skill-prompt","content":"[IMPORTANT: User invoked the \"triage\" skill; follow its instructions. Full skill below.]"}' \
+    '{"type":"custom_message","customType":"skill-prompt","content":"[IMPORTANT: User invoked the \"triage\" skill; follow its instructions. Full skill below.]"}' \
+    '{"type":"custom_message","customType":"skill-prompt","content":"[IMPORTANT: User invoked the \"deslop\" skill; follow its instructions. Full skill below.]"}' \
+    '{"type":"custom","customType":"tool_execution_start","data":{"toolName":"Read"}}' \
+    > "$f"
+  touch -t "$STAMP" "$f"
+  run_dream "$root"
+  local h; h=$(hash_of "$f")
+  assert_eq "$(jq -r '.skills_invoked | join(",")' "$(fdir "$root")/$h.json")" "deslop,triage" \
+    "the findings JSON carries the measured skills, not the worker's empty list"
+  assert_eq "$(jq -r '.skills_invoked_counts.triage' "$(fdir "$root")/$h.json")" "2" \
+    "per-skill counts survive into the findings so 'top 5 by count' can be ranked"
+  assert_eq "$(jq -r '.skills_invoked_count' "$(fdir "$root")/$h.json")" "3" \
+    "the total counts invocations, not distinct skills"
+  rm -rf "$root"
+}
+
+test_malformed_worker_output_is_a_failure_with_its_evidence(){
+  echo "# non-empty output that is not findings JSON must fail loudly, keeping the diagnostics"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  local h; h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
+  export MOCK_MODE=l1_malformed
+  AUTODREAM_L1_ROUNDS=1 run_dream "$root"
+  unset MOCK_MODE
+  assert_file    "$(fdir "$root")/$h.json.err" "the .err survives instead of being deleted as a success"
+  assert_grep    "$(fdir "$root")/$h.json.err" 'no usable .findings key' ".err says why the output was rejected"
+  assert_grep    "$(fdir "$root")/$h.json.err" 'this is not json at all' ".err keeps what the worker actually wrote"
+  assert_nogrep  "$(fdir "$root")/$h.json" 'this is not json at all' "the malformed file never reaches L2"
+  rm -rf "$root"
+}
+
+test_findings_must_be_an_array_not_merely_present(){
+  echo "# .findings that is a string or object is not a result, and must not reach L2"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  local h; h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
+  export MOCK_MODE=l1_wrongtype
+  AUTODREAM_L1_ROUNDS=1 run_dream "$root"
+  unset MOCK_MODE
+  assert_file   "$(fdir "$root")/$h.json.err" "the schema-invalid write is treated as a failure"
+  assert_grep   "$(fdir "$root")/$h.json.err" 'no usable .findings key' ".err says why it was rejected"
+  assert_nogrep "$(fdir "$root")/$h.json" 'oops' "the schema-invalid file never reaches L2"
+  rm -rf "$root"
+}
+
+test_stale_wrongtype_findings_is_redispatched(){
+  echo "# a stale schema-invalid findings file from a prior run must be re-run, not skipped"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  local h; h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
+  # Seed the exact shape a previous run could have left: .findings present but a string.
+  # The dispatcher guard said "done" and exited, while l1_missing_count said "missing",
+  # so nothing ever rewrote it and L2 aggregated it anyway. Three sites answer this
+  # question and all three must agree.
+  mkdir -p "$(fdir "$root")"
+  printf '{"session_path":"STALE","findings":"oops"}' > "$(fdir "$root")/$h.json"
+  run_dream "$root"
+  assert_nogrep "$(fdir "$root")/$h.json" 'oops'  "the stale invalid file was replaced, not skipped"
+  assert_eq "$(jq -r '.findings | type' "$(fdir "$root")/$h.json")" "array" "the rewritten file has a real findings array"
+  rm -rf "$root"
+}
+
+test_rounds_used_counts_rounds_that_dispatched(){
+  echo "# a round that deferred before dispatching must not be counted as a round used"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  local shim; shim=$(shim_curl "$root" 000)
+  TEST_CURL_SHIMMED=1 PATH="$shim:$PATH" AUTODREAM_NETCHECK=1 AUTODREAM_NETCHECK_CAP=0 run_dream "$root"
+  assert_grep "$(fdir "$root")/run-stats.txt" 'l1_rounds_used: 0' "zero rounds dispatched is reported as zero"
+  # And the L2-scoped keys exist even though the run returned before the aggregator.
+  assert_grep "$(fdir "$root")/run-stats.txt" 'network_deferred_l2: no'      "the L2 keys are written on the L1-deferral path too"
+  assert_grep "$(fdir "$root")/run-stats.txt" 'network_down_seconds_l2: 0'   "an L2 that never ran waited zero seconds"
+  rm -rf "$root"
+}
+
+test_unexecutable_curl_is_not_read_as_an_outage(){
+  echo "# a curl that exists but cannot be executed (exit 126) is unclassifiable, not down"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  mkdir -p "$root/shim"
+  # No shebang and no exec permission on the target: bash reports 126, not 127.
+  printf 'not-an-executable\n' > "$root/shim/curl"; chmod 644 "$root/shim/curl"
+  TEST_CURL_SHIMMED=1 PATH="$root/shim:$PATH" AUTODREAM_NETCHECK=1 AUTODREAM_NETCHECK_CAP=0 run_dream "$root"
+  assert_file "$root/dreams/$DATE.md" "the run completed rather than deferring on an unrunnable curl"
+  assert_grep "$(fdir "$root")/run-stats.txt" 'network_deferred: no' "126 is treated the same as 127"
+  rm -rf "$root"
+}
+
+test_worker_failure_records_exit_code_and_stdout(){
+  echo "# a failed worker's .err carries its exit code and its stdout, not just 'Working...'"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  local shim; shim=$(shim_curl "$root" 200)   # network is fine; the worker is not
+  local h; h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
+  export MOCK_MODE=l1_noisy_fail
+  TEST_CURL_SHIMMED=1   PATH="$shim:$PATH" AUTODREAM_L1_ROUNDS=1 run_dream "$root"
+  unset MOCK_MODE
+  local err="$(fdir "$root")/$h.json.err"
+  assert_grep    "$err" 'worker exit code: 7'          ".err records the worker's exit code"
+  assert_grep    "$err" 'rate_limit_exceeded'          ".err carries the stdout that explains the failure"
+  assert_nogrep  "$err" 'no route to api'              "a reachable host is not reported as an outage"
+  assert_no_file "$(fdir "$root")/$h.json.out"         "the stdout capture is cleaned up"
+  rm -rf "$root"
+}
+
 # ---- run the new tests ----
+test_network_down_defers_the_date
+test_route_lost_after_the_precheck_still_defers
+test_missing_curl_is_not_read_as_an_outage
+test_a_transient_outage_is_ridden_out_not_deferred
+test_no_curl_does_not_defer_a_healthy_run
+test_skill_fields_are_enforced_from_the_sidecar
+test_malformed_worker_output_is_a_failure_with_its_evidence
+test_findings_must_be_an_array_not_merely_present
+test_rounds_used_counts_rounds_that_dispatched
+test_stale_wrongtype_findings_is_redispatched
+test_unexecutable_curl_is_not_read_as_an_outage
+test_worker_failure_records_exit_code_and_stdout
 test_skills_inventory
 test_skills_inventory_python_failure_exits_1
 test_omp_singleroot_autodetect

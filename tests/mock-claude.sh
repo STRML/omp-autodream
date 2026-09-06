@@ -56,6 +56,24 @@ if printf '%s' "$line1" | grep -q '^Session transcript'; then
   write_badproject() { printf '{"session_path":"%s","project":"WRONG-PROJECT","turn_count":2,"tool_call_count":0,"tools_used":[],"skills_invoked":[],"models_used":[],"notable_initiatives":[],"findings":[]}' "$sess" > "$out"; }
   case "$mode" in
     l1_incomplete) : ;;                 # never write — simulates a worker that exits empty
+    l1_malformed)                       # non-empty output that is not a findings JSON.
+      # The runner used to accept any non-empty file as success, delete both diagnostics,
+      # and hand this to L2 on the final round.
+      printf 'this is not json at all\n' > "$out"
+      echo done
+      exit 0 ;;
+    l1_wrongtype)                       # .findings present but a STRING, not an array.
+      # jq -e .findings is truthy for this, so it used to pass both the idempotency read
+      # and the outbound validation and reach L2 as a successful result.
+      printf '{"session_path":"x","findings":"oops"}' > "$out"
+      echo done
+      exit 0 ;;
+    l1_noisy_fail)                      # writes nothing, but says WHY on stdout and exits
+      # nonzero. This is the real shape: omp puts its diagnosis on stdout and only
+      # "Working..." on stderr, and run.sh sent stdout to /dev/null, so every failure
+      # arrived looking identical. Pins the exit-code and stdout capture.
+      echo "provider error: 429 rate_limit_exceeded"
+      exit 7 ;;
     l1_exit124) exit 124 ;;             # intrinsic 124, no deadline involved. GNU timeout
                                         # propagates a child's own status, so this arrives
                                         # looking exactly like a timeout; only elapsed tells

@@ -75,6 +75,7 @@ field; ignore it there too.
   "tool_call_count": 87,
   "tools_used": ["Bash", "Read", "Write", "Edit"],
   "skills_invoked": ["schedule", "python-env-management"],
+  "skills_authored": ["rs3-gui-navigation"],
   "models_used": ["claude-opus-4-7"],
   "notable_initiatives": ["one-line summary of the main thing the user worked on"],
   "underlying_goal": "one line of user intent, or null if it duplicates notable_initiatives",
@@ -92,6 +93,8 @@ field; ignore it there too.
   ]
 }
 ```
+
+**`skills_invoked` and `skills_authored` come from the precomputed stats block, never from your own reading.** Both are counted mechanically by the runner and appear in the "Precomputed session stats" section below the schema; copy them across verbatim. Do not infer a skill invocation from a `manage_skill` tool call — that tool creates, updates and deletes skills, it never runs one, and reading it either way was how a session that wrote four skills came out as evidence that the skill inventory never fires. In OMP a skill that actually ran leaves one `custom_message` record of `customType: "skill-prompt"`, which is what the runner counts.
 
 If you encounter an error (file unreadable, malformed JSONL), emit:
 ```json
