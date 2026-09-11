@@ -140,6 +140,96 @@ Four things changed, and each is a test in `tests/run-all.sh`:
 
 The trap to avoid when reading a future run: `l1_missing_after_retries: 0` and `l1_timed_out: 0` do not rule out the network. Workers that fail instantly leave no timeout, and the last round leaves a metadata stub rather than a missing slot, so both keys read clean through a total outage. That is the reasoning that made the 2026-09-04 self-audit say "this was not the network".
 
+### Six nights of empty stubs, and the retry loop hid it (2026-09-11)
+
+2026-09-05 through 2026-09-10 each lost the whole corpus the same way: every worker
+exited 0 in about twelve seconds having written nothing, all five rounds, every night.
+Four separate reports proposed four different causes and none of them was right. Two are
+worth naming because the next session will reach for them too.
+
+The reports blamed mnemopi, on the strength of `mnemopi: fastembed not loadable` being
+the last line in a dead worker's log. It is also a line in every *healthy* worker's log,
+including the run that later succeeded. A last log line is not a cause of death.
+
+They also reported L1 as running `runinfra/deepseek-v4-flash`, which is the model named
+in `run.sh`'s own env-var header. Nothing sets `AUTODREAM_L1_MODEL` — not the config, not
+the plists, not launchctl — so the model in force was the `:-` default in the worker
+invocation, which was `anthropic/claude-haiku`. The header had drifted, the report quoted
+the header, and three nights of diagnosis went to a provider the run never called.
+`runinfra/deepseek-v4-flash` does not exist in `models.yml` and never did. **Read the
+invocation, not the header.** The same applies to the `RUNINFRA_API_KEY` keychain
+fallback described near that block: it is documented and not implemented.
+
+L1 now defaults to `deepseek/deepseek-flash` (2026-09-11, user's call — haiku is slower
+and dearer for this work). Measured on one 1.5 KB transcript under the launchd-minimal
+environment: deepseek 12s, `zai/glm-5.3-flash` 46s, both writing valid findings. Keep zai
+in mind for one reason: it authenticates with a static `apiKey` from `models.yml` while
+deepseek uses `auth: oauth`, so if the token-race hypothesis below ever proves out, zai
+sidesteps it outright at about four times the latency. **The default now lives in three
+places — the header, the worker invocation, and the warmup invocation. Change them
+together.**
+
+What none of it explains is that the failure does not reproduce. The same invocation,
+the same `l1-no-advisor.yml`, the same launchd-minimal environment under `env -i`, single
+worker and full 8-way fanout all succeed by hand. Every failure started between 03:45 and
+04:22; every successful repro ran at midday. The remaining difference an interactive repro
+cannot stage is a cold auth token, and `FANOUT` workers starting together after hours of
+idle all race the same `agent.db` OAuth refresh. That fits the signature exactly, duration
+included, and it is still a hypothesis — no artifact on those six nights proves it.
+
+Two changes, neither of which assumes the hypothesis is right:
+
+- **The auth warmup** serializes the first model call of the run, so a cold token is
+  refreshed once with nothing else contending instead of by eight workers at once. It is
+  never fatal — a mitigation for an unproven cause must not be able to cost the run its
+  corpus — and it stamps `l1_warmup: ok|failed|skipped` into run-stats. `failed` beside a
+  dead corpus is the line all six nights were missing. `AUTODREAM_L1_WARMUP=0` disables it.
+- **The circuit breaker** stops the retry loop after two consecutive rounds that recover
+  no session. The budget is built for a Mac sleeping through a round and against that it
+  works; against a deterministic failure it bought 405 seconds of spawns for sixteen empty
+  stubs, and the `l1_rounds_used: 5 of 5, l1_timed_out: 0` it left behind read as a healthy
+  retry loop. It still dispatches the final round, because the metadata-stub fallback only
+  fires when the dispatcher sees `AUTODREAM_CURRENT_ROUND` at the budget — break out
+  without it and the slots stay empty, which the deferral logic reads as a dead network
+  rather than a dead worker. `l1_breaker_fired` says the budget was cut on purpose, so a
+  short `l1_rounds_used` is not mistaken for a run that finished early and cleanly.
+
+Both are pinned in `tests/run-all.sh`: warmup ordering against round 1, the skip token
+staying distinct from the pass token, the breaker firing on `l1_incomplete` while sparing
+`l1_flaky`, and the stub round surviving the cut.
+
+**The `/debate:run tight` pass earned its keep on this change, and the three findings it
+returned are the reason the code above reads as it does.** All three were in the new code,
+and the suite was green before it ran:
+
+- **The warmup was unbounded** (Codex auditor and executor, independently). It runs ahead of
+  `wait_for_network`, the L1 timeout, the retry loop and the breaker — every recovery path
+  here — so a hang on exactly the cold-start condition it targets wedged the run before all
+  of them, with launchd suppressing later triggers while the job stayed alive. It now has
+  its own deadline, and a host with no `timeout` binary **skips** the warmup instead of
+  running it unbounded.
+- **The breaker fired after one barren round, not two.** It compared each round's ending
+  count against the previous round's ending count, so a round 1 that took 3 missing down to
+  1 followed by a barren round 2 read as `1 == 1` and tripped — while logging that both
+  rounds recovered nothing, which was false. It now counts a consecutive no-progress streak
+  from each round's own start and end, and any recovery resets it.
+- **The warmup recorded `ok` for the exact failure it exists to expose.** It captured
+  `2>&1`, and omp writes `Working...` to stderr on every run including the dead ones, so
+  exit-0-with-empty-stdout came back non-empty and passed. stdout alone decides now; stderr
+  goes to `findings/<date>/l1-warmup.err` for the log line.
+
+The general lesson, which is the one worth carrying: **a green suite says the tests you
+thought of pass.** Every one of these was a path no existing test covered, in code written
+to fix a failure that had already survived four reports. `tests/mock-claude.sh` grew a
+`ping` branch as part of the fix, because the warmup call was falling through to the L2
+aggregator, and a fixture that always printed something made `l1_warmup: ok` unfalsifiable.
+
+**Known follow-up, not fixed here:** `net_up` probes `api.anthropic.com` (`bin/run.sh`),
+which was L1's provider until 2026-09-11 and is now only L2's. With L1 on DeepSeek, an
+Anthropic-only outage defers a date whose L1 would have been fine, and a DeepSeek outage
+with Anthropic reachable is classified as a worker failure rather than a network one. The
+probe should become provider-aware or test generic connectivity.
+
 ### The logger could kill the run, and did (2026-08-02)
 
 Every recovery path above assumes it gets to run. `run 2>&1 | tee -a "$RUN_LOG"` quietly revoked that assumption for all of them at once: it made each log line a write to a pipe, so whatever killed `tee` killed the run by SIGPIPE on the next `log` call. Three runs died there on 2026-08-02 — two scheduled, one detached, so launchd was not the cause — and 2026-08-01 ended with no report at all. The signature is a run log that stops mid-sentence at `L2 aggregation attempt 1/3...` and a `Terminated: 15` on tee beside a `Broken pipe: 13` on run in the launchd stderr. Nothing else says anything, because the thing that would have said it is what died.
@@ -150,7 +240,16 @@ What still has no root cause is who SIGTERMs `tee`. It was not `claude --print` 
 
 ## Upstream changelog window
 
-`changelog_window()` clones/pulls `anthropics/claude-code` into `cache/claude-code` and runs `git log -p` on `CHANGELOG.md` over `[TARGET_DATE, NEXT_DATE)` (real commit dates; the raw CHANGELOG has no dates, the git history does). The inserted lines go to `changelog-window.md`, which L2 reads for the "Upstream Claude Code changes" report section. Any git failure writes a note and never aborts the run. There is no remote `git blame`; that is why we keep a persistent local clone.
+`changelog_window()` runs `git log -p` on a changelog over `[TARGET_DATE, NEXT_DATE)` (real commit dates; the raw CHANGELOG has no dates, the git history does). The inserted lines go to `changelog-window.md`, which L2 reads for the "Upstream harness changes" report section. Any git failure writes a note and never aborts the run. There is no remote `git blame`; that is why we keep a persistent local clone.
+
+Since 2026-09-11 it watches **three** harnesses rather than one, because the user works across all three: Claude Code, Codex, and OMP. `changelog_sources()` holds the list as `name|remote|path|cache-dir` records. Four things in that design are load-bearing:
+
+- **The path is per-source.** OMP is a monorepo with no root CHANGELOG — the CLI's log is at `packages/coding-agent/CHANGELOG.md`. A hardcoded `CHANGELOG.md` silently yields an empty section for it.
+- **Failures are per-source.** Each harness gets its own cache, its own clone/pull, and its own `## <Harness>` section in the one output file. A dead remote writes an explicit failure line into its own section; it never blanks the others, and it never produces an empty file that reads like a quiet night upstream.
+- **`CHANGELOG_REMOTE` selects a single source and suppresses the defaults.** Back-compat for the old one-repo knob, and the reason the test suite stays offline: the changelog test points that variable at a local fixture, and a default list that still ran would have the suite cloning three real remotes. `AUTODREAM_CHANGELOG_SOURCES` overrides the whole set.
+- **Sections are appended to a named file, never emitted on stdout.** `log()` writes to stdout, so an earlier draft that built the file inside a `{ … } > "$out"` block filed every "cloning …" progress line as an upstream release note. Caught in a live run against all three remotes; `test_changelog_multi_source` pins it.
+
+Output is deduped and capped. A changelog edited across many commits in one window re-inserts the same lines repeatedly — OMP moved 119 commits over 2026-09-08..10 and emitted `## [18.1.16]` three times, each with its bullets. Non-blank lines are deduped order-preserving (blanks exempt, or the markdown collapses into one paragraph) and each section is capped at `AUTODREAM_CHANGELOG_MAX_LINES` (400) with an explicit truncation note, so one chatty monorepo cannot crowd the other harnesses out of L2's context.
 
 ## Operator notes: one file for the prompt, many surfaces for the human
 

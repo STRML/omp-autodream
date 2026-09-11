@@ -30,13 +30,16 @@ nothing else in your session corpus is touched.
   OMP's transcripts carry the same substance Claude's do — user/assistant `message`
   records, `custom` records for tool calls, `model_change` provenance — so the triage
   reads full conversation + tool activity, not just prompts.
-- **Layer 1 (per-session triage):** `runinfra/deepseek-v4-flash` — cheap, fast.
+- **Layer 1 (per-session triage):** `deepseek/deepseek-flash` — cheap, fast.
   Every L1 worker runs with the **advisor disabled** (`--config l1-no-advisor.yml`),
   so a nightly fan-out doesn't boot the expensive advisor model on every session.
 - **Layer 2 (aggregation):** `anthropic/claude-opus-5` on the Anthropic subscription
   (file-based `agent.db` OAuth — safe unattended at 3am; no keychain dependency).
-- **Changelog window:** still diffs the upstream `anthropics/claude-code` repo, since
-  OMP tracks Claude Code releases.
+- **Changelog window:** diffs the changelog of all three harnesses you work across —
+  Claude Code, Codex and OMP — over the report's date window, and the report says what
+  each relevant release means for your setup rather than reprinting the release notes.
+  Each source has its own cache and its own section, so one unreachable remote never
+  silences the others. Override the watched set with `AUTODREAM_CHANGELOG_SOURCES`.
 
 ## What you get
 
@@ -125,7 +128,7 @@ AUTODREAM_FORCE=1 ~/.omp/agent/autodream/run.sh 2026-05-29  # rebuild a date
 ```
 
 > **$OMP_BIN** overrides the `omp` binary location (default `/opt/homebrew/bin/omp`).
-> The L1 runner model is `AUTODREAM_L1_MODEL` (default `runinfra/deepseek-v4-flash`);
+> The L1 runner model is `AUTODREAM_L1_MODEL` (default `deepseek/deepseek-flash`);
 > the L2 aggregator model is `AUTODREAM_L2_MODEL` (default
 > `anthropic/claude-opus-5`). All knobs are documented in `bin/run.sh`'s header.
 
@@ -224,7 +227,7 @@ going after you disconnect:
 
 ## How it works (short version)
 
-Two layers: a cheap per-session pass (Layer 1, `runinfra/deepseek-v4-flash`) extracts
+Two layers: a cheap per-session pass (Layer 1, `deepseek/deepseek-flash`) extracts
 structured findings from each transcript, then a single smarter pass (Layer 2,
 `anthropic/claude-opus-5`) ranks them across the whole day and writes the report.
 Layer 1 workers invoke `omp -p` headless with the advisor disabled; Layer 2 invokes
@@ -248,11 +251,14 @@ see **`codemaps/architecture.md`** and **`CLAUDE.md`**.
 - The nightly pipeline runs headless `omp -p` workers in `--approval-mode yolo` (Layer 1
   workers write findings; the Layer 2 aggregator writes the daily report). Don't run
   it in a shared environment.
-- **L1 auth:** the `runinfra` key normally lives in the macOS login keychain (via the
-  `!security` escape in `~/.omp/agent/models.yml`). At 3am a locked keychain could kill
-  the fan-out; `run.sh` sources `RUNINFRA_API_KEY` from
-  `~/.omp/agent/autodream/x-credentials` (chmod 600) when present, else falls back to
-  the keychain. Layer 2 needs no key (subscription OAuth via `agent.db`).
+- **Auth:** both layers use subscription OAuth via `agent.db` and need no API key on the
+  default models. A run does serialize one throwaway model call before the fan-out
+  (`l1_warmup` in `run-stats.txt`, disable with `AUTODREAM_L1_WARMUP=0`) so a cold token
+  is refreshed once rather than by every worker at once. If you point `AUTODREAM_L1_MODEL`
+  at a keyed provider, put its key in `~/.omp/agent/autodream/x-credentials` (chmod 600,
+  `key=value`): `run.sh` sources that file and nothing else. There is no keychain
+  fallback, despite what this bullet claimed before 2026-09-11 — a key that lives only in
+  the keychain reaches the workers unset.
 - The first run clones `anthropics/claude-code` (small) for the changelog window; it
   degrades gracefully with no git/network.
 

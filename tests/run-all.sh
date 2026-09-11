@@ -809,6 +809,107 @@ test_changelog(){
   rm -rf "$root"
 }
 
+test_breaker_needs_two_barren_rounds_not_one(){
+  echo "# a round that recovered sessions must not be counted barren by the round after it"
+  local root; root=$(setup_env)
+  mk_session "$root" sess1; mk_session "$root" sess2; mk_session "$root" sess3
+  mkdir -p "$root/mockstate"
+  # Exactly one session ever succeeds: round 1 goes 3 missing -> 2, rounds 2+ recover none.
+  # The first version of the breaker compared each round's ending count against the PREVIOUS
+  # round's ending count, so round 2 alone (2 == 2) tripped it and logged that rounds 1 and 2
+  # both recovered nothing — false, round 1 recovered one. The streak must reach 2, so the
+  # earliest honest trip is round 3.
+  export MOCK_MODE=l1_partial_then_stall MOCK_STATE_DIR="$root/mockstate"
+  AUTODREAM_L1_ROUNDS=5 run_dream "$root"
+  unset MOCK_MODE MOCK_STATE_DIR
+
+  assert_grep   "$root/run.out" 'L1 triage round 3/5' "round 3 still runs — round 2 alone cannot trip the breaker"
+  assert_nogrep  "$root/run.out" 'rounds 1 and 2 both recovered nothing' "the breaker never claims a productive round was barren"
+  assert_grep   "$(fdir "$root")/run-stats.txt" 'l1_breaker_fired: yes' "it does still fire once two rounds really are barren"
+  assert_grep   "$(fdir "$root")/run-stats.txt" 'l1_missing_after_retries: 0' "the stub round still lands"
+  rm -rf "$root"
+}
+
+test_warmup_empty_stdout_is_a_failure_not_ok(){
+  echo "# the warmup must not read omp's stderr chatter as a successful reply"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  # l1_incomplete writes nothing to stdout. omp prints 'Working...' on stderr on every run,
+  # so a warmup that captured 2>&1 saw non-empty output and recorded `ok` for precisely the
+  # exit-0/empty-stdout failure it was added to expose.
+  export MOCK_MODE=l1_incomplete
+  AUTODREAM_L1_ROUNDS=1 run_dream "$root"
+  unset MOCK_MODE
+  assert_nogrep "$(fdir "$root")/run-stats.txt" 'l1_warmup: ok' "an empty-stdout warmup is never recorded as ok"
+  rm -rf "$root"
+}
+
+test_changelog_multi_source(){
+  echo "# multi-source changelog: per-harness sections, isolated failures, no log leakage"
+  command -v git >/dev/null 2>&1 || { echo "  skip - git not available"; return 0; }
+  local root; root=$(setup_env); mk_session "$root" sess1
+
+  # Two local fixture 'remotes'. The second keeps its changelog at a NESTED path, which is
+  # the OMP shape — a monorepo with no root CHANGELOG — and the reason path is per-source.
+  local a="$root/up-a"; mkdir -p "$a"
+  ( cd "$a" && git init -q && git config user.email t@t.invalid && git config user.name t
+    printf '# Changelog\n\n## 9.9.9\n\n- Alpha in-window\n' > CHANGELOG.md
+    git add CHANGELOG.md
+    GIT_AUTHOR_DATE="2020-01-02T12:00:00" GIT_COMMITTER_DATE="2020-01-02T12:00:00" \
+      git commit -q -m 'alpha release' )
+
+  local b="$root/up-b"; mkdir -p "$b/packages/coding-agent"
+  ( cd "$b" && git init -q && git config user.email t@t.invalid && git config user.name t
+    printf '# Changelog\n\n## 8.8.8\n\n- Beta in-window\n' > packages/coding-agent/CHANGELOG.md
+    git add packages/coding-agent/CHANGELOG.md
+    GIT_AUTHOR_DATE="2020-01-02T12:00:00" GIT_COMMITTER_DATE="2020-01-02T12:00:00" \
+      git commit -q -m 'beta release' )
+
+  # Third source points at a path that is not a repo: its clone must fail into its own
+  # section without costing the other two theirs.
+  export AUTODREAM_CHANGELOG=1
+  export AUTODREAM_CHANGELOG_SOURCES="Alpha|$a|CHANGELOG.md|$root/cache/a;Beta|$b|packages/coding-agent/CHANGELOG.md|$root/cache/b;Ghost|$root/nope.git|CHANGELOG.md|$root/cache/ghost"
+  run_dream "$root"
+  unset AUTODREAM_CHANGELOG AUTODREAM_CHANGELOG_SOURCES
+
+  local cw="$(fdir "$root")/changelog-window.md"
+  assert_file   "$cw" "changelog-window.md written"
+  assert_grep   "$cw" '^## Alpha'            "the first harness gets its own section"
+  assert_grep   "$cw" '^## Beta'             "the second harness gets its own section"
+  assert_grep   "$cw" '^## Ghost'            "an unreachable harness still gets a section"
+  assert_grep   "$cw" 'Alpha in-window'      "the first harness's entry is captured"
+  assert_grep   "$cw" 'Beta in-window'       "a nested changelog path is captured"
+  assert_grep   "$cw" 'Git clone failed'     "the unreachable harness reports its failure"
+  # The bug this pins: log() writes to stdout, so building the file inside a redirected
+  # block files the runner's own progress lines as upstream release notes.
+  assert_nogrep "$cw" 'changelog\['          "no runner log lines leak into the report input"
+  assert_nogrep "$cw" 'cloning'              "no clone progress leaks into the report input"
+  rm -rf "$root"
+}
+
+test_changelog_single_remote_suppresses_defaults(){
+  echo "# CHANGELOG_REMOTE selects one source and suppresses the default three"
+  command -v git >/dev/null 2>&1 || { echo "  skip - git not available"; return 0; }
+  local root; root=$(setup_env); mk_session "$root" sess1
+  local up="$root/upstream"; mkdir -p "$up"
+  ( cd "$up" && git init -q && git config user.email t@t.invalid && git config user.name t
+    printf '# Changelog\n\n## 7.7.7\n\n- Solo in-window\n' > CHANGELOG.md
+    git add CHANGELOG.md
+    GIT_AUTHOR_DATE="2020-01-02T12:00:00" GIT_COMMITTER_DATE="2020-01-02T12:00:00" \
+      git commit -q -m 'solo release' )
+
+  export AUTODREAM_CHANGELOG=1 CHANGELOG_REMOTE="$up" CLAUDE_CODE_REPO="$root/cache/cc"
+  run_dream "$root"
+  unset AUTODREAM_CHANGELOG CHANGELOG_REMOTE CLAUDE_CODE_REPO
+
+  local cw="$(fdir "$root")/changelog-window.md"
+  assert_grep   "$cw" 'Solo in-window' "the named remote is read"
+  # Load-bearing: without the suppression the suite would clone three real remotes, and
+  # the promise that it never touches the network would break silently.
+  assert_nogrep "$cw" '^## Codex'      "the Codex default is suppressed"
+  assert_nogrep "$cw" '^## OMP'        "the OMP default is suppressed"
+  rm -rf "$root"
+}
+
 test_prune_helper(){
   echo "# prune-self-sessions helper: list / filter / delete"
   local PR="$REPO/bin/prune-self-sessions.sh"
@@ -2323,6 +2424,74 @@ test_worker_failure_records_exit_code_and_stdout(){
   rm -rf "$root"
 }
 
+test_warmup_runs_before_the_fanout(){
+  echo "# the auth warmup is one serial call that lands before round 1 dispatches"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  run_dream "$root"
+  # Ordering is the whole feature. A warmup that runs alongside the fanout refreshes
+  # nothing, because the workers it was meant to protect are already racing it.
+  local warm round
+  warm=$(grep -n 'L1 auth warmup' "$root/run.out" | head -1 | cut -d: -f1)
+  round=$(grep -n 'L1 triage round 1/' "$root/run.out" | head -1 | cut -d: -f1)
+  assert_grep "$root/run.out" 'L1 auth warmup'          "the warmup is logged"
+  [ -n "$warm" ] && [ -n "$round" ] && [ "$warm" -lt "$round" ] \
+    && ok "the warmup completes before the first round dispatches" \
+    || no "the warmup completes before the first round dispatches (warmup line $warm, round line $round)"
+  assert_grep "$(fdir "$root")/run-stats.txt" 'l1_warmup: ok' "run-stats records the warmup result"
+  rm -rf "$root"
+}
+
+test_warmup_can_be_disabled(){
+  echo "# AUTODREAM_L1_WARMUP=0 skips the call and says so rather than reporting a pass"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  AUTODREAM_L1_WARMUP=0 run_dream "$root"
+  # 'skipped' and 'ok' must never be the same token: a self-audit reading l1_warmup has
+  # to be able to tell a warmup that passed from one that never ran.
+  assert_grep   "$(fdir "$root")/run-stats.txt" 'l1_warmup: skipped' "a disabled warmup is recorded as skipped"
+  assert_nogrep "$root/run.out" 'L1 auth warmup'                     "and nothing is dispatched for it"
+  assert_file   "$root/dreams/$DATE.md"                              "the run still completes normally"
+  rm -rf "$root"
+}
+
+test_a_deterministic_failure_trips_the_breaker(){
+  echo "# two rounds recovering nothing cut the retry budget instead of spending all five"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  local h; h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
+  # l1_incomplete never writes output, so every round fails identically — the 2026-09-05
+  # through 2026-09-10 shape, where five rounds bought sixteen empty stubs and the stats
+  # they left read as a healthy retry loop.
+  export MOCK_MODE=l1_incomplete
+  AUTODREAM_L1_ROUNDS=5 run_dream "$root"
+  unset MOCK_MODE
+  local stats="$(fdir "$root")/run-stats.txt"
+  assert_grep   "$root/run.out" 'L1 circuit breaker'      "the breaker announces itself"
+  assert_grep   "$stats" 'l1_breaker_fired: yes'          "run-stats records that the budget was cut"
+  assert_grep   "$root/run.out" 'L1 triage round 2/5'     "round 2 still runs (one bad round proves nothing)"
+  assert_nogrep "$root/run.out" 'L1 triage round 3/5'     "rounds 3 and 4 are skipped"
+  assert_nogrep "$root/run.out" 'L1 triage round 4/5'     "no further retry round is dispatched"
+  # The stub round is not optional. Without it the slot stays empty, which the deferral
+  # logic reads as a dead network rather than a dead worker.
+  assert_file   "$(fdir "$root")/$h.json"                 "the stub round still writes the metadata stub"
+  assert_grep   "$stats" 'l1_missing_after_retries: 0'    "no session is left in a missing state"
+  assert_grep   "$stats" 'network_deferred: no'           "a deterministic worker failure is not an outage"
+  rm -rf "$root"
+}
+
+test_a_flaky_worker_does_not_trip_the_breaker(){
+  echo "# a worker that recovers on retry must keep its retry budget"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  # l1_flaky fails the first dispatch per session and succeeds on the second. Round 2
+  # recovers the session, so the breaker's two-rounds-of-no-progress condition is never
+  # met — this is the case the retry loop exists for and the breaker must not steal.
+  export MOCK_MODE=l1_flaky
+  AUTODREAM_L1_ROUNDS=5 run_dream "$root"
+  unset MOCK_MODE
+  assert_grep   "$(fdir "$root")/run-stats.txt" 'l1_breaker_fired: no' "the breaker stays out of a recovering run"
+  assert_nogrep "$root/run.out" 'L1 circuit breaker'                   "and never announces itself"
+  assert_file   "$root/dreams/$DATE.md"                                "the run produces its report"
+  rm -rf "$root"
+}
+
 # ---- run the new tests ----
 test_network_down_defers_the_date
 test_route_lost_after_the_precheck_still_defers
@@ -2343,6 +2512,14 @@ test_omp_singleroot_empty_store_no_abort
 test_rootprobe_remembers_choice
 test_rootprobe_no_write_mode_flags_but_does_not_write
 test_rootprobe_empty_home
+test_warmup_runs_before_the_fanout
+test_warmup_can_be_disabled
+test_a_deterministic_failure_trips_the_breaker
+test_a_flaky_worker_does_not_trip_the_breaker
+test_breaker_needs_two_barren_rounds_not_one
+test_warmup_empty_stdout_is_a_failure_not_ok
+test_changelog_multi_source
+test_changelog_single_remote_suppresses_defaults
 
 echo
 echo "----------------------------------------"

@@ -2,7 +2,7 @@
 # Autodream runner — invoked by launchd at ~3am local time.
 #
 # Two-layer pipeline:
-#   L1: For each of yesterday's session JSONLs, spawn a parallel `omp --model deepseek-v4-flash`
+#   L1: For each of yesterday's session JSONLs, spawn a parallel `omp --model deepseek-flash`
 #       running SESSION_TRIAGE.md → writes one findings.json per session.
 #   L2: One `omp --model claude-opus-5` running PROMPT.md → reads all findings JSONs,
 #       writes $DREAMS_DIR/YYYY-MM-DD.md.
@@ -31,24 +31,58 @@
 #   FANOUT         L1 parallelism                      default: 8
 #   AUTODREAM_CHANGELOG  set 0 to skip the upstream-changelog check  default: 1
 #   CLAUDE_CODE_REPO     persistent cache for the claude-code clone  default: $AUTODREAM_DIR/cache/claude-code
-#   CHANGELOG_REMOTE     git remote to clone/pull       default: https://github.com/anthropics/claude-code.git
+#   CHANGELOG_REMOTE     git remote for the Claude Code source. Setting it selects that
+#                        source ALONE and suppresses the other two (back-compat, and how
+#                        the test suite stays offline).
+#   AUTODREAM_CHANGELOG_SOURCES  override the watched set. Semicolon-separated records of
+#                        name|remote|path-in-repo|cache-dir. Default watches three
+#                        harnesses, because the user works across all three:
+#                          Claude Code|https://github.com/anthropics/claude-code.git|CHANGELOG.md|<cache>/claude-code
+#                          Codex|https://github.com/openai/codex.git|CHANGELOG.md|<cache>/codex
+#                          OMP|https://github.com/STRML/oh-my-pi.git|packages/coding-agent/CHANGELOG.md|<cache>/oh-my-pi
+#                        OMP is a monorepo with no root CHANGELOG, hence the per-source path.
 #   AUTODREAM_L1_ROUNDS  max L1 retry rounds for missing sessions    default: 5
+#                        Two consecutive rounds that recover no session trip a circuit
+#                        breaker: the run jumps straight to the stub round rather than
+#                        spending the rest of the budget on an identical failure.
+#   AUTODREAM_L1_WARMUP  set 0 to skip the pre-fanout auth warmup     default: 1
+#                        One serial model call before the parallel dispatch, so a cold
+#                        OAuth token is refreshed once instead of by FANOUT workers at
+#                        once. Never fatal; result lands in run-stats as l1_warmup.
 #   AUTODREAM_L2_ATTEMPTS max L2 attempts to produce a report        default: 3
 #   AUTODREAM_RETRY_WAIT seconds to pause between retry rounds       default: 60
 #   AUTODREAM_NETCHECK   set 0 to skip the pre-dispatch network check default: 1
 #   AUTODREAM_NETCHECK_CAP seconds to wait for a route before deferring default: 1800
 #   AUTODREAM_FORCE      set 1 to rebuild even if a report exists    default: 0
 #   AUTODREAM_SLIM_BYTES sessions larger than this are slimmed for L1  default: 262144
-#   AUTODREAM_L1_MODEL   override the L1 triage model                 default: runinfra/deepseek-v4-flash
+#   AUTODREAM_L1_MODEL   override the L1 triage model                 default: deepseek/deepseek-flash
+#                        Nothing sets AUTODREAM_L1_MODEL, so the `:-` default in the two
+#                        invocations below (worker + warmup) IS the model in force. This
+#                        line said runinfra/deepseek-v4-flash until 2026-09-11 while the
+#                        code ran anthropic/claude-haiku, and three nights of failure were
+#                        diagnosed against a provider the run never called — that id is
+#                        not in models.yml at all. Change the invocations and this line
+#                        together or not at all.
+#                        Measured 2026-09-11 on the same 1.5 KB transcript, launchd-minimal
+#                        env: deepseek/deepseek-flash 12s, zai/glm-5.3-flash 46s, both
+#                        writing valid findings. zai is the fallback worth knowing about
+#                        for one reason — it authenticates with a static apiKey from
+#                        models.yml, where deepseek uses auth: oauth, so if the token-race
+#                        hypothesis behind the warmup below ever proves out, zai sidesteps
+#                        it entirely at ~4x the latency.
 #   AUTODREAM_L1_TIMEOUT seconds before an L1 worker is killed with     default: 1200
 #                        its process group; needs timeout or gtimeout on PATH.
 #                        Must be a positive integer (0 would disable the timeout).
 #                        SIGKILL follows 30s after the SIGTERM, so the worst-case
 #                        bound is AUTODREAM_L1_TIMEOUT + 30.
 #   AUTODREAM_L2_MODEL   override the L2 aggregator model             default: anthropic/claude-opus-5
-#   RUNINFRA_API_KEY     L1 provider key; sourced from $AUTODREAM_DIR/x-credentials (chmod 600)
-#                        when present, else resolved from the login keychain. L2 needs no key
-#                        (agent.db OAuth).
+#   RUNINFRA_API_KEY     Only read if a runinfra model is selected, which the default is
+#                        not. Sourced from $AUTODREAM_DIR/x-credentials (chmod 600) when
+#                        that file defines it. There is NO keychain fallback: this block
+#                        claimed one until 2026-09-11 and no code ever implemented it, so
+#                        a keychain-only key reaches the workers unset. The installed
+#                        x-credentials holds the X/Twitter cookie pair and no provider key.
+#                        Both layers authenticate via agent.db OAuth by default.
 #   AUTODREAM_MIN_USER_TURNS  noise-gate floor on user_message_count  default: 2
 #   AUTODREAM_MIN_MINUTES     noise-gate floor on duration_minutes    default: 1
 #   AUTODREAM_STATS_BIN       override the resolved session-stats.sh path, authoritative
@@ -142,12 +176,18 @@ if [ -f "$AUTODREAM_CONFIG" ]; then
   eval "$_env_snapshot"
   unset _env_snapshot _config_probe_err
 fi
-# L1 auth band-aid: the L1 provider key (RUNINFRA_API_KEY) lives in the login keychain
-# (!security escape), which can be locked at 3am. If $AUTODREAM_DIR/x-credentials
-# (chmod 600, key=value lines) exists, source it so the L1 workers pick the key up
-# directly; the keychain is the fallback when the file is absent (or lacks the key).
-# L2 never needs a key: it authenticates via agent.db OAuth. Sourced with nounset off
-# so a user-edited key=value file can never abort the run.
+# Source $AUTODREAM_DIR/x-credentials (chmod 600, key=value lines) when it exists, so a
+# provider key written there reaches the workers. Nounset is off around it so a
+# user-edited file can never abort the run.
+#
+# This block used to claim the login keychain as a fallback "when the file is absent or
+# lacks the key". No code implements that, here or anywhere else in the repo — the file
+# is sourced and that is all. A key that lives only in the keychain reaches the workers
+# unset, and the run says nothing about it. Left unimplemented deliberately rather than
+# written: nothing in the default path needs a provider key (both layers use agent.db
+# OAuth), and a `security find-generic-password` call at 03:15 prompts against a locked
+# keychain, which is the failure this was supposed to avoid. If a runinfra model is ever
+# made the default, implement the fallback and delete this paragraph.
 if [ -f "$AUTODREAM_DIR/x-credentials" ]; then
   set +u
   . "$AUTODREAM_DIR/x-credentials" 2>/dev/null || true
@@ -476,56 +516,131 @@ session_is_substantive() {
 # git is the only dependency. Any failure is recorded in the output file, never aborts the
 # pipeline. Window matches the session scan exactly, so each release is reported once.
 # Disable with AUTODREAM_CHANGELOG=0; point CHANGELOG_REMOTE at a local repo for offline tests.
+#
+# Three harnesses are watched, not one: the user works across Claude Code, Codex and OMP,
+# and a release note only earns its place in the report when it lands in a tool actually
+# in use. OMP keeps no root CHANGELOG — it is a monorepo and the CLI's log lives at
+# packages/coding-agent/CHANGELOG.md — so the path is per-source rather than assumed.
+#
+# One source's failure never silences the others: each gets its own cache, its own
+# clone/pull and its own section, and a dead remote writes an explicit failure line into
+# that section rather than an empty file that reads like a quiet night upstream.
+changelog_sources() {
+  # An explicit CHANGELOG_REMOTE selects a SINGLE source and suppresses the defaults.
+  # Back-compat for the old one-repo knob, and load-bearing for the test suite: the
+  # changelog test points this at a local fixture, and a default list that still ran
+  # would have the suite cloning three real remotes — the promise that it never touches
+  # the network, broken silently.
+  if [ -n "${CHANGELOG_REMOTE:-}" ]; then
+    printf '%s|%s|%s|%s\n' "Claude Code" "$CHANGELOG_REMOTE" "CHANGELOG.md" \
+      "${CLAUDE_CODE_REPO:-$AUTODREAM_DIR/cache/claude-code}"
+    return 0
+  fi
+  if [ -n "${AUTODREAM_CHANGELOG_SOURCES:-}" ]; then
+    printf '%s\n' "$AUTODREAM_CHANGELOG_SOURCES" | tr ';' '\n' | sed '/^[[:space:]]*$/d'
+    return 0
+  fi
+  printf '%s|%s|%s|%s\n' \
+    "Claude Code" "https://github.com/anthropics/claude-code.git" "CHANGELOG.md" "${CLAUDE_CODE_REPO:-$AUTODREAM_DIR/cache/claude-code}"
+  printf '%s|%s|%s|%s\n' \
+    "Codex" "https://github.com/openai/codex.git" "CHANGELOG.md" "$AUTODREAM_DIR/cache/codex"
+  printf '%s|%s|%s|%s\n' \
+    "OMP" "https://github.com/STRML/oh-my-pi.git" "packages/coding-agent/CHANGELOG.md" "$AUTODREAM_DIR/cache/oh-my-pi"
+}
+
+# Append one source's section to $5. Never returns non-zero — a source that cannot be
+# reached says so in its own section and the run carries on.
+#
+# The section goes to a named file rather than stdout, and that is not a style choice:
+# log() writes to stdout, so a stdout-emitting version run inside a `{ … } > "$out"`
+# block silently interleaves every "cloning …" progress line into the changelog L2 then
+# reads as release notes. Caught in a live run against all three remotes.
+changelog_one() { # $1=name $2=remote $3=path $4=repo $5=out
+  local name="$1" remote="$2" path="$3" repo="$4" out="$5"
+  local head_sha n added
+
+  if [ -d "$repo/.git" ]; then
+    if ! ( cd "$repo" && git pull --ff-only --quiet ) 2>>"$RUN_LOG"; then
+      log "changelog[$name]: pull failed"
+      printf '## %s\n\nGit pull failed; %s changes not checked this run.\n\n' "$name" "$name" >> "$out"
+      return 0
+    fi
+  else
+    log "changelog[$name]: cloning $remote -> $repo..."
+    rm -rf "$repo"
+    # blob:none + sparse keeps a monorepo clone cheap — oh-my-pi carries Cargo, bazel and
+    # a node_modules tree, and we want one markdown file out of it. Blobs for the path we
+    # actually log are fetched on demand. Real remotes only: git ignores --filter on a
+    # local clone, and the suite's offline fixture must behave the same either way.
+    local cloneargs=()
+    case "$remote" in
+      *://*|*@*:*) cloneargs=(--filter=blob:none --sparse) ;;
+    esac
+    if ! git clone --quiet "${cloneargs[@]+"${cloneargs[@]}"}" "$remote" "$repo" 2>>"$RUN_LOG"; then
+      log "changelog[$name]: clone failed"
+      printf '## %s\n\nGit clone failed; %s changes not checked this run.\n\n' "$name" "$name" >> "$out"
+      return 0
+    fi
+    if [ "${#cloneargs[@]}" -gt 0 ]; then
+      ( cd "$repo" && git sparse-checkout set "$path" ) >/dev/null 2>>"$RUN_LOG" || true
+    fi
+  fi
+
+  head_sha=$( cd "$repo" && git rev-parse --short HEAD 2>/dev/null ) || head_sha="?"
+  n=$( cd "$repo" && git log --format=%H \
+         --since="$TARGET_DATE 00:00:00" --until="$NEXT_DATE 00:00:00" \
+         -- "$path" 2>/dev/null | wc -l | tr -d ' ' )
+  # Inserted changelog lines (new version headers + bullets), oldest-first; strip the
+  # diff's leading '+' but drop the '+++ b/<path>' file header.
+  # Dedupe non-blank lines, keep every blank. A changelog edited across many commits in one
+  # window re-inserts the same lines repeatedly: OMP's log moved 119 commits for 2026-09-08
+  # through 09-10 and emitted `## [18.1.16]` three times with its bullets under each. Blank
+  # lines are exempt or the markdown collapses into one paragraph.
+  added=$( cd "$repo" && git log -p --reverse \
+             --since="$TARGET_DATE 00:00:00" --until="$NEXT_DATE 00:00:00" \
+             -- "$path" 2>/dev/null \
+           | grep '^+' | grep -v '^+++' | sed 's/^+//' \
+           | awk '!NF || !seen[$0]++' )
+  # Cap per source. One chatty monorepo must not crowd the other harnesses out of L2's
+  # context; the cap is per section, so a quiet source is never truncated for a loud one.
+  local cap="${AUTODREAM_CHANGELOG_MAX_LINES:-400}" total
+  total=$(printf '%s\n' "$added" | wc -l | tr -d ' ')
+  if [ "${total:-0}" -gt "$cap" ]; then
+    added=$(printf '%s\n' "$added" | head -n "$cap")
+    added="$added
+[...truncated: $total lines in window, showing first $cap. Raise AUTODREAM_CHANGELOG_MAX_LINES to see the rest.]"
+    log "changelog[$name]: $total lines truncated to $cap"
+  fi
+
+  if [ "${n:-0}" -gt 0 ] && [ -n "$added" ]; then
+    printf '## %s\n# Source: %s @ %s (%s)\n# Commits touching the changelog in window: %s\n\n%s\n\n' \
+      "$name" "$remote" "$head_sha" "$path" "$n" "$added" >> "$out"
+    log "changelog[$name]: $n commit(s) in window"
+  else
+    printf '## %s\n# Source: %s @ %s (%s)\n\nNo changelog commits in this window.\n\n' \
+      "$name" "$remote" "$head_sha" "$path" >> "$out"
+    log "changelog[$name]: no commits in window"
+  fi
+}
+
 changelog_window() {
   local out="$FINDINGS_DIR/changelog-window.md"
   [ "${AUTODREAM_CHANGELOG:-1}" != "0" ] || { log "changelog check disabled (AUTODREAM_CHANGELOG=0)"; return 0; }
   command -v git >/dev/null 2>&1 || { log "changelog: git not found; skipping"; return 0; }
 
-  local remote="${CHANGELOG_REMOTE:-https://github.com/anthropics/claude-code.git}"
-  local repo="${CLAUDE_CODE_REPO:-$AUTODREAM_DIR/cache/claude-code}"
-
-  if [ -d "$repo/.git" ]; then
-    log "changelog: updating cache ($repo)..."
-    if ! ( cd "$repo" && git pull --ff-only --quiet ) 2>>"$RUN_LOG"; then
-      log "changelog: pull failed"
-      printf '# Claude Code changelog\n\nGit pull failed; upstream changes not checked this run.\n' > "$out"
-      return 0
-    fi
-  else
-    log "changelog: cloning $remote -> $repo..."
-    rm -rf "$repo"
-    if ! git clone --quiet "$remote" "$repo" 2>>"$RUN_LOG"; then
-      log "changelog: clone failed"
-      printf '# Claude Code changelog\n\nGit clone failed; upstream changes not checked this run.\n' > "$out"
-      return 0
-    fi
-  fi
-
-  local head_sha n added
-  head_sha=$( cd "$repo" && git rev-parse --short HEAD 2>/dev/null ) || head_sha="?"
-  n=$( cd "$repo" && git log --format=%H \
-         --since="$TARGET_DATE 00:00:00" --until="$NEXT_DATE 00:00:00" \
-         -- CHANGELOG.md 2>/dev/null | wc -l | tr -d ' ' )
-  # Inserted changelog lines (new version headers + bullets), oldest-first; strip the
-  # diff's leading '+' but drop the '+++ b/CHANGELOG.md' file header.
-  added=$( cd "$repo" && git log -p --reverse \
-             --since="$TARGET_DATE 00:00:00" --until="$NEXT_DATE 00:00:00" \
-             -- CHANGELOG.md 2>/dev/null \
-           | grep '^+' | grep -v '^+++' | sed 's/^+//' )
-
-  if [ "${n:-0}" -gt 0 ] && [ -n "$added" ]; then
-    {
-      printf '# Claude Code changelog — commits in [%s, %s)\n' "$TARGET_DATE" "$NEXT_DATE"
-      printf '# Source: %s @ %s\n' "$remote" "$head_sha"
-      printf '# Commits touching CHANGELOG.md in window: %s\n\n' "$n"
-      printf '%s\n' "$added"
-    } > "$out"
-    log "changelog: $n commit(s) in window -> $out"
-  else
-    printf '# Claude Code changelog — commits in [%s, %s)\n# Source: %s @ %s\n\nNo changelog commits in this window.\n' \
-      "$TARGET_DATE" "$NEXT_DATE" "$remote" "$head_sha" > "$out"
-    log "changelog: no commits in window"
-  fi
+  local srcs; srcs=$(changelog_sources)
+  # Truncate once here, then every section appends. Nothing in this function may wrap the
+  # loop in a `> "$out"` block: log() writes to stdout, so that would file the runner's
+  # own progress lines as upstream release notes.
+  printf '# Harness changelogs — commits in [%s, %s)\n\n' "$TARGET_DATE" "$NEXT_DATE" > "$out"
+  local name remote path repo
+  # Here-string rather than a pipe: a piped while-read runs in a subshell, which is a trap
+  # the moment this loop needs to set a variable the caller reads.
+  while IFS='|' read -r name remote path repo; do
+    [ -n "$name" ] || continue
+    changelog_one "$name" "$remote" "$path" "$repo" "$out"
+  done <<< "$srcs"
+  log "changelog: window written -> $out"
 }
 
 # ---- Sleep/network resilience helpers ----
@@ -791,7 +906,7 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
       --approval-mode yolo \
       --no-session \
       --config "$NO_ADVISOR_CFG" \
-      --model "${AUTODREAM_L1_MODEL:-anthropic/claude-haiku}" \
+      --model "${AUTODREAM_L1_MODEL:-deepseek/deepseek-flash}" \
       --tools=Read,Write \
       --append-system-prompt "Headless triage worker. Read the session transcript and write exactly one findings JSON object, via the Write tool, to the literal output path given on line 2 of the prompt. Those paths are literal strings, not shell variables — never \$-expand them. Print only the literal word done and exit." \
       > "$outlog" 2> "$errlog"
@@ -1094,8 +1209,8 @@ EOF
   compute_overlap_stats
 
   # ---- Layer 1: triage, parallel, retried across sleep/network gaps ----
-  # Worker env for omp: keep provider auth (L1's runinfra key from x-credentials or the
-  # login keychain) but strip per-call bloat — no CLAUDE.md auto-load, a scoped tool
+  # Worker env for omp: keep provider auth (agent.db OAuth on the default models, plus any
+  # key x-credentials defined) but strip per-call bloat — no CLAUDE.md auto-load, a scoped tool
   # surface (--tools=Read,Write: read the transcript, write the findings JSON), and the
   # advisor-off overlay (--config "$NO_ADVISOR_CFG") so no headless worker boots the
   # opus advisor. --no-session leaves no transcript.
@@ -1132,6 +1247,62 @@ EOF
   L1_START=$(date +%s)
   L1_ROUNDS="${AUTODREAM_L1_ROUNDS:-5}"
   MISSING=$COUNT
+  # Serialize the first model call of the run. 2026-09-05 through 2026-09-10 each lost
+  # their whole corpus to workers that exited 0 in ~12s having written nothing, and none
+  # of it reproduces by hand: the same invocation, the same config and the same
+  # launchd-minimal environment all succeed at 14:00. The difference an interactive
+  # repro cannot stage is a cold auth token. FANOUT workers starting together after
+  # hours of idle all race the same agent.db OAuth refresh, and omp reports losing that
+  # race by exiting 0 with empty stdout — the exact signature, including the duration.
+  # One throwaway call before the fanout does the refresh exactly once, with nothing
+  # else contending. This is a mitigation for an unproven cause, so it is never fatal:
+  # a warmup that fails for its own reasons must not cost the run its corpus. It logs,
+  # stamps run-stats, and the rounds proceed either way.
+  #
+  # Two properties are not optional here, and both were review findings against the first
+  # draft of this block (2026-09-11, Codex auditor + executor seats independently):
+  #
+  # BOUNDED. The warmup runs ahead of wait_for_network, the L1 timeout, the retry loop and
+  # the circuit breaker — every recovery mechanism this script has. An unwrapped call that
+  # hangs on exactly the cold-start condition it targets therefore wedges the run before
+  # any of them, and launchd suppresses later triggers while the job is still alive. So it
+  # gets its own deadline, short, and a host with no timeout binary skips the warmup
+  # outright rather than running it unbounded — the fanout behind it is already designed to
+  # survive a bad token, so an unbounded hang is strictly worse than no warmup.
+  #
+  # STREAMS SEPARATE. omp prints "Working..." on stderr on every run, including the runs
+  # that die. Merging 2>&1 into the captured output made any such run non-empty, so the
+  # exact failure this exists to expose — exit 0, empty stdout — was recorded as
+  # `l1_warmup: ok`. stdout alone decides; stderr is kept only for the log line.
+  L1_WARMUP=skipped
+  if [ "${AUTODREAM_L1_WARMUP:-1}" = "0" ]; then
+    :
+  elif [ -z "$TIMEOUT_BIN" ]; then
+    L1_WARMUP=skipped_no_timeout
+    log "L1 auth warmup skipped: no timeout binary, and an unbounded warmup can wedge the run before every retry path"
+  else
+    warmup_errf="$FINDINGS_DIR/l1-warmup.err"
+    warmup_out=$(printf 'ping\n' | "$TIMEOUT_BIN" -k 10 "${AUTODREAM_L1_WARMUP_TIMEOUT:-120}" "$OMP_BIN" \
+      --allow-home \
+      -p \
+      --approval-mode yolo \
+      --no-session \
+      --config "$NO_ADVISOR_CFG" \
+      --model "${AUTODREAM_L1_MODEL:-deepseek/deepseek-flash}" \
+      --append-system-prompt 'Reply with the single word ok and exit.' 2>"$warmup_errf")
+    warmup_rc=$?
+    if [ "$warmup_rc" -eq 0 ] && [ -n "$warmup_out" ]; then
+      L1_WARMUP=ok
+      log "L1 auth warmup ok"
+    else
+      L1_WARMUP=failed
+      # The whole point of the warmup is that this line exists before 8 workers repeat the
+      # failure in parallel and bury it. Name both streams: an empty stdout IS the finding,
+      # and it is what every .err file for those six nights failed to say.
+      log "L1 auth warmup FAILED (exit $warmup_rc): stdout=[${warmup_out:-<empty>}] stderr=[$(head -c 300 "$warmup_errf" 2>/dev/null | tr '\n' ' ')]"
+    fi
+    unset warmup_out warmup_rc warmup_errf
+  fi
   # Set when a round could not be dispatched because the host had no route. The run
   # then stops before L2 and writes no report, so the date stays unassembled and a
   # later catch-up trigger retries it against a live network. Writing a report from a
@@ -1139,6 +1310,14 @@ EOF
   # questions, and its own self-audit has no way to tell that the corpus is missing.
   NET_DEFERRED=no
   LAST_ROUND_RUN=0
+  # Consecutive rounds that recovered nothing. A streak, not a comparison against the last
+  # round's ending count: comparing end-to-end counts calls two rounds barren whenever the
+  # SECOND one is, because round 1 having recovered sessions is invisible in its own ending
+  # number. Round 1 taking 3 missing down to 1 and round 2 recovering none leaves both ends
+  # equal at 1, which tripped the breaker after a single bad round and logged the lie that
+  # rounds 1 and 2 both recovered nothing. Any recovery resets the streak to zero.
+  L1_NOPROGRESS=0
+  L1_BREAKER=no
   for round in $(seq 1 "$L1_ROUNDS"); do
     # Check BEFORE dispatching, including on round 1 — the overnight failure is a Mac
     # that slept through its trigger, so round 1 is the round most likely to run at a
@@ -1155,12 +1334,49 @@ EOF
     # Reference file for the omp-log capture in the failure path: "modified since this
     # round started". Touched per round so a later round does not match a stale log.
     : > "$FINDINGS_DIR/l1-round.ref"
+    # Sampled before the dispatch, so "did THIS round recover anything" is answerable
+    # without inferring it from the previous round's ending count.
+    round_start_missing=$(l1_missing_count)
     dispatch_l1
     LAST_ROUND_RUN="$round"
     MISSING=$(l1_missing_count)
     L1_DONE=$(findings_json_count)
     log "L1 round $round: $L1_DONE done, $MISSING still missing"
     [ "$MISSING" -eq 0 ] && break
+    if [ "$MISSING" -lt "$round_start_missing" ]; then
+      L1_NOPROGRESS=0
+    else
+      L1_NOPROGRESS=$((L1_NOPROGRESS + 1))
+    fi
+    # Circuit breaker. The retry budget is built for a Mac sleeping through a round, and
+    # against that it works. Against a worker that dies the same way every time it buys
+    # nothing and hides the shape: 2026-09-08 spent all five rounds and 405s to write 16
+    # empty stubs, and the run-stats it left (l1_rounds_used 5 of 5, l1_timed_out 0) read
+    # as a healthy retry loop rather than as five identical failures. Two consecutive
+    # rounds that recover no session means deterministic, not transient.
+    #
+    # It still has to dispatch once more. The metadata-stub fallback fires only when the
+    # dispatcher sees AUTODREAM_CURRENT_ROUND at the budget (see the stub branch above),
+    # so breaking out here without that round would leave the slots empty, and an empty
+    # slot is not a stub: l1_missing_after_retries would go non-zero and the deferral
+    # logic below would read a dead worker as a dead network. So jump to the last round
+    # rather than skipping to the end — three dispatches instead of five, with the same
+    # artifacts on disk.
+    # The -lt guard matters at AUTODREAM_L1_ROUNDS=2 (the test suite runs low budgets):
+    # there the final round IS the stub round and has already run, so firing here would
+    # dispatch a redundant extra one and log a negative skip count.
+    if [ "$L1_NOPROGRESS" -ge 2 ] && [ "$round" -lt "$L1_ROUNDS" ]; then
+      L1_BREAKER=yes
+      log "L1 circuit breaker: $L1_NOPROGRESS consecutive rounds recovered nothing ($MISSING still missing) as of round $round. Failure is deterministic; skipping $((L1_ROUNDS - round - 1)) retry round(s) and dispatching the stub round."
+      export AUTODREAM_CURRENT_ROUND="$L1_ROUNDS"
+      : > "$FINDINGS_DIR/l1-round.ref"
+      dispatch_l1
+      LAST_ROUND_RUN="$L1_ROUNDS"
+      MISSING=$(l1_missing_count)
+      L1_DONE=$(findings_json_count)
+      log "L1 stub round: $L1_DONE done, $MISSING still missing"
+      break
+    fi
     if [ "$round" -lt "$L1_ROUNDS" ]; then
       log "L1 retrying $MISSING missing session(s) after a network/sleep check..."
       sleep "${AUTODREAM_RETRY_WAIT:-60}"
@@ -1406,6 +1622,16 @@ PY
     # round used. A stat that counts a round nobody ran is worse than no stat.
     printf 'l1_rounds_used: %s\n' "$LAST_ROUND_RUN"
     printf 'l1_rounds_max: %s\n' "$L1_ROUNDS"
+    # Both keys exist so the self-audit can tell a healthy retry loop from five identical
+    # failures, which l1_rounds_used alone never could. A `failed` warmup beside a dead
+    # corpus names the cause on the artifact instead of leaving it to a repro that will
+    # not reproduce; `yes` on the breaker says the budget was cut deliberately, so a
+    # short l1_rounds_used is not read as a run that finished early and cleanly.
+    # Defaulted because run.sh runs under `set -u` and both are assigned inside the L1
+    # phase: any path that writes stats without reaching it would abort the run here,
+    # which is the stats writer killing the thing it exists to describe.
+    printf 'l1_warmup: %s\n' "${L1_WARMUP:-not_reached}"
+    printf 'l1_breaker_fired: %s\n' "${L1_BREAKER:-not_reached}"
     printf 'l1_findings_written: %s\n' "$L1_OK"
     printf 'l1_findings_with_error: %s\n' "$L1_ERRORED"
     # Oversized-transcript measurement gate (#12) — see the computation above L1_ERRORED

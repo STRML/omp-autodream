@@ -9,6 +9,10 @@
 #
 # Env knobs (all optional):
 #   MOCK_MODE=good           write findings (L1) / emit report on stdout (L2). [default]
+#   MOCK_MODE=l1_partial_then_stall  exactly ONE session ever succeeds (claimed via an
+#                            atomic mkdir under MOCK_STATE_DIR, which the test must set);
+#                            round 1 recovers something, every later round recovers
+#                            nothing. Pins the circuit breaker's no-progress streak.
 #   MOCK_MODE=l1_incomplete  L1 writes nothing (simulates a worker that exits
 #                            without producing JSON); L2 still emits its report.
 #   MOCK_MODE=l1_exit124     L1 exits 124 immediately; MOCK_MODE=l1_exit137 SIGKILLs
@@ -40,6 +44,23 @@ input=$(cat)
 mode="${MOCK_MODE:-good}"
 line1=$(printf '%s\n' "$input" | sed -n '1p')
 line2=$(printf '%s\n' "$input" | sed -n '2p')
+
+# ---- Pre-fanout auth warmup ----
+# run.sh pipes the single word `ping` before dispatching L1. It is neither layer, and
+# without this branch it fell through to the L2 aggregator below, where line2 is empty and
+# the report destination resolves to nothing. Handle it first and explicitly.
+#
+# In the failure modes it answers the way a dead omp does — exit 0, NOTHING on stdout, the
+# usual chatter on stderr. That is the whole signature the warmup exists to catch, and a
+# fixture that always printed something made `l1_warmup: ok` unfalsifiable.
+if [ "$line1" = "ping" ]; then
+  printf 'Working...\n' >&2
+  case "$mode" in
+    l1_incomplete|l1_noisy_fail|l1_hang|l1_exit124|l1_exit137) : ;;
+    *) echo ok ;;
+  esac
+  exit 0
+fi
 
 if printf '%s' "$line1" | grep -q '^Session transcript'; then
   # ---- Layer 1: triage worker ----
@@ -88,6 +109,18 @@ if printf '%s' "$line1" | grep -q '^Session transcript'; then
     l1_badproject) write_badproject ;;  # wrong project + real path — exercises normalization
     l1_flaky)                           # fail the first dispatch per session, succeed on retry
       if [ -f "$out.attempt" ]; then write_findings; else : > "$out.attempt"; fi ;;
+    l1_partial_then_stall)
+      # Exactly one session ever succeeds; every other one fails forever. Round 1 therefore
+      # RECOVERS something while later rounds recover nothing — the shape that exposed the
+      # circuit breaker's off-by-one, where comparing a round's ending count against the
+      # previous round's ending count called two rounds barren as soon as the second was.
+      #
+      # mkdir, not a file test: workers run at FANOUT 8, so a test-then-create would let
+      # several of them win the claim at once and the fixture would recover a different
+      # number of sessions per run. mkdir succeeds for exactly one caller.
+      if mkdir "${MOCK_STATE_DIR:?l1_partial_then_stall needs MOCK_STATE_DIR}/one-succeeded" 2>/dev/null; then
+        write_findings
+      fi ;;
     *) write_findings ;;
   esac
   echo done
