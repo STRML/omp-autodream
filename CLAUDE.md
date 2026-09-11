@@ -306,6 +306,38 @@ Two invariants keep this from ever costing a night's report: the script always e
 
 The queryId walk against X's JS bundle stays untested, and #38 closed on that rather than on a fixture. A fixture would assert that our regex matches a string we wrote, and would keep passing on the only day it mattered — the day X changes its chunk naming. A live canary was rejected too: it buys a few hours of notice over the nightly report, at the cost of an unattended job hitting a third party on a schedule. What shipped instead is `x_queryid_source` in `run-stats.txt` (`fresh` / `cache` / `failed` / `not_attempted`), because the one state nothing could see was `cache` — the fetch works, so the walk looks fine, while it may have rotted at any point since the last `fresh`. `x-bookmarks.sh` stamps it on every path via a file rather than a variable, for the reason the whole script does: `get_query_id` runs inside a command substitution.
 
+### The bundle rotation that actually happened (2026-09-11)
+
+`x_queryid_source: failed` on every run from at least 2026-09-05. The cause was one regex
+width. X moved its webpack chunk hashes from 7-8 hex characters to **16**
+(`34778:"c316cbd4536390c0"`), the hash-map read was pinned at `[a-f0-9]{7,8}`, so `hash`
+came back empty, no candidate URL was ever built, and the walk reported "could not find
+the Bookmarks queryId in any X JS bundle" — a message that correctly names the class and
+tells you nothing about which part moved. Everything else was healthy the whole time: the
+cookies were live (HTTP 200, no login redirect), the chunk-name map was still in the page,
+and `bundle.Bookmarks` was still in it.
+
+Two things to reuse when it rotates again, because it will:
+
+- **Diagnose by replaying the steps against the live page, not by reading the script.** Pull
+  `x.com/i/bookmarks` with the stored cookies, confirm it is not the login page, then run
+  each extraction in turn — chunk id, name, hash — and see which one returns empty. That is
+  a two-minute answer and it was four reports away from being asked.
+- **The filename carries one more hex digit than the map stores.** `main:"<16 chars>"` in the
+  map, `main.<16 chars>a.js` in the page; the Bookmarks chunk resolved at
+  `<name>.c316cbd4536390c0a.js` against a map value of `c316cbd4536390c0`. That digit is not
+  derivable, so the walk enumerates it, `a` first because both chunks observed that day used
+  it. Widths are now `{7,64}` — do not re-pin them to whatever X currently ships.
+
+The candidate list is deduped with `awk '!seen[$0]++'` rather than `sort -u`, and the walk
+cap is 24. Both matter together: the suffixes are ordered cheapest-first, sorting put the
+digit variants ahead of `a`, and the old cap of 8 then cut off the only one that resolves.
+
+No fixture test was added, consistent with #38 below: a fixture here asserts that our regex
+matches a string we wrote, and it would have passed happily on the day X changed. The real
+protection is `x_queryid_source` in `run-stats.txt`, which did its job — it read `failed`
+for four consecutive runs and the reports said so each time. What failed was acting on it.
+
 `bin/cookie-cadence.sh` (#39) answers how long a pasted cookie pair lasts, which is what decides whether automating the capture is worth its moving parts. Same shape as `oversized-gate.sh`: it recomputes from the `x-bookmarks.md` headers already on disk, makes no model calls, reads no credentials, and is safe to re-run. Two things in it are load-bearing rather than decorative. It counts only the 401/403 rejection and the login-page redirect as expiries — a dead network or a missing jq says nothing about the cookies, and folding those in would make a yearly chore read as a weekly one with no visible sign of the error. And a stretch of working nights with no expiry at the end of it is right-censored, so it is reported as a lower bound and never as a lifetime.
 
 ## Self-audit
