@@ -436,7 +436,6 @@ The suite pins `AUTODREAM_CONFIG` into its sandbox now that `run.sh` sources the
 
 ## Gotchas (host environment)
 
-- The user's shell rewrites `grep` to `rtk grep`, which rejects some flags (`-h`); prefer `tail`/`rg`-style invocations when scripting against logs interactively.
 - The Claude Code sandbox denies writes under `~/.claude/` (including `rm` of symlinks/findings); those operations need the sandbox disabled.
 - Subagent transcripts live in `projects/.../<session>/subagents/agent-*.jsonl` and ARE legitimate sessions to triage; they are not self-pollution.
 - `claude --print` worker calls run from cwd `$HOME`, so any transcript they (used to) leave landed in the `-Users-<you>` project bucket.
