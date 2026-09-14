@@ -15,7 +15,11 @@ WRITER="$REPO/bin/autodream-note.sh"
 
 PASS=0
 FAIL=0
-SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/notes-path.XXXXXX")"
+# GitHub's macOS runners set TMPDIR with a trailing slash, and mktemp keeps the "//" it
+# makes. The reader resolves its own directory with cd && pwd, which collapses it, so the
+# seam row's string comparison failed in CI and passed locally. Strip the slash first.
+tmproot="${TMPDIR:-/tmp}"
+SANDBOX="$(mktemp -d "${tmproot%/}/notes-path.XXXXXX")"
 
 # vault-notes.sh defaults AUTODREAM_CONFIG to $AUTODREAM_DIR/config and sources it.
 # Every other suite pins this; without it a developer whose real config points
