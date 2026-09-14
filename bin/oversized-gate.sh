@@ -59,6 +59,7 @@ fi
 total_oversized=0
 total_errored=0
 total_silent=0
+total_deferred=0
 total_unmeasurable=0
 
 # A silent worker death is an error stub whose .err shows exit 0 AND empty stdout: the
@@ -74,6 +75,14 @@ for d in "${DIRS[@]}"; do
   date_label=$(basename "$d")
   list="$d/sessions.txt"
   [ -r "$list" ] || { printf '%-12s %7s %10s %9s %7s %8s  %s\n' "$date_label" - - - - - "no sessions.txt"; continue; }
+  # A network-deferred run stopped before its workers finished. Its oversized sessions were
+  # counted, but the ones that never ran have no stub, so its share reads lower than the
+  # evidence supports. PROMPT.md already says to keep it out of the trailing week.
+  if grep -qx 'network_deferred: yes' "$d/run-stats.txt" 2>/dev/null; then
+    printf '%-12s %7s %10s %9s %7s %8s  %s\n' "$date_label" - - - - - "network-deferred run, excluded"
+    total_deferred=$((total_deferred + 1))
+    continue
+  fi
 
   sessions=0; oversized=0; errored=0; silent=0; from_sidecar=0; unmeasurable=0
   while IFS= read -r session; do
@@ -121,6 +130,7 @@ for d in "${DIRS[@]}"; do
 done
 
 echo
+[ "$total_deferred" -gt 0 ] && echo "Excluded $total_deferred network-deferred date(s): no worker ran for part of those corpora."
 if [ "$total_oversized" -eq 0 ]; then
   echo "No oversized transcripts in this window. The gate has nothing to measure;"
   echo "that is not the same as a measured 0% and should not close #12 on its own."

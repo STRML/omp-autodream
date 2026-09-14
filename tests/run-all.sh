@@ -2368,6 +2368,22 @@ test_network_down_defers_the_date(){
   rm -rf "$root"
 }
 
+test_oversized_gate_script_deferred(){
+  echo "# oversized-gate.sh: a network-deferred date is excluded, never read as a clean 0%"
+  local GATE="$REPO/bin/oversized-gate.sh"
+  [ -x "$GATE" ] || { no "oversized-gate.sh executable"; return 0; }
+  local root; root=$(setup_env); mk_session "$root" sess1
+  local shim; shim=$(shim_curl "$root" 000)
+  TEST_CURL_SHIMMED=1 PATH="$shim:$PATH" AUTODREAM_SLIM_BYTES=100 AUTODREAM_NETCHECK=1 AUTODREAM_NETCHECK_CAP=0 run_dream "$root"
+  local fd; fd=$(fdir "$root")
+  assert_grep "$fd/run-stats.txt" 'network_deferred: yes' "precondition: the run really deferred"
+  local out; out=$(AUTODREAM_SLIM_BYTES=100 bash "$GATE" "$fd" 2>&1)
+  printf '%s' "$out" > "$root/gate.out"
+  assert_grep   "$root/gate.out" 'network-deferred run, excluded' "the deferred date is named and excluded"
+  assert_nogrep "$root/gate.out" 'GATE CLOSED'                    "a date where no worker ran must not close the gate"
+  rm -rf "$root"
+}
+
 test_route_lost_after_the_precheck_still_defers(){
   echo "# a route lost AFTER the pre-dispatch check must defer, not publish a short corpus"
   local root; root=$(setup_env); mk_session "$root" sess1
@@ -2650,6 +2666,7 @@ test_a_flaky_worker_does_not_trip_the_breaker(){
 
 # ---- run the new tests ----
 test_network_down_defers_the_date
+test_oversized_gate_script_deferred
 test_route_lost_after_the_precheck_still_defers
 test_missing_curl_is_not_read_as_an_outage
 test_a_transient_outage_is_ridden_out_not_deferred
