@@ -1313,6 +1313,7 @@ test_oversized_gate_zero(){
   local stats="$(fdir "$root")/run-stats.txt"
   assert_grep "$stats" 'oversized_total: 0'   "no oversized sessions under the default threshold"
   assert_grep "$stats" 'oversized_errored: 0' "no oversized-errored sessions under the default threshold"
+  assert_grep "$stats" 'oversized_errored_silent: 0' "the silent counter is present at 0, not absent"
   rm -rf "$root"
 }
 
@@ -1343,6 +1344,32 @@ test_oversized_gate_errored(){
   local stats="$(fdir "$root")/run-stats.txt"
   assert_grep "$stats" 'oversized_total: 1'   "the incomplete session still counted as oversized"
   assert_grep "$stats" 'oversized_errored: 1' "its final-round error stub is paired and counted"
+  # l1_incomplete still prints "done", so its stdout is not empty and it is not silent.
+  assert_grep "$stats" 'oversized_errored_silent: 0' "a failure with output on stdout is not a silent death"
+  rm -rf "$root"
+}
+
+test_oversized_gate_errored_silent(){
+  echo "# oversized gate (#12 measurement): an exit-0, empty-stdout worker death is counted as silent"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  export AUTODREAM_SLIM_BYTES=100 MOCK_MODE=l1_silent AUTODREAM_L1_ROUNDS=1
+  run_dream "$root"
+  unset AUTODREAM_SLIM_BYTES MOCK_MODE AUTODREAM_L1_ROUNDS
+  local stats="$(fdir "$root")/run-stats.txt"
+  assert_grep "$stats" 'oversized_errored: 1'        "the silent death still leaves an error stub"
+  assert_grep "$stats" 'oversized_errored_silent: 1' "and is counted as silent, apart from size failures"
+  rm -rf "$root"
+}
+
+test_oversized_gate_errored_noisy(){
+  echo "# oversized gate (#12 measurement): a failure that exited nonzero with output is not silent"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  export AUTODREAM_SLIM_BYTES=100 MOCK_MODE=l1_noisy_fail AUTODREAM_L1_ROUNDS=1
+  run_dream "$root"
+  unset AUTODREAM_SLIM_BYTES MOCK_MODE AUTODREAM_L1_ROUNDS
+  local stats="$(fdir "$root")/run-stats.txt"
+  assert_grep "$stats" 'oversized_errored: 1'        "the noisy failure is still an oversized error"
+  assert_grep "$stats" 'oversized_errored_silent: 0' "exit 7 with a stdout diagnosis counts toward the gate"
   rm -rf "$root"
 }
 
@@ -1549,12 +1576,45 @@ test_oversized_gate_script_open(){
   local GATE="$REPO/bin/oversized-gate.sh"
   [ -x "$GATE" ] || { no "oversized-gate.sh executable"; return 0; }
   local root; root=$(setup_env); mk_session "$root" sess1
-  export AUTODREAM_SLIM_BYTES=100 MOCK_MODE=l1_incomplete AUTODREAM_L1_ROUNDS=1
+  export AUTODREAM_SLIM_BYTES=100 MOCK_MODE=l1_noisy_fail AUTODREAM_L1_ROUNDS=1
   run_dream "$root"
   unset AUTODREAM_SLIM_BYTES MOCK_MODE AUTODREAM_L1_ROUNDS
   local out; out=$(AUTODREAM_SLIM_BYTES=100 bash "$GATE" "$(fdir "$root")" 2>&1)
   printf '%s' "$out" > "$root/gate.out"
   assert_grep "$root/gate.out" 'GATE OPEN'    "1 of 1 errored is 100%, well over the 5% threshold"
+  rm -rf "$root"
+}
+
+test_oversized_gate_script_silent(){
+  echo "# oversized-gate.sh: a window whose only failures are silent worker deaths measures nothing about size"
+  local GATE="$REPO/bin/oversized-gate.sh"
+  [ -x "$GATE" ] || { no "oversized-gate.sh executable"; return 0; }
+  local root; root=$(setup_env); mk_session "$root" sess1
+  export AUTODREAM_SLIM_BYTES=100 MOCK_MODE=l1_silent AUTODREAM_L1_ROUNDS=1
+  run_dream "$root"
+  unset AUTODREAM_SLIM_BYTES MOCK_MODE AUTODREAM_L1_ROUNDS
+  local out; out=$(AUTODREAM_SLIM_BYTES=100 bash "$GATE" "$(fdir "$root")" 2>&1)
+  printf '%s' "$out" > "$root/gate.out"
+  assert_grep   "$root/gate.out" '1 silent'                     "the silent death is reported, not hidden"
+  assert_grep   "$root/gate.out" 'no size-attributable failures' "an all-silent window has nothing to judge size by"
+  assert_nogrep "$root/gate.out" 'GATE OPEN'                     "and must not open the gate"
+  assert_nogrep "$root/gate.out" 'GATE CLOSED'                   "or close it"
+  rm -rf "$root"
+}
+
+test_oversized_gate_script_missing_err(){
+  echo "# oversized-gate.sh: an error stub whose .err is gone counts toward the gate, not as silent"
+  local GATE="$REPO/bin/oversized-gate.sh"
+  [ -x "$GATE" ] || { no "oversized-gate.sh executable"; return 0; }
+  local root; root=$(setup_env); mk_session "$root" sess1
+  export AUTODREAM_SLIM_BYTES=100 MOCK_MODE=l1_silent AUTODREAM_L1_ROUNDS=1
+  run_dream "$root"
+  unset AUTODREAM_SLIM_BYTES MOCK_MODE AUTODREAM_L1_ROUNDS
+  local fd; fd=$(fdir "$root")
+  rm -f "$fd"/*.json.err
+  local out; out=$(AUTODREAM_SLIM_BYTES=100 bash "$GATE" "$fd" 2>&1)
+  printf '%s' "$out" > "$root/gate.out"
+  assert_grep "$root/gate.out" 'GATE OPEN' "without the .err there is no proof of a silent death, so it counts"
   rm -rf "$root"
 }
 
@@ -1983,6 +2043,8 @@ test_noise_gate_env_override
 test_oversized_gate_zero
 test_oversized_gate_total
 test_oversized_gate_errored
+test_oversized_gate_errored_noisy
+test_oversized_gate_errored_silent
 test_stats_sidecar_ok
 test_stats_sidecar_missing_counted
 test_stats_sidecar_missing_keeps_oversized_count
@@ -1995,6 +2057,8 @@ test_runner_provenance_relative_symlink
 test_runner_provenance_unresolvable_chain
 test_oversized_gate_script
 test_oversized_gate_script_open
+test_oversized_gate_script_silent
+test_oversized_gate_script_missing_err
 test_oversized_gate_script_empty
 test_oversized_gate_script_args
 test_notify_count

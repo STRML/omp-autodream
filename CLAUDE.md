@@ -420,6 +420,8 @@ The general rule this is an instance of: a facet the report will reason about qu
 
 `bin/oversized-gate.sh` exists because of the same incident. The #12 gate is a trailing-window judgment but `run.sh` records one night at a time, so a stretch of old-runner nights used to be unrecoverable. It recomputes the window from the `*.stats.json` sidecars and findings JSONs still on disk, which survive independently of whether the runner knew how to count them. Artifacts only, no model calls, safe to re-run. It refuses to call an empty window a measured 0%, and quotes a rule-of-three upper bound so a clean run isn't read as stronger evidence than the sample supports.
 
+Both the gate script and `run.sh` count **silent worker deaths** separately (`oversized_errored_silent`): an error stub whose `.err` holds both `worker exit code: 0 after` and `worker stdout was empty`. That worker never reached the model, so its failure says nothing about transcript size. On 2026-09-13 the raw ratio read 6/7, and every failed worker had died in omp's first-turn memory recall. The gate share is computed over the size-attributable rest, a window where every failure was silent reports that it measured nothing, and a stub whose `.err` is missing stays in the size-attributable count because nothing proves it silent. The predicate lives in both scripts; `test_oversized_gate_errored_silent` and `test_oversized_gate_script_silent` pin them to the same answer, using the mock's `l1_silent` mode. `l1_incomplete` is not that shape: it still prints `done`, so its stdout is not empty.
+
 ## Running / rerunning a date
 
 ```

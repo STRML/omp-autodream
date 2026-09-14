@@ -1496,6 +1496,7 @@ EOF
   # unstubbed and defers the run, so it never reaches these counters at all.
   OVERSIZED_TOTAL=0
   OVERSIZED_ERRORED=0
+  OVERSIZED_ERRORED_SILENT=0
   STATS_SIDECARS_UNPARSEABLE=0
   while IFS= read -r session; do
     [ -n "$session" ] || continue
@@ -1524,10 +1525,21 @@ EOF
       # self-audit nothing while implying it was measured.
       if [ -f "$findingsfile" ] && grep -q '"error":' "$findingsfile" 2>/dev/null; then
         OVERSIZED_ERRORED=$((OVERSIZED_ERRORED + 1))
+        # A worker that exited 0 with empty stdout never reached the model, so its failure
+        # says nothing about transcript size: on 2026-09-13 this ratio read 6/7 while every
+        # failed worker had died in omp's first-turn memory recall. Count those separately so
+        # the gate can be judged on the rest. Both lines must be present in the surviving .err;
+        # a missing .err is no proof of anything and stays in the size-attributable count.
+        # oversized-gate.sh applies the same predicate to the trailing window.
+        errfile="$findingsfile.err"
+        if grep -q '^worker exit code: 0 after ' "$errfile" 2>/dev/null \
+           && grep -qx 'worker stdout was empty' "$errfile" 2>/dev/null; then
+          OVERSIZED_ERRORED_SILENT=$((OVERSIZED_ERRORED_SILENT + 1))
+        fi
       fi
     fi
   done < "$SESSIONS_LIST"
-  log "oversized: $OVERSIZED_TOTAL session(s) over ${AUTODREAM_SLIM_BYTES:-262144} bytes ($OVERSIZED_ERRORED errored)"
+  log "oversized: $OVERSIZED_TOTAL session(s) over ${AUTODREAM_SLIM_BYTES:-262144} bytes ($OVERSIZED_ERRORED errored, $OVERSIZED_ERRORED_SILENT of them silent worker deaths)"
   if [ "$STATS_SIDECARS_UNPARSEABLE" -gt 0 ]; then
     log "stats sidecars unparseable: $STATS_SIDECARS_UNPARSEABLE of $COUNT (sizes fell back to a live read; gated/oversized counts are degraded)"
   fi
@@ -1697,6 +1709,7 @@ PY
     # for the gate meaning (M/N >= 5% over a trailing week opens issue #12).
     printf 'oversized_total: %s\n' "$OVERSIZED_TOTAL"
     printf 'oversized_errored: %s\n' "$OVERSIZED_ERRORED"
+    printf 'oversized_errored_silent: %s\n' "$OVERSIZED_ERRORED_SILENT"
     # Network health for this run. network_down_seconds is time spent blocked in
     # wait_for_network across all rounds; network_deferred says the run stopped before L2
     # because a round could not be dispatched at all, which means this date has findings
