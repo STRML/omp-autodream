@@ -9,14 +9,20 @@ Cross-slice interfaces for porting cc-autodream to OMP. All slices agree on thes
   `$OMP_BIN --allow-home -p --permission-mode bypassPermissions --no-session-persistence --strict-mcp-config --disable-slash-commands --config "$NO_ADVISOR_CFG" [--model <L1_MODEL>]`
 - Tools grant: L1 workers get `--tools=Read,Write` (read the transcript, write the findings JSON); the L2 aggregator gets `--tools=Glob,Read` — no Write/Edit, because L2 emits the report on stdout only and must never touch files. Both flags are accepted by omp.
 
-## Advisor-off overlay (REQUIRED on every worker)
-- File: `$AUTODREAM_DIR/l1-no-advisor.yml` (written by install.sh), content:
+## Worker overlay (REQUIRED on every worker)
+- File: `$AUTODREAM_DIR/l1-no-advisor.yml`, a symlink install.sh creates to the repo's `l1-no-advisor.yml`. It sets:
   ```yaml
   advisor:
     enabled: false
     subagents: false
+  disabledProviders: [ollama, llama.cpp, lm-studio]
+  mnemopi:
+    autoRecall: false
   ```
-- Passed as `--config` to every L1 worker AND the L2 aggregator so no headless worker boots the opus advisor (verified: it DOES fire in print mode otherwise). env `NO_ADVISOR_CFG`.
+- Passed as `--config` to every L1 worker AND the L2 aggregator. env `NO_ADVISOR_CFG`.
+  - `advisor`: no headless worker boots the opus advisor (verified: it DOES fire in print mode otherwise).
+  - `disabledProviders`: no worker spends startup probing local engines.
+  - `mnemopi.autoRecall: false`: first-turn recall made `-p` workers exit 0 with empty stdout before the first model call (verified 2026-09-14).
 
 ## Session roots (OMP)
 - OMP sessions live at `$HOME/.omp/agent/sessions/<project-encoded>/<TS>_<uuid>.jsonl`, one JSONL per session dir, project-encoded dirs like `-git-rush-rushautoworks`/`--private-tmp--`.
@@ -51,8 +57,9 @@ Cross-slice interfaces for porting cc-autodream to OMP. All slices agree on thes
   installed x-credentials holds only the X/Twitter cookie pair. A key that lives solely in
   the keychain reaches the workers unset.
 - Both layers serialize one throwaway model call before the L1 fan-out (`l1_warmup` in
-  run-stats, `AUTODREAM_L1_WARMUP=0` to disable) so a cold token is refreshed once rather
-  than raced by every worker.
+  run-stats, `AUTODREAM_L1_WARMUP=0` to disable). It was added against a suspected
+  cold-token race that turned out not to be the cause, and it stays because it is cheap
+  and never fatal.
 
 ## Tests
 - `tests/run-all.sh` must pass. `tests/mock-claude.sh` → add `tests/mock-omp.sh` emitting minimal `{type:"message"}` transcripts; keep existing fixtures' intent.

@@ -69,16 +69,12 @@ link "$REPO_DIR/prompts/SESSION_TRIAGE.md" "$TARGET/SESSION_TRIAGE.md"
 
 chmod +x "$REPO_DIR/bin/"*.sh
 
-# --------------------------------------------------- advisor-off overlay --
-# OMP boots the opus advisor on every headless compile of a run unless told not to,
-# burning subscription budget. run.sh passes the overlay below as --config to every
-# worker (env NO_ADVISOR_CFG). Written here once so a fresh install is complete.
-cat > "$TARGET/l1-no-advisor.yml" <<'YAML'
-advisor:
-  enabled: false
-  subagents: false
-YAML
-chmod 644 "$TARGET/l1-no-advisor.yml"
+# --------------------------------------------------- worker overlay --
+# run.sh passes this overlay as --config to every worker (env NO_ADVISOR_CFG). It turns
+# off the advisor, local provider probes and first-turn memory recall; the file's own
+# comments say why. Linked rather than written here: a heredoc copy drifted from the
+# installed file and a fresh install silently lost disabledProviders.
+link "$REPO_DIR/l1-no-advisor.yml" "$TARGET/l1-no-advisor.yml"
 
 # --------------------------------------------------- session roots --
 # autodream scans the OMP session store — a single root, $HOME/.omp/agent/sessions.

@@ -65,11 +65,9 @@
 #                        together or not at all.
 #                        Measured 2026-09-11 on the same 1.5 KB transcript, launchd-minimal
 #                        env: deepseek/deepseek-flash 12s, zai/glm-5.3-flash 46s, both
-#                        writing valid findings. zai is the fallback worth knowing about
-#                        for one reason — it authenticates with a static apiKey from
-#                        models.yml, where deepseek uses auth: oauth, so if the token-race
-#                        hypothesis behind the warmup below ever proves out, zai sidesteps
-#                        it entirely at ~4x the latency.
+#                        writing valid findings. The model was not why the 09-13 workers
+#                        died: zai failed the same way on 2026-09-14. The cause was
+#                        first-turn mnemopi recall, which l1-no-advisor.yml turns off.
 #   AUTODREAM_L1_TIMEOUT seconds before an L1 worker is killed with     default: 1200
 #                        its process group; needs timeout or gtimeout on PATH.
 #                        Must be a positive integer (0 would disable the timeout).
@@ -1247,17 +1245,13 @@ EOF
   L1_START=$(date +%s)
   L1_ROUNDS="${AUTODREAM_L1_ROUNDS:-5}"
   MISSING=$COUNT
-  # Serialize the first model call of the run. 2026-09-05 through 2026-09-10 each lost
-  # their whole corpus to workers that exited 0 in ~12s having written nothing, and none
-  # of it reproduces by hand: the same invocation, the same config and the same
-  # launchd-minimal environment all succeed at 14:00. The difference an interactive
-  # repro cannot stage is a cold auth token. FANOUT workers starting together after
-  # hours of idle all race the same agent.db OAuth refresh, and omp reports losing that
-  # race by exiting 0 with empty stdout — the exact signature, including the duration.
-  # One throwaway call before the fanout does the refresh exactly once, with nothing
-  # else contending. This is a mitigation for an unproven cause, so it is never fatal:
-  # a warmup that fails for its own reasons must not cost the run its corpus. It logs,
-  # stamps run-stats, and the rounds proceed either way.
+  # Serialize the first model call of the run. This was added 2026-09-11 against a
+  # cold-token race that was never proven, and the race was not the cause: on 2026-09-14
+  # workers still exited 0 with empty stdout right after "L1 auth warmup ok", on a
+  # static-key provider. The verified cause for 09-13 was first-turn mnemopi recall,
+  # now off in l1-no-advisor.yml. The warmup stays because it is one cheap call and it
+  # is never fatal: a warmup that fails for its own reasons must not cost the run its
+  # corpus. It logs, stamps run-stats, and the rounds proceed either way.
   #
   # Two properties are not optional here, and both were review findings against the first
   # draft of this block (2026-09-11, Codex auditor + executor seats independently):

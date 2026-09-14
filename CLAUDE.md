@@ -148,8 +148,10 @@ Four separate reports proposed four different causes and none of them was right.
 worth naming because the next session will reach for them too.
 
 The reports blamed mnemopi, on the strength of `mnemopi: fastembed not loadable` being
-the last line in a dead worker's log. It is also a line in every *healthy* worker's log,
-including the run that later succeeded. A last log line is not a cause of death.
+the last line in a dead worker's log. That line is also in every *healthy* worker's log,
+including the run that later succeeded, so it proved nothing. A last log line is not a
+cause of death. mnemopi did turn out to be the cause, through a different path; see
+"The actual cause: first-turn memory recall" below.
 
 They also reported L1 as running `runinfra/deepseek-v4-flash`, which is the model named
 in `run.sh`'s own env-var header. Nothing sets `AUTODREAM_L1_MODEL` — not the config, not
@@ -162,28 +164,23 @@ fallback described near that block: it is documented and not implemented.
 
 L1 now defaults to `deepseek/deepseek-flash` (2026-09-11, user's call — haiku is slower
 and dearer for this work). Measured on one 1.5 KB transcript under the launchd-minimal
-environment: deepseek 12s, `zai/glm-5.3-flash` 46s, both writing valid findings. Keep zai
-in mind for one reason: it authenticates with a static `apiKey` from `models.yml` while
-deepseek uses `auth: oauth`, so if the token-race hypothesis below ever proves out, zai
-sidesteps it outright at about four times the latency. **The default now lives in three
-places — the header, the worker invocation, and the warmup invocation. Change them
-together.**
+environment: deepseek 12s, `zai/glm-5.3-flash` 46s, both writing valid findings. zai
+authenticates with a static `apiKey` from `models.yml` while deepseek uses `auth: oauth`.
+On 2026-09-14 zai failed exactly like deepseek, which ruled out the token race described
+next. **The default now lives in three places: the header, the worker invocation, and
+the warmup invocation. Change them together.**
 
-What none of it explains is that the failure does not reproduce. The same invocation,
-the same `l1-no-advisor.yml`, the same launchd-minimal environment under `env -i`, single
-worker and full 8-way fanout all succeed by hand. Every failure started between 03:45 and
-04:22; every successful repro ran at midday. The remaining difference an interactive repro
-cannot stage is a cold auth token, and `FANOUT` workers starting together after hours of
-idle all race the same `agent.db` OAuth refresh. That fits the signature exactly, duration
-included, and it is still a hypothesis — no artifact on those six nights proves it.
+What none of it explained is that the failure did not reproduce by hand. The same
+invocation, the same `l1-no-advisor.yml`, and the same launchd-minimal environment under
+`env -i` all succeeded, single worker and full 8-way fanout alike. This section blamed a
+cold auth token that `FANOUT` workers raced to refresh. That was wrong, and the section
+"The actual cause: first-turn memory recall" below has the verified cause.
 
-Two changes, neither of which assumes the hypothesis is right:
+Two changes shipped against that hypothesis:
 
-- **The auth warmup** serializes the first model call of the run, so a cold token is
-  refreshed once with nothing else contending instead of by eight workers at once. It is
-  never fatal — a mitigation for an unproven cause must not be able to cost the run its
-  corpus — and it stamps `l1_warmup: ok|failed|skipped` into run-stats. `failed` beside a
-  dead corpus is the line all six nights were missing. `AUTODREAM_L1_WARMUP=0` disables it.
+- **The auth warmup** serializes the first model call of the run. It did not fix the
+  failure, but it is one cheap call and never fatal, so it stays. It stamps
+  `l1_warmup: ok|failed|skipped` into run-stats. `AUTODREAM_L1_WARMUP=0` disables it.
 - **The circuit breaker** stops the retry loop after two consecutive rounds that recover
   no session. The budget is built for a Mac sleeping through a round and against that it
   works; against a deterministic failure it bought 405 seconds of spawns for sixteen empty
@@ -229,6 +226,50 @@ which was L1's provider until 2026-09-11 and is now only L2's. With L1 on DeepSe
 Anthropic-only outage defers a date whose L1 would have been fine, and a DeepSeek outage
 with Anthropic reachable is classified as a worker failure rather than a network one. The
 probe should become provider-aware or test generic connectivity.
+
+### The actual cause: first-turn memory recall (2026-09-14)
+
+Every failed 09-13 worker stopped at the same point. With `PI_DEBUG_STARTUP=1`, each one
+printed `[startup] print:prompt:initial:start` and exited 0 with no matching `:done`, no
+`Session exit recorded` log line, and no `provider proxy resolved`. The last line in each
+of the 30 omp logs was `mnemopi: resuming interrupted embedding rebuild`.
+
+The switch is `mnemopi.autoRecall`. Before the first model request, omp embeds the prompt
+to recall memories into the system prompt. A real launchd run whose only change was
+`autoRecall: false` in `l1-no-advisor.yml` fixed it: the two sessions that had failed in
+every earlier round wrote findings in round 1 (4 for `evidence-419`, 3 for
+`review-437-corr`).
+
+Each of these was ruled out the same day by a run that still failed, or still passed, with
+the factor removed:
+
+- the L1 model (zai failed like deepseek);
+- the launchd environment (`env -i` passed);
+- 6-way concurrency (passed);
+- the variables `run.sh` exports (passed);
+- the fastembed install (complete on disk since 2026-08-14);
+- stdin (omp prints `Working...` only after it has a prompt);
+- the EPIPE clean-exit path (armed only under `omp acp`).
+
+`MNEMOPI_NO_EMBEDDINGS=1` is not a usable switch. Workers with it set still logged the
+embedding rebuild and still died.
+
+The exit mechanism comes from reading source, not from a test. The embed worker is a child
+process that omp unrefs outside its test runtime
+(`packages/coding-agent/src/subprocess/worker-client.ts:292` in the omp fork), and its
+request timer is unref'd too (`packages/coding-agent/src/mnemopi/embed-client.ts:211`). If
+nothing else holds Bun's event loop open while the prompt waits on that child, the process
+exits with code 0. That fits hand runs failing only occasionally while the pipeline failed
+every time.
+
+Two things to reuse:
+
+- **When a hand repro passes, instrument the pipeline instead.** `PI_DEBUG_STARTUP=1` in
+  the config reaches every worker through `set -a` and writes phase markers into each
+  `.err`. One run found the failing phase after a day of hand repros that all passed.
+- **The overlay is linked, not copied.** `install.sh` used to write its own heredoc copy,
+  which lacked `disabledProviders` and would have lacked this setting. It now links the
+  repo file, so there is one copy.
 
 ### The logger could kill the run, and did (2026-08-02)
 

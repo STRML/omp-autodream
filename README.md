@@ -33,6 +33,8 @@ nothing else in your session corpus is touched.
 - **Layer 1 (per-session triage):** `deepseek/deepseek-flash` — cheap, fast.
   Every L1 worker runs with the **advisor disabled** (`--config l1-no-advisor.yml`),
   so a nightly fan-out doesn't boot the expensive advisor model on every session.
+  The same overlay turns off first-turn memory recall, which made every worker exit 0
+  before calling the model.
 - **Layer 2 (aggregation):** `anthropic/claude-opus-5` on the Anthropic subscription
   (file-based `agent.db` OAuth — safe unattended at 3am; no keychain dependency).
 - **Changelog window:** diffs the changelog of all three harnesses you work across —
@@ -96,8 +98,9 @@ schedule for you (auto-detecting your username, paths, and the `omp` binary — 
 plist editing). Because the scripts are symlinks, editing the repo copy takes effect
 immediately.
 
-Install writes the advisor-off overlay (`l1-no-advisor.yml`) into `AUTODREAM_DIR`; the
-nightly runners pass it as `--config` so no headless worker boots the advisor.
+Install links the worker overlay (`l1-no-advisor.yml`) into `AUTODREAM_DIR`. The nightly
+runners pass it as `--config`, so no headless worker boots the advisor, probes local
+providers, or runs first-turn memory recall.
 
 The schedule fires `run.sh` at 03:15 with morning catch-up triggers (06:15/09:15/12:15)
 in case the Mac was asleep; the idempotency guard makes all but the first a one-second
@@ -253,8 +256,9 @@ see **`codemaps/architecture.md`** and **`CLAUDE.md`**.
   it in a shared environment.
 - **Auth:** both layers use subscription OAuth via `agent.db` and need no API key on the
   default models. A run does serialize one throwaway model call before the fan-out
-  (`l1_warmup` in `run-stats.txt`, disable with `AUTODREAM_L1_WARMUP=0`) so a cold token
-  is refreshed once rather than by every worker at once. If you point `AUTODREAM_L1_MODEL`
+  (`l1_warmup` in `run-stats.txt`, disable with `AUTODREAM_L1_WARMUP=0`). It was added
+  against a suspected cold-token race that turned out not to be the cause, and it stays
+  because it is cheap and never fatal. If you point `AUTODREAM_L1_MODEL`
   at a keyed provider, put its key in `~/.omp/agent/autodream/x-credentials` (chmod 600,
   `key=value`): `run.sh` sources that file and nothing else. There is no keychain
   fallback, despite what this bullet claimed before 2026-09-11 — a key that lives only in
