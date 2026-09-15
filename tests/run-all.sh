@@ -1307,13 +1307,18 @@ test_noise_gate_env_override(){
 }
 
 test_oversized_gate_zero(){
-  echo "# oversized gate (#12 measurement): both keys present at 0 on a normal run"
+  echo "# oversized gate (#12 measurement): every failure-class key is present at 0 on a normal run"
   local root; root=$(setup_env); mk_session "$root" sess1
   run_dream "$root"
   local stats="$(fdir "$root")/run-stats.txt"
   assert_grep "$stats" 'oversized_total: 0'   "no oversized sessions under the default threshold"
   assert_grep "$stats" 'oversized_errored: 0' "no oversized-errored sessions under the default threshold"
   assert_grep "$stats" 'oversized_errored_silent: 0' "the silent counter is present at 0, not absent"
+  assert_grep "$stats" 'oversized_errored_provider: 0' "the oversized provider counter is present at 0, not absent"
+  assert_grep "$stats" 'oversized_errored_unclassified: 0' "the oversized unclassified counter is present at 0, not absent"
+  assert_grep "$stats" 'l1_errored_silent: 0' "the all-session silent counter is present at 0, not absent"
+  assert_grep "$stats" 'l1_errored_provider: 0' "the all-session provider counter is present at 0, not absent"
+  assert_grep "$stats" 'l1_errored_unclassified: 0' "the all-session unclassified counter is present at 0, not absent"
   rm -rf "$root"
 }
 
@@ -1358,18 +1363,35 @@ test_oversized_gate_errored_silent(){
   local stats="$(fdir "$root")/run-stats.txt"
   assert_grep "$stats" 'oversized_errored: 1'        "the silent death still leaves an error stub"
   assert_grep "$stats" 'oversized_errored_silent: 1' "and is counted as silent, apart from size failures"
+  assert_grep "$stats" 'l1_errored_silent: 1'         "the all-session classifier also counts the silent death"
   rm -rf "$root"
 }
 
 test_oversized_gate_errored_noisy(){
-  echo "# oversized gate (#12 measurement): a failure that exited nonzero with output is not silent"
+  echo "# oversized gate (#12 measurement): a provider refusal is excluded from the size share"
   local root; root=$(setup_env); mk_session "$root" sess1
   export AUTODREAM_SLIM_BYTES=100 MOCK_MODE=l1_noisy_fail AUTODREAM_L1_ROUNDS=1
   run_dream "$root"
   unset AUTODREAM_SLIM_BYTES MOCK_MODE AUTODREAM_L1_ROUNDS
   local stats="$(fdir "$root")/run-stats.txt"
   assert_grep "$stats" 'oversized_errored: 1'        "the noisy failure is still an oversized error"
-  assert_grep "$stats" 'oversized_errored_silent: 0' "exit 7 with a stdout diagnosis counts toward the gate"
+  assert_grep "$stats" 'oversized_errored_provider: 1' "the 429 is classified as an oversized provider failure"
+  assert_grep "$stats" 'l1_errored_provider: 1'        "the all-session classifier also counts the provider failure"
+  rm -rf "$root"
+}
+
+test_oversized_gate_context_overflow(){
+  echo "# oversized gate (#12 measurement): a context overflow counts as size, not provider"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  export AUTODREAM_SLIM_BYTES=100 MOCK_MODE=l1_context_overflow AUTODREAM_L1_ROUNDS=1
+  run_dream "$root"
+  unset AUTODREAM_SLIM_BYTES MOCK_MODE AUTODREAM_L1_ROUNDS
+  local stats="$(fdir "$root")/run-stats.txt"
+  assert_grep "$stats" 'oversized_errored: 1' "the context overflow is still an oversized error"
+  assert_grep "$stats" 'oversized_errored_provider: 0' "a size signature overrides the provider wording"
+  assert_grep "$stats" 'oversized_errored_unclassified: 0' "the captured context overflow is classified"
+  assert_grep "$stats" 'l1_errored_provider: 0' "the all-session classifier does not call it provider"
+  assert_grep "$stats" 'l1_errored_unclassified: 0' "the all-session classifier recognizes it as size"
   rm -rf "$root"
 }
 
@@ -1565,6 +1587,7 @@ test_oversized_gate_script(){
   assert_nogrep "$fd/run-stats.txt" 'oversized_total' "precondition: the keys really are gone"
   local out; out=$(AUTODREAM_SLIM_BYTES=100 bash "$GATE" "$fd" 2>&1)
   printf '%s' "$out" > "$root/gate.out"
+  assert_grep "$root/gate.out" 'SILENT  *PROVIDER  *UNCLASS' "the table reports every excluded failure class"
   assert_grep "$root/gate.out" 'GATE CLOSED'  "a clean window reports the gate closed"
   assert_grep "$root/gate.out" '1 oversized'  "recovered the oversized count without run-stats.txt"
   assert_grep "$root/gate.out" 'rule of three' "quotes the upper bound rather than implying 0% is certain"
@@ -1572,7 +1595,7 @@ test_oversized_gate_script(){
 }
 
 test_oversized_gate_script_open(){
-  echo "# oversized-gate.sh (#29): an errored oversized session pushes the window over the threshold"
+  echo "# oversized-gate.sh: a provider refusal is reported and excluded from the size verdict"
   local GATE="$REPO/bin/oversized-gate.sh"
   [ -x "$GATE" ] || { no "oversized-gate.sh executable"; return 0; }
   local root; root=$(setup_env); mk_session "$root" sess1
@@ -1581,7 +1604,25 @@ test_oversized_gate_script_open(){
   unset AUTODREAM_SLIM_BYTES MOCK_MODE AUTODREAM_L1_ROUNDS
   local out; out=$(AUTODREAM_SLIM_BYTES=100 bash "$GATE" "$(fdir "$root")" 2>&1)
   printf '%s' "$out" > "$root/gate.out"
-  assert_grep "$root/gate.out" 'GATE OPEN'    "1 of 1 errored is 100%, well over the 5% threshold"
+  assert_grep   "$root/gate.out" '1 provider' "the 429 is reported as a provider failure"
+  assert_grep   "$root/gate.out" 'measured nothing about size' "a provider-only window has no size evidence"
+  assert_nogrep "$root/gate.out" 'GATE OPEN' "a provider refusal does not open the size gate"
+  assert_nogrep "$root/gate.out" 'GATE CLOSED' "a provider refusal does not close the size gate"
+  rm -rf "$root"
+}
+
+test_oversized_gate_script_context_overflow(){
+  echo "# oversized-gate.sh: a context overflow opens the size gate"
+  local GATE="$REPO/bin/oversized-gate.sh"
+  [ -x "$GATE" ] || { no "oversized-gate.sh executable"; return 0; }
+  local root; root=$(setup_env); mk_session "$root" sess1
+  export AUTODREAM_SLIM_BYTES=100 MOCK_MODE=l1_context_overflow AUTODREAM_L1_ROUNDS=1
+  run_dream "$root"
+  unset AUTODREAM_SLIM_BYTES MOCK_MODE AUTODREAM_L1_ROUNDS
+  local out; out=$(AUTODREAM_SLIM_BYTES=100 bash "$GATE" "$(fdir "$root")" 2>&1)
+  printf '%s' "$out" > "$root/gate.out"
+  assert_grep "$root/gate.out" 'GATE OPEN' "one context overflow in one measured session opens the gate"
+  assert_grep "$root/gate.out" 'Size-attributable: 1 errored of 1' "the context overflow remains in the size numerator"
   rm -rf "$root"
 }
 
@@ -1596,26 +1637,91 @@ test_oversized_gate_script_silent(){
   local out; out=$(AUTODREAM_SLIM_BYTES=100 bash "$GATE" "$(fdir "$root")" 2>&1)
   printf '%s' "$out" > "$root/gate.out"
   assert_grep   "$root/gate.out" '1 silent'                     "the silent death is reported, not hidden"
-  assert_grep   "$root/gate.out" 'no size-attributable failures' "an all-silent window has nothing to judge size by"
+  assert_grep   "$root/gate.out" 'measured nothing about size'   "an all-silent window has nothing to judge size by"
   assert_nogrep "$root/gate.out" 'GATE OPEN'                     "and must not open the gate"
   assert_nogrep "$root/gate.out" 'GATE CLOSED'                   "or close it"
   rm -rf "$root"
 }
 
 test_oversized_gate_script_missing_err(){
-  echo "# oversized-gate.sh: an error stub whose .err is gone counts toward the gate, not as silent"
+  echo "# oversized-gate.sh: an error stub whose .err is gone is unclassified and excluded"
   local GATE="$REPO/bin/oversized-gate.sh"
   [ -x "$GATE" ] || { no "oversized-gate.sh executable"; return 0; }
   local root; root=$(setup_env); mk_session "$root" sess1
-  export AUTODREAM_SLIM_BYTES=100 MOCK_MODE=l1_silent AUTODREAM_L1_ROUNDS=1
+  local fd; fd=$(fdir "$root")
+  local h; h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
+  mkdir -p "$fd"
+  printf '{"session_path":"%s","error":"legacy failure","findings":[]}\n' \
+    "$root/projects/proj-a/sess1.jsonl" > "$fd/$h.json"
+  export AUTODREAM_SLIM_BYTES=100
+  run_dream "$root"
+  unset AUTODREAM_SLIM_BYTES
+  assert_grep "$fd/run-stats.txt" 'oversized_errored_unclassified: 1' "run.sh classifies a missing .err as unclassified"
+  assert_grep "$fd/run-stats.txt" 'l1_errored_unclassified: 1' "the all-session classifier also counts the legacy stub"
+  local out; out=$(AUTODREAM_SLIM_BYTES=100 bash "$GATE" "$fd" 2>&1)
+  printf '%s' "$out" > "$root/gate.out"
+  assert_grep   "$root/gate.out" '1 unclassified' "the missing .err is reported as unclassified"
+  assert_grep   "$root/gate.out" 'measured nothing about size' "a legacy-only window has no size evidence"
+  assert_nogrep "$root/gate.out" 'GATE OPEN' "an unclassified failure does not open the gate"
+  assert_nogrep "$root/gate.out" 'GATE CLOSED' "an unclassified failure does not close the gate"
+  rm -rf "$root"
+}
+
+test_oversized_gate_script_err_without_exit_code(){
+  echo "# oversized-gate.sh: an .err from before exit-code capture is unclassified"
+  local GATE="$REPO/bin/oversized-gate.sh"
+  [ -x "$GATE" ] || { no "oversized-gate.sh executable"; return 0; }
+  local root; root=$(setup_env); mk_session "$root" sess1
+  export AUTODREAM_SLIM_BYTES=100 MOCK_MODE=l1_noisy_fail AUTODREAM_L1_ROUNDS=1
   run_dream "$root"
   unset AUTODREAM_SLIM_BYTES MOCK_MODE AUTODREAM_L1_ROUNDS
   local fd; fd=$(fdir "$root")
-  rm -f "$fd"/*.json.err
+  local h; h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
+  grep -v '^worker exit code:' "$fd/$h.json.err" > "$fd/$h.json.err.tmp" && mv "$fd/$h.json.err.tmp" "$fd/$h.json.err"
   local out; out=$(AUTODREAM_SLIM_BYTES=100 bash "$GATE" "$fd" 2>&1)
   printf '%s' "$out" > "$root/gate.out"
-  assert_grep "$root/gate.out" 'GATE OPEN' "without the .err there is no proof of a silent death, so it counts"
+  assert_grep "$root/gate.out" '1 unclassified' "an .err without an exit-code line is unclassified"
+  assert_nogrep "$root/gate.out" 'GATE OPEN' "the legacy .err does not open the gate"
+  assert_nogrep "$root/gate.out" 'GATE CLOSED' "the legacy .err does not close the gate"
   rm -rf "$root"
+}
+
+test_oversized_gate_script_stdout_section_boundary(){
+  echo "# oversized-gate.sh: provider text in the appended omp log cannot override a size diagnosis"
+  local GATE="$REPO/bin/oversized-gate.sh"
+  [ -x "$GATE" ] || { no "oversized-gate.sh executable"; return 0; }
+  local root; root=$(setup_env); mk_session "$root" sess1
+  export AUTODREAM_SLIM_BYTES=100 MOCK_MODE=l1_context_overflow AUTODREAM_L1_ROUNDS=1
+  run_dream "$root"
+  unset AUTODREAM_SLIM_BYTES MOCK_MODE AUTODREAM_L1_ROUNDS
+  local fd; fd=$(fdir "$root")
+  local h; h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
+  printf '%s\n' '--- an omp log touched during this round, may belong to a sibling worker: fixture ---' \
+    'provider error: 429 rate_limit_exceeded' >> "$fd/$h.json.err"
+  local out; out=$(AUTODREAM_SLIM_BYTES=100 bash "$GATE" "$fd" 2>&1)
+  printf '%s' "$out" > "$root/gate.out"
+  assert_grep "$root/gate.out" 'GATE OPEN' "the stdout context signature keeps the failure in the size share"
+  assert_grep "$root/gate.out" '0 provider' "the sibling omp-log 429 is outside the classification section"
+  rm -rf "$root"
+}
+
+test_oversized_gate_script_mixed_size_and_provider(){
+  echo "# oversized-gate.sh: one size failure plus one provider failure measures 1 of 1"
+  local GATE="$REPO/bin/oversized-gate.sh"
+  [ -x "$GATE" ] || { no "oversized-gate.sh executable"; return 0; }
+  local size_root provider_root
+  size_root=$(setup_env); mk_session "$size_root" size1
+  provider_root=$(setup_env); mk_session "$provider_root" provider1
+  export AUTODREAM_SLIM_BYTES=100 MOCK_MODE=l1_context_overflow AUTODREAM_L1_ROUNDS=1
+  run_dream "$size_root"
+  export MOCK_MODE=l1_noisy_fail
+  run_dream "$provider_root"
+  unset AUTODREAM_SLIM_BYTES MOCK_MODE AUTODREAM_L1_ROUNDS
+  local out; out=$(AUTODREAM_SLIM_BYTES=100 bash "$GATE" "$(fdir "$size_root")" "$(fdir "$provider_root")" 2>&1)
+  printf '%s' "$out" > "$size_root/gate.out"
+  assert_grep "$size_root/gate.out" 'Size-attributable: 1 errored of 1' "the provider failure leaves both sides of the share"
+  assert_grep "$size_root/gate.out" 'GATE OPEN' "the remaining 1-of-1 size share opens the gate"
+  rm -rf "$size_root" "$provider_root"
 }
 
 test_oversized_gate_script_empty(){
@@ -2045,6 +2151,7 @@ test_oversized_gate_total
 test_oversized_gate_errored
 test_oversized_gate_errored_noisy
 test_oversized_gate_errored_silent
+test_oversized_gate_context_overflow
 test_stats_sidecar_ok
 test_stats_sidecar_missing_counted
 test_stats_sidecar_missing_keeps_oversized_count
@@ -2057,8 +2164,12 @@ test_runner_provenance_relative_symlink
 test_runner_provenance_unresolvable_chain
 test_oversized_gate_script
 test_oversized_gate_script_open
+test_oversized_gate_script_context_overflow
 test_oversized_gate_script_silent
 test_oversized_gate_script_missing_err
+test_oversized_gate_script_err_without_exit_code
+test_oversized_gate_script_stdout_section_boundary
+test_oversized_gate_script_mixed_size_and_provider
 test_oversized_gate_script_empty
 test_oversized_gate_script_args
 test_notify_count
@@ -2572,8 +2683,9 @@ test_unexecutable_curl_is_not_read_as_an_outage(){
   echo "# a curl that exists but cannot be executed (exit 126) is unclassifiable, not down"
   local root; root=$(setup_env); mk_session "$root" sess1
   mkdir -p "$root/shim"
-  # No shebang and no exec permission on the target: bash reports 126, not 127.
-  printf 'not-an-executable\n' > "$root/shim/curl"; chmod 644 "$root/shim/curl"
+  # Return 126 directly. Some shells skip a non-executable PATH entry and run the next
+  # curl, which made this offline fixture depend on whether the host network was up.
+  printf '#!/bin/bash\nexit 126\n' > "$root/shim/curl"; chmod 755 "$root/shim/curl"
   TEST_CURL_SHIMMED=1 PATH="$root/shim:$PATH" AUTODREAM_NETCHECK=1 AUTODREAM_NETCHECK_CAP=0 run_dream "$root"
   assert_file "$root/dreams/$DATE.md" "the run completed rather than deferring on an unrunnable curl"
   assert_grep "$(fdir "$root")/run-stats.txt" 'network_deferred: no' "126 is treated the same as 127"

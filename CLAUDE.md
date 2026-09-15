@@ -420,7 +420,26 @@ The general rule this is an instance of: a facet the report will reason about qu
 
 `bin/oversized-gate.sh` exists because of the same incident. The #12 gate is a trailing-window judgment but `run.sh` records one night at a time, so a stretch of old-runner nights used to be unrecoverable. It recomputes the window from the `*.stats.json` sidecars and findings JSONs still on disk, which survive independently of whether the runner knew how to count them. Artifacts only, no model calls, safe to re-run. It refuses to call an empty window a measured 0%, and quotes a rule-of-three upper bound so a clean run isn't read as stronger evidence than the sample supports.
 
-Both the gate script and `run.sh` count **silent worker deaths** separately (`oversized_errored_silent`): an error stub whose `.err` holds both `worker exit code: 0 after` and `worker stdout was empty`. That worker never reached the model, so its failure says nothing about transcript size. On 2026-09-13 the raw ratio read 6/7, and every failed worker had died in omp's first-turn memory recall. The gate share is computed over the size-attributable rest, a window where every failure was silent reports that it measured nothing, and a stub whose `.err` is missing stays in the size-attributable count because nothing proves it silent. The predicate lives in both scripts; `test_oversized_gate_errored_silent` and `test_oversized_gate_script_silent` pin them to the same answer, using the mock's `l1_silent` mode. `l1_incomplete` is not that shape: it still prints `done`, so its stdout is not empty. The script also skips any date whose `run-stats.txt` reads `network_deferred: yes` and says so: those runs counted their oversized sessions but never ran every worker, so their share reads low (Codex review of 2400815).
+`bin/failure-class.sh` is the single failure predicate sourced by both `run.sh` and
+`bin/oversized-gate.sh`. It assigns every error stub to one of four classes from its
+`.err`: `unclassified` when the file is missing, empty, or predates the
+`worker exit code:` capture; `silent` for exit 0 with the exact
+`worker stdout was empty` line; `provider` when the captured worker-stdout section
+shows a 429/auth/5xx/overload/quota refusal without a size signature; and `size` for
+everything else, including context-limit signatures, timeouts, and other nonzero
+exits. Provider and size matching stops at the next `--- ` section so a 429 in the
+appended omp log, which may belong to a sibling worker, cannot reclassify this one.
+
+`run.sh` records silent, provider, and unclassified counts beside both
+`l1_findings_with_error` and `oversized_errored`. The #12 share removes all three
+classes from its numerator and denominator, so only failures with no better
+explanation count against size. On 2026-09-13 the raw ratio read 6/7 while every
+failed worker had died in omp's first-turn memory recall; the classified window now
+reports that it measured nothing about size. `bin/oversized-gate.sh` recomputes all
+four classes from artifacts even when `run-stats.txt` predates the counters. It also
+skips any date whose stats read `network_deferred: yes`, because those runs counted
+oversized sessions that never reached a worker and their share reads low (Codex
+review of 2400815).
 
 ## Running / rerunning a date
 

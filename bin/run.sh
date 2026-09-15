@@ -250,6 +250,14 @@ SESSIONS_LIST="$FINDINGS_DIR/sessions.txt"
 # transcript?". Resolve it next to this script first (works for the repo copy and the
 # ~/.claude/autodream symlink), then fall back to the install dir.
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+FAILURE_CLASS="$SCRIPT_DIR/failure-class.sh"
+[ -r "$FAILURE_CLASS" ] || FAILURE_CLASS="$AUTODREAM_DIR/failure-class.sh"
+if [ ! -r "$FAILURE_CLASS" ]; then
+  printf 'fatal: required failure classifier not found: %s\n' "$FAILURE_CLASS" >&2
+  exit 1
+fi
+# shellcheck source=./failure-class.sh
+. "$FAILURE_CLASS"
 PRUNE="$SCRIPT_DIR/prune-self-sessions.sh"
 [ -x "$PRUNE" ] || PRUNE="$AUTODREAM_DIR/prune-self-sessions.sh"
 # Root prober — decides which $HOME/.claude*/projects dirs to scan (see root-probe.sh).
@@ -1444,31 +1452,43 @@ EOF
   L1_ELAPSED=$(( $(date +%s) - L1_START ))
   L1_OK=$(findings_json_count)
   L1_FAIL=$(ls -1 "$FINDINGS_DIR"/*.json.err 2>/dev/null | wc -l | tr -d " ")
-  # In-band failures: a worker that ran to completion but couldn't fit the transcript
-  # writes a findings JSON carrying a top-level "error" key (empty findings). These are
-  # NOT .json.err files, so l1_err_files=0 masked them — count them explicitly so the
-  # self-audit can alarm on a high extraction-failure rate (slimming should drive →0).
+  # In-band failures: the final retry writes a findings JSON carrying a top-level
+  # "error" key (empty findings). These are NOT .json.err files, so l1_err_files=0
+  # masked them. Count every stub, then classify its surviving .err before the
+  # self-audit decides whether the failure says anything about transcript size.
   L1_ERRORED=$(find "$FINDINGS_DIR" -type f -name '*.json' ! -name '*.stats.json' \
     -exec grep -l '"error":' {} + 2>/dev/null | wc -l | tr -d " ")
+  L1_ERRORED_SILENT=0
+  L1_ERRORED_PROVIDER=0
+  L1_ERRORED_UNCLASSIFIED=0
+  for findingsfile in "$FINDINGS_DIR"/*.json; do
+    [ -f "$findingsfile" ] || continue
+    case "$findingsfile" in *.stats.json) continue ;; esac
+    grep -q '"error":' "$findingsfile" 2>/dev/null || continue
+    failure_class=$(classify_failure "$findingsfile.err")
+    case "$failure_class" in
+      silent) L1_ERRORED_SILENT=$((L1_ERRORED_SILENT + 1)) ;;
+      provider) L1_ERRORED_PROVIDER=$((L1_ERRORED_PROVIDER + 1)) ;;
+      unclassified) L1_ERRORED_UNCLASSIFIED=$((L1_ERRORED_UNCLASSIFIED + 1)) ;;
+    esac
+  done
   # Noise-gated sessions: dispatch_l1 wrote a stub instead of calling the model
   # (see the "Noise gate" comment in dispatch_l1). Counted from the findings
   # dir rather than a shared counter, since each gate decision happens inside
   # an independent xargs subshell with no shared state to increment.
   GATED=$(find "$FINDINGS_DIR" -type f -name '*.json' ! -name '*.stats.json' \
     -exec grep -l '"skipped": *"below_noise_gate"' {} + 2>/dev/null | wc -l | tr -d " ")
-  log "L1 done in ${L1_ELAPSED}s: $L1_OK done ($L1_ERRORED with errors, $GATED gated), $MISSING missing (.err files: $L1_FAIL)"
+  log "L1 done in ${L1_ELAPSED}s: $L1_OK done ($L1_ERRORED with errors: $L1_ERRORED_SILENT silent, $L1_ERRORED_PROVIDER provider, $L1_ERRORED_UNCLASSIFIED unclassified; $GATED gated), $MISSING missing (.err files: $L1_FAIL)"
 
   # ---- Oversized-transcript measurement gate (#12) ----
   # Issue #12 proposes chunk-summarizing oversized transcripts instead of slimming them;
   # that implementation is BLOCKED pending evidence it's actually needed. These two
   # counters are the measurement: how many triaged sessions exceeded AUTODREAM_SLIM_BYTES
-  # (the same threshold dispatch_l1 checks before calling slim-transcript.sh), and of
-  # those, how many still ended in an in-band failure (the same top-level "error" key
-  # L1_ERRORED checks above) despite the existing fallback stack (slimming, chunked-Read
-  # guidance, metadata-stub path). Gate: if oversized_errored/oversized_total sustains
-  # >= 5% over a trailing week, that's the signal issue #12's gate has opened; below that
-  # the fallback stack is doing its job. This script only records the counters — the L2
-  # self-audit and the human do the trailing-week judgment.
+  # (the same threshold dispatch_l1 checks before calling slim-transcript.sh), how many
+  # ended in an in-band failure, and which of those failures have a non-size explanation.
+  # The gate removes silent, provider, and unclassified failures from both sides. If the
+  # residual size share sustains >= 5% over a trailing week, issue #12's gate has opened.
+  # This script only records the counters; L2 and the human do the window judgment.
   # Computed post-hoc from the *.stats.json sidecars' transcript_bytes field, same
   # post-hoc pattern as GATED/L1_ERRORED above: the per-worker sz variable at dispatch
   # time (line ~309) lives in an xargs subshell with no shared state to increment
@@ -1497,6 +1517,8 @@ EOF
   OVERSIZED_TOTAL=0
   OVERSIZED_ERRORED=0
   OVERSIZED_ERRORED_SILENT=0
+  OVERSIZED_ERRORED_PROVIDER=0
+  OVERSIZED_ERRORED_UNCLASSIFIED=0
   STATS_SIDECARS_UNPARSEABLE=0
   while IFS= read -r session; do
     [ -n "$session" ] || continue
@@ -1525,21 +1547,17 @@ EOF
       # self-audit nothing while implying it was measured.
       if [ -f "$findingsfile" ] && grep -q '"error":' "$findingsfile" 2>/dev/null; then
         OVERSIZED_ERRORED=$((OVERSIZED_ERRORED + 1))
-        # A worker that exited 0 with empty stdout never reached the model, so its failure
-        # says nothing about transcript size: on 2026-09-13 this ratio read 6/7 while every
-        # failed worker had died in omp's first-turn memory recall. Count those separately so
-        # the gate can be judged on the rest. Both lines must be present in the surviving .err;
-        # a missing .err is no proof of anything and stays in the size-attributable count.
-        # oversized-gate.sh applies the same predicate to the trailing window.
         errfile="$findingsfile.err"
-        if grep -q '^worker exit code: 0 after ' "$errfile" 2>/dev/null \
-           && grep -qx 'worker stdout was empty' "$errfile" 2>/dev/null; then
-          OVERSIZED_ERRORED_SILENT=$((OVERSIZED_ERRORED_SILENT + 1))
-        fi
+        failure_class=$(classify_failure "$errfile")
+        case "$failure_class" in
+          silent) OVERSIZED_ERRORED_SILENT=$((OVERSIZED_ERRORED_SILENT + 1)) ;;
+          provider) OVERSIZED_ERRORED_PROVIDER=$((OVERSIZED_ERRORED_PROVIDER + 1)) ;;
+          unclassified) OVERSIZED_ERRORED_UNCLASSIFIED=$((OVERSIZED_ERRORED_UNCLASSIFIED + 1)) ;;
+        esac
       fi
     fi
   done < "$SESSIONS_LIST"
-  log "oversized: $OVERSIZED_TOTAL session(s) over ${AUTODREAM_SLIM_BYTES:-262144} bytes ($OVERSIZED_ERRORED errored, $OVERSIZED_ERRORED_SILENT of them silent worker deaths)"
+  log "oversized: $OVERSIZED_TOTAL session(s) over ${AUTODREAM_SLIM_BYTES:-262144} bytes ($OVERSIZED_ERRORED errored: $OVERSIZED_ERRORED_SILENT silent, $OVERSIZED_ERRORED_PROVIDER provider, $OVERSIZED_ERRORED_UNCLASSIFIED unclassified)"
   if [ "$STATS_SIDECARS_UNPARSEABLE" -gt 0 ]; then
     log "stats sidecars unparseable: $STATS_SIDECARS_UNPARSEABLE of $COUNT (sizes fell back to a live read; gated/oversized counts are degraded)"
   fi
@@ -1705,11 +1723,16 @@ PY
     printf 'l1_breaker_fired: %s\n' "${L1_BREAKER:-not_reached}"
     printf 'l1_findings_written: %s\n' "$L1_OK"
     printf 'l1_findings_with_error: %s\n' "$L1_ERRORED"
+    printf 'l1_errored_silent: %s\n' "$L1_ERRORED_SILENT"
+    printf 'l1_errored_provider: %s\n' "$L1_ERRORED_PROVIDER"
+    printf 'l1_errored_unclassified: %s\n' "$L1_ERRORED_UNCLASSIFIED"
     # Oversized-transcript measurement gate (#12) — see the computation above L1_ERRORED
     # for the gate meaning (M/N >= 5% over a trailing week opens issue #12).
     printf 'oversized_total: %s\n' "$OVERSIZED_TOTAL"
     printf 'oversized_errored: %s\n' "$OVERSIZED_ERRORED"
     printf 'oversized_errored_silent: %s\n' "$OVERSIZED_ERRORED_SILENT"
+    printf 'oversized_errored_provider: %s\n' "$OVERSIZED_ERRORED_PROVIDER"
+    printf 'oversized_errored_unclassified: %s\n' "$OVERSIZED_ERRORED_UNCLASSIFIED"
     # Network health for this run. network_down_seconds is time spent blocked in
     # wait_for_network across all rounds; network_deferred says the run stopped before L2
     # because a round could not be dispatched at all, which means this date has findings
