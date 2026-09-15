@@ -1351,6 +1351,8 @@ test_oversized_gate_errored(){
   assert_grep "$stats" 'oversized_errored: 1' "its final-round error stub is paired and counted"
   # l1_incomplete still prints "done", so its stdout is not empty and it is not silent.
   assert_grep "$stats" 'oversized_errored_silent: 0' "a failure with output on stdout is not a silent death"
+  assert_grep "$stats" 'oversized_errored_provider: 0' "a failure with no provider signature is not a provider failure"
+  assert_grep "$stats" 'oversized_errored_unclassified: 0' "a captured exit code leaves it classified, so it counts as size"
   rm -rf "$root"
 }
 
@@ -1703,6 +1705,30 @@ test_oversized_gate_script_stdout_section_boundary(){
   assert_grep "$root/gate.out" 'GATE OPEN' "the stdout context signature keeps the failure in the size share"
   assert_grep "$root/gate.out" '0 provider' "the sibling omp-log 429 is outside the classification section"
   rm -rf "$root"
+}
+
+test_failure_class_provider_matrix(){
+  echo "# failure-class.sh: every 5xx and auth-error wording is provider, not size"
+  local dir; dir=$(mktemp -d)
+  # shellcheck source=../bin/failure-class.sh
+  . "$REPO/bin/failure-class.sh"
+  local n=0 line want got
+  while IFS='|' read -r want line; do
+    n=$((n + 1))
+    printf 'worker exit code: 1 after 9s\n--- worker stdout, last 40 lines ---\n%s\n' "$line" > "$dir/$n.err"
+    got=$(classify_failure "$dir/$n.err")
+    assert_eq "$got" "$want" "[$line] is $want"
+  done <<'EOF'
+provider|error: HTTP 520 from upstream
+provider|503 Service Unavailable
+provider|auth error: token expired
+provider|Authentication failed for provider deepseek
+provider|401 Unauthorized
+size|context length exceeded (HTTP 500)
+size|read 5200 bytes then exited
+size|worker timed out after 600s
+EOF
+  rm -rf "$dir"
 }
 
 test_oversized_gate_script_mixed_size_and_provider(){
@@ -2169,6 +2195,7 @@ test_oversized_gate_script_silent
 test_oversized_gate_script_missing_err
 test_oversized_gate_script_err_without_exit_code
 test_oversized_gate_script_stdout_section_boundary
+test_failure_class_provider_matrix
 test_oversized_gate_script_mixed_size_and_provider
 test_oversized_gate_script_empty
 test_oversized_gate_script_args

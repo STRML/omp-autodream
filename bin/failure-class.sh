@@ -35,7 +35,7 @@ classify_failure() {
   fi
 
   if printf '%s\n' "$stdout_section" \
-      | grep -Eiq '(^|[^0-9])(429|401|403|500|502|503|504|529)([^0-9]|$)|rate[[:space:]_]limit|overloaded|quota|unauthorized|forbidden|invalid[[:space:]_]+api[[:space:]_]+key'; then
+      | grep -Eiq '(^|[^0-9])(429|401|403|5[0-9][0-9])([^0-9]|$)|rate[[:space:]_]limit|overloaded|quota|unauthorized|forbidden|invalid[[:space:]_]+api[[:space:]_]+key|auth(entication)?[[:space:]_]+(error|failed|failure)|token[[:space:]_]+expired'; then
     printf '%s\n' provider
     return 0
   fi
