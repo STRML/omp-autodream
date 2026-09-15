@@ -66,13 +66,19 @@ ranked patterns, five open questions). The shape:
 1. Add a Read-before-Edit reminder to the project CLAUDE.md?
 ```
 
-Three ways you actually interact with it:
+How you interact with it:
 
 - **It runs unattended.** A launchd job fires overnight (with morning catch-up
   triggers in case the Mac was asleep). You do nothing.
 - **It opens itself.** When a report lands, `notify.sh` writes its open questions to a
   text file and pops it open in your editor — so it's in front of you with morning
   coffee, not waiting to be discovered.
+- **It gets louder when a question goes unanswered.** Once the report has asked the
+  same question 3 reports in a row, a second banner tells you it is still unanswered,
+  and the question lands in `findings/<date>/question-escalations.txt`. Two questions
+  are the same when their bold titles match word for word (case and spacing aside). A
+  night with no report doesn't break a streak; a report that drops the question ends
+  it. Set `AUTODREAM_QUESTION_ESCALATE_AT` to change the 3.
 - **It has an interactive suggestion solver.** `review.sh` opens a Claude session
   preloaded with the report and walks the open questions one at a time — restate,
   recommend, then **approve / modify / skip / discuss** — executing the ones you
@@ -128,6 +134,8 @@ AUTODREAM_FORCE=1 ~/.omp/agent/autodream/run.sh 2026-05-29  # rebuild a date
 ~/.omp/agent/autodream/review.sh                            # solve the latest report's questions
 ~/.omp/agent/autodream/review.sh 2026-05-29                 # triage a specific report
 ~/.omp/agent/autodream/review.sh --force 2026-05-29         # open it even if there's nothing to triage
+~/.omp/agent/autodream/question-streaks.sh status           # questions asked in consecutive reports
+~/.omp/agent/autodream/question-streaks.sh clear <key>      # forget one you've acted on (clear all: every one)
 ```
 
 > **$OMP_BIN** overrides the `omp` binary location (default `/opt/homebrew/bin/omp`).
