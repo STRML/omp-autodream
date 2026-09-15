@@ -563,8 +563,11 @@ Three details the Codex review of `232c94c` found, each with a test:
 - **The watermark survives an empty board.** The newest counted date lives in
   `question-streaks.tsv.last`, because a question-free report empties the state file and
   the watermark used to go with it, letting an older rebuild count as a new night. A
-  watermark that exists but cannot be read refuses the update, and it is staged to
-  `.last.tmp` before state changes so a failed write refuses too (Codex review of `4eea84d`).
+  watermark that exists but cannot be read refuses the update. The watermark is written
+  and moved into place before state changes, and a failure at either step refuses the
+  update. A state write that fails after that leaves the board as a night skipped on a
+  held lock would; state changed under the old watermark could recreate a streak (Codex
+  reviews of `4eea84d` and `600e6dd`).
 - **`clear` takes the same lock as `update`**, before its "nothing to clear" check, and
   fails loudly when it cannot, so an update that already read the old state cannot write a
   cleared or first streak back.

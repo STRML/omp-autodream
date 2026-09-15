@@ -2760,6 +2760,20 @@ test_question_streaks_state_lives_with_the_install(){
   AUTODREAM_QUESTION_STATE="$st3" AUTODREAM_NOTIFY_DRYRUN=1 bash "$QS" update "$root/2026-03-01.md" >/dev/null 2>&1
   rmdir "$st3.last.tmp" 2>/dev/null
   assert_eq "$(wc -l < "$st3" | tr -d ' ')" "0" "a watermark that cannot be staged leaves state untouched"
+
+  # The watermark's final move can fail too. State used to change first and the failed move
+  # only logged, so a cleared board kept the old watermark and an older rebuild recreated the
+  # streak (Codex review of 600e6dd). Every state write now waits on the watermark.
+  local st4="$root/w4.tsv"; : > "$st4"
+  mkdir -p "$root/failmv"
+  printf '#!/bin/sh\nexit 1\n' > "$root/failmv/mv"; chmod +x "$root/failmv/mv"
+  printf '## Open questions for the user\n\n1. **Another?** body\n\n<!-- autodream:open-questions=1 -->\n' > "$root/2026-03-03.md"
+  AUTODREAM_QUESTION_STATE="$st4" AUTODREAM_NOTIFY_DRYRUN=1 bash "$QS" update "$root/2026-03-01.md" >/dev/null 2>&1
+  cp "$st4" "$root/w4.before"
+  PATH="$root/failmv:$PATH" AUTODREAM_QUESTION_STATE="$st4" AUTODREAM_NOTIFY_DRYRUN=1 bash "$QS" update "$root/2026-03-02.md" >/dev/null 2>&1
+  if cmp -s "$st4" "$root/w4.before"; then ok "a failed watermark move on a question-free report leaves the board as it was"; else no "a failed watermark move on a question-free report leaves the board as it was"; fi
+  PATH="$root/failmv:$PATH" AUTODREAM_QUESTION_STATE="$st4" AUTODREAM_NOTIFY_DRYRUN=1 bash "$QS" update "$root/2026-03-03.md" >/dev/null 2>&1
+  if cmp -s "$st4" "$root/w4.before"; then ok "a failed watermark move on a report with questions leaves the board as it was"; else no "a failed watermark move on a report with questions leaves the board as it was"; fi
   rm -rf "$root"
 }
 

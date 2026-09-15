@@ -126,11 +126,18 @@ LOCK="$STATE.lock"
 # state file, and deriving the watermark from that file alone then forgot it, so an older
 # rebuild afterwards counted as a new night (Codex review of 232c94c).
 LAST="$STATE.last"
-# Stage the watermark beside its final path before state changes, so a failed write refuses
-# the update instead of leaving state with no watermark, and the move into place is atomic
-# within one directory (Codex review of 4eea84d).
-stage_last()  { printf '%s\n' "$1" > "$LAST.tmp" 2>/dev/null; }
-commit_last() { mv -f "$LAST.tmp" "$LAST" 2>/dev/null; }
+# Advance the watermark BEFORE state changes, and refuse the update when it fails. The two
+# files cannot change together, so the order decides which failure is safe. A state write
+# that fails after the watermark leaves last night's board, as a night skipped on a held
+# lock does. A state change under the old watermark lets an older rebuild recreate a streak
+# (Codex reviews of 4eea84d and 600e6dd). The write goes to a temp file and moves into
+# place in one directory, so a reader never sees a partial date.
+advance_last() {
+  if printf '%s\n' "$1" > "$LAST.tmp" 2>/dev/null && mv -f "$LAST.tmp" "$LAST" 2>/dev/null; then return 0; fi
+  rm -f "$LAST.tmp" 2>/dev/null
+  echo "question-streaks: cannot write the watermark $LAST; leaving streaks untouched"
+  return 1
+}
 acquire_lock() {
   local i=0
   while ! mkdir "$LOCK" 2>/dev/null; do
@@ -203,14 +210,11 @@ cmd_update() {
     return 0
   fi
 
+  mkdir -p "$(dirname "$STATE")" 2>/dev/null || true
   if [ "${n:-0}" -eq 0 ]; then
-    if ! stage_last "$date"; then
-      echo "question-streaks: cannot write the watermark $LAST; leaving streaks untouched"
-      return 0
-    fi
+    advance_last "$date" || return 0
     echo "question-streaks: no open questions in $date; clearing $(nlines "$STATE") streak(s)"
     : > "$STATE" 2>/dev/null || echo "question-streaks: could not clear $STATE (continuing)"
-    commit_last || echo "question-streaks: could not move the watermark into place at $LAST (continuing)"
     return 0
   fi
 
@@ -234,13 +238,8 @@ cmd_update() {
     fi
   done < "$tmp/titles"
 
-  mkdir -p "$(dirname "$STATE")" 2>/dev/null || true
-  if ! stage_last "$date"; then
-    echo "question-streaks: cannot write the watermark $LAST; leaving streaks untouched"
-    return 0
-  fi
-  cp "$tmp/next" "$STATE" 2>/dev/null || { rm -f "$LAST.tmp"; echo "question-streaks: could not write $STATE (continuing)"; return 0; }
-  commit_last || echo "question-streaks: could not move the watermark into place at $LAST (continuing)"
+  advance_last "$date" || return 0
+  cp "$tmp/next" "$STATE" 2>/dev/null || { echo "question-streaks: could not write $STATE (continuing)"; return 0; }
 
   echo "question-streaks: $n question(s) in $date, $escalated at or past $ESCALATE_AT consecutive"
   [ "$escalated" -eq 0 ] && return 0
