@@ -1,0 +1,17 @@
+# Files this repo shares VERBATIM with its sibling autodream repo.
+#
+# bin/check-shared-drift.sh compares each one's code (comments stripped) against the
+# sibling checkout and fails when they differ. A file belongs here only when the two
+# copies are meant to stay identical forever — a self-contained helper with no
+# cc-vs-omp-specific logic. Everything else in bin/ has legitimately diverged, most of
+# all run.sh, and listing it here would just train people to ignore the check.
+#
+# Measured 2026-09-15 with comments stripped: these four were byte-identical; every other
+# shared filename differed by 8 to 1009 code lines.
+#
+# To remove a file: delete its line AND say why in CLAUDE.md. Divergence is a decision,
+# not an accident, and the next person needs to know which one it was.
+bin/cookie-cadence.sh
+bin/make-notifier.sh
+bin/overlap-stats.sh
+bin/x-bookmarks.sh

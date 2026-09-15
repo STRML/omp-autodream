@@ -475,6 +475,43 @@ The suite pins `AUTODREAM_CONFIG` into its sandbox now that `run.sh` sources the
 
 `tests/review-cmux.sh` covers `bin/review.sh`'s `AUTODREAM_TRIAGE_SURFACE=cmux` launch path (the morning review job's workspace popup) with a mock cmux binary — no real workspace ever spawns. It pins the same-day dedup marker contract against the report: first trigger opens and stamps a confirmed token (claim dir + `.confirmed` sibling), a same-day same-digest trigger is deduped, `--force` bypasses the marker, a failed create releases the claim and exits non-zero, the marker binds to the report content digest (a rebuilt report opens again), stale claims and tokens >14 days get reaped, a confirmed marker survives the reclaim grace window while an abandoned (unconfirmed, old) claim is reclaimed and a young unconfirmed claim suppresses concurrent triggers, the round-1 legacy `review-launched-$DATE` marker is migrated, a headless (non-TTY) run with missing cmux fails non-zero instead of falling back to a headless inline claude, and a logs dir that can't be created fails loudly. Run it after any change to the cmux branch of review.sh.
 
+## The sibling repo, and the fix that lands in only one of them
+
+This repo has a twin: **cc-autodream**, the Claude Code original this one was ported from.
+Both are checked out on this host and **both installs run nightly** —
+`~/.omp/agent/autodream` off this repo, `~/.claude/autodream` off that one. Most of the
+code has genuinely diverged; measured 2026-09-15 with comments stripped, `run.sh` differs
+by 1009 code lines, `review.sh` by 93, `session-stats.sh` by 70. That is the port doing
+its job, and those files should differ.
+
+Four helpers are byte-identical by intent, and they are listed in
+`shared-with-sibling.txt`:
+
+```
+bin/cookie-cadence.sh   bin/make-notifier.sh   bin/overlap-stats.sh   bin/x-bookmarks.sh
+```
+
+A fix to any of those is half a fix until it lands in both. That is not hypothetical. On
+2026-09-11 the X bookmarks queryId walk was fixed *here* after X moved to 16-character
+webpack chunk hashes (see "The bundle rotation that actually happened"); the identical
+file in cc-autodream was never touched. That install kept failing every night, its
+reports said `x_queryid_source: failed` ten nights running and raised it as an open
+question six times, and it took the user noticing. **Both repos' test suites passed the
+entire time**, because each was internally consistent — which is precisely why no in-repo
+test could ever have caught it.
+
+`bin/check-shared-drift.sh` now compares those files against the sibling checkout and
+`tests/run-all.sh` runs it last. It strips comments before comparing, because each repo
+dates its own incident notes and a check that fired on prose would be disabled within a
+week; what must not differ is what runs. With no sibling on disk it prints SKIPPED and
+exits 0 **loudly**, naming the path it looked for — the same rule as `overlap_measured`
+and `stats_sidecars_unparseable`: a degraded measurement says so rather than reading as a
+pass. It is verified by re-introducing the real regression, not by a fixture.
+
+The habit that generalizes: **a review finding is a class, not a site.** Before fixing
+anything under `bin/`, check whether the sibling ships the same file. One `grep` on
+2026-09-11 would have saved four failing nights in the other install.
+
 ## Gotchas (host environment)
 
 - The Claude Code sandbox denies writes under `~/.claude/` (including `rm` of symlinks/findings); those operations need the sandbox disabled.

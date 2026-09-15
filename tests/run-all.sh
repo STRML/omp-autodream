@@ -2626,6 +2626,19 @@ test_changelog_multi_source
 test_changelog_refuses_foreign_cache_dir
 test_changelog_single_remote_suppresses_defaults
 
+# Cross-repo drift, last. It is not a unit test — it inspects the sibling checkout, so it
+# can only run on a machine holding both — but it belongs in the same command as the rest,
+# because the failure it catches is one no amount of in-repo testing can see. Both repos
+# passed their own suites for the four nights cc-autodream's bookmark walk was broken.
+# SKIPPED (no sibling) exits 0 and says so; drift exits 1 and counts as a failure here.
+echo
+echo "# cross-repo: shared files must not drift from the sibling autodream repo"
+if bash "$REPO/bin/check-shared-drift.sh"; then
+  ok "shared files match the sibling repo (or the check skipped and said so)"
+else
+  no "shared files have drifted from the sibling repo"
+fi
+
 echo
 echo "----------------------------------------"
 echo "passed: $pass   failed: $fail"
