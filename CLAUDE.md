@@ -553,6 +553,19 @@ Four decisions in it are load-bearing:
   value and the escalation would never fire again — the same class of bug as a broken
   sidecar reading as a real measurement.
 
+Three details the Codex review of `232c94c` found, each with a test:
+
+- **The store is the install's.** A bare run of the helper (`status`, `clear`, or the
+  early empty-night path in `run.sh`, which runs before `AUTODREAM_DIR` is exported)
+  resolves its install dir from its own symlink, the way `run.sh` does. It used to fall
+  back to `~/.claude/autodream` and clear a store nobody reads. `run.sh` also passes
+  `AUTODREAM_DIR` at both call sites.
+- **The watermark survives an empty board.** The newest counted date lives in
+  `question-streaks.tsv.last`, because a question-free report empties the state file and
+  the watermark used to go with it, letting an older rebuild count as a new night.
+- **`clear` takes the same lock as `update`**, and fails loudly when it cannot, so an
+  update that already read the old state cannot write a cleared streak back.
+
 Threshold is `AUTODREAM_QUESTION_ESCALATE_AT` (default 3). `question-streaks.sh status`
 prints the current streaks; `clear all|<key>` forgets one after you have acted on it.
 

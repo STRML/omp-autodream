@@ -99,6 +99,12 @@ while IFS= read -r rel; do
     echo "DRIFT  $rel — missing on one side (this: $([ -f "$mine" ] && echo yes || echo no), sibling: $([ -f "$theirs" ] && echo yes || echo no))"
     missing=$(( missing + 1 )); drift=$(( drift + 1 )); continue
   fi
+  # strip_comments hides read errors, so two unreadable files used to strip to two empty
+  # outputs and compare equal (Codex review of 232c94c). Unread is unverified: call it drift.
+  if [ ! -r "$mine" ] || [ ! -r "$theirs" ]; then
+    echo "DRIFT  $rel — unreadable on one side (this: $([ -r "$mine" ] && echo yes || echo no), sibling: $([ -r "$theirs" ] && echo yes || echo no))"
+    drift=$(( drift + 1 )); continue
+  fi
   strip_comments "$mine"   > "$TMP/a"
   strip_comments "$theirs" > "$TMP/b"
   checked=$(( checked + 1 ))

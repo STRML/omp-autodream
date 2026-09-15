@@ -1246,7 +1246,7 @@ EOF
     # it was not. The early return below is why this cannot live at the usual call
     # site next to notify.sh.
     if [ -x "$AUTODREAM_DIR/question-streaks.sh" ]; then
-      "$AUTODREAM_DIR/question-streaks.sh" update "$REPORT_PATH" "$FINDINGS_DIR" \
+      env AUTODREAM_DIR="$AUTODREAM_DIR" "$AUTODREAM_DIR/question-streaks.sh" update "$REPORT_PATH" "$FINDINGS_DIR" \
         || log "question-streaks returned non-zero (continuing)"
     fi
     return 0
@@ -2064,7 +2064,7 @@ PY
     # asked six times across ten failing nights, each night's banner identical to the last,
     # and nothing moved until the user noticed by accident. Never fatal; it is bookkeeping.
     if [ -x "$AUTODREAM_DIR/question-streaks.sh" ]; then
-      "$AUTODREAM_DIR/question-streaks.sh" update "$REPORT_PATH" "$FINDINGS_DIR" \
+      env AUTODREAM_DIR="$AUTODREAM_DIR" "$AUTODREAM_DIR/question-streaks.sh" update "$REPORT_PATH" "$FINDINGS_DIR" \
         || log "question-streaks returned non-zero (continuing)"
     fi
 

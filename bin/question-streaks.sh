@@ -65,6 +65,16 @@
 # still escalating tomorrow.
 set -uo pipefail
 
+# install.sh links this script into the install's own AUTODREAM_DIR, so a bare invocation
+# (status, clear, or run.sh's early empty-night path) finds the store there, the same way
+# run.sh finds its install dir. The legacy ~/.claude/autodream stays the last resort
+# (Codex review of 232c94c).
+if [ -z "${AUTODREAM_DIR:-}" ]; then
+  self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+  if [ -n "$self_dir" ] && { [ -f "$self_dir/config" ] || [ -f "$self_dir/l1-no-advisor.yml" ]; }; then
+    AUTODREAM_DIR="$self_dir"
+  fi
+fi
 AUTODREAM_DIR="${AUTODREAM_DIR:-$HOME/.claude/autodream}"
 STATE="${AUTODREAM_QUESTION_STATE:-$AUTODREAM_DIR/question-streaks.tsv}"
 ESCALATE_AT="${AUTODREAM_QUESTION_ESCALATE_AT:-3}"
@@ -112,6 +122,10 @@ titles_of() { # $1=report
 # than blocking — a missed increment costs one night of escalation latency, while a
 # bookkeeping helper that hangs would hold up the pipeline behind it.
 LOCK="$STATE.lock"
+# The newest counted report date, kept beside the state. A question-free report empties the
+# state file, and deriving the watermark from that file alone then forgot it, so an older
+# rebuild afterwards counted as a new night (Codex review of 232c94c).
+LAST="$STATE.last"
 acquire_lock() {
   local i=0
   while ! mkdir "$LOCK" 2>/dev/null; do
@@ -149,7 +163,8 @@ cmd_update() {
 
   # Refuse to go backwards. Rebuilding an old date would otherwise drop every streak that
   # old report does not mention and rewrite the live state with history.
-  local newest; newest=$(awk -F'\t' 'NF>=4 {print $4}' "$STATE" 2>/dev/null | sort | tail -1)
+  local newest; newest=$( { awk -F'\t' 'NF>=4 {print $4}' "$STATE" 2>/dev/null; cat "$LAST" 2>/dev/null; } \
+    | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' | sort | tail -1)
   if [ -n "$newest" ] && [ "$date" \< "$newest" ]; then
     echo "question-streaks: $date is older than the last counted report ($newest); leaving streaks untouched"
     return 0
@@ -180,6 +195,7 @@ cmd_update() {
   if [ "${n:-0}" -eq 0 ]; then
     echo "question-streaks: no open questions in $date; clearing $(nlines "$STATE") streak(s)"
     : > "$STATE" 2>/dev/null || echo "question-streaks: could not clear $STATE (continuing)"
+    printf '%s\n' "$date" > "$LAST" 2>/dev/null || true
     return 0
   fi
 
@@ -205,6 +221,7 @@ cmd_update() {
 
   mkdir -p "$(dirname "$STATE")" 2>/dev/null || true
   cp "$tmp/next" "$STATE" 2>/dev/null || { echo "question-streaks: could not write $STATE (continuing)"; return 0; }
+  printf '%s\n' "$date" > "$LAST" 2>/dev/null || true
 
   echo "question-streaks: $n question(s) in $date, $escalated at or past $ESCALATE_AT consecutive"
   [ "$escalated" -eq 0 ] && return 0
@@ -257,6 +274,14 @@ cmd_status() {
 cmd_clear() {
   local what="${1:?usage: question-streaks.sh clear all|<key>}"
   [ -s "$STATE" ] || { echo "question-streaks: nothing to clear"; return 0; }
+  # Same lock as update. Without it an update that already read the old state writes it
+  # back after this clear, and the streak the operator just cleared returns (Codex review
+  # of 232c94c).
+  if ! acquire_lock; then
+    echo "question-streaks: FAILED to clear: another run holds $LOCK" >&2
+    return 1
+  fi
+  trap 'release_lock' RETURN
   if [ "$what" = "all" ]; then
     if : > "$STATE" 2>/dev/null; then echo "question-streaks: cleared all streaks"; return 0; fi
     echo "question-streaks: FAILED to clear $STATE" >&2; return 1

@@ -2445,6 +2445,13 @@ test_shared_drift_check_from_a_worktree(){
   out=$(env -u AUTODREAM_SIBLING_REPO bash "$T/elsewhere/bin/check-shared-drift.sh" 2>&1); rc=$?
   assert_eq "$rc" "0" "an unrecognised checkout name skips instead of failing the suite"
   case "$out" in *SKIPPED*) ok "and says it skipped" ;; *) no "and says it skipped (got [$out])" ;; esac
+  # Two unreadable copies used to strip to two empty files and compare equal (Codex review
+  # of 232c94c). A file the check cannot read has not been verified, so it is drift.
+  printf 'echo same\n' > "$T/cc-autodream/bin/a.sh"
+  chmod 000 "$T/omp-autodream-feature/bin/a.sh" "$T/cc-autodream/bin/a.sh"
+  env -u AUTODREAM_SIBLING_REPO bash "$T/omp-autodream-feature/bin/check-shared-drift.sh" >/dev/null 2>&1; rc=$?
+  chmod 644 "$T/omp-autodream-feature/bin/a.sh" "$T/cc-autodream/bin/a.sh"
+  assert_eq "$rc" "1" "an unreadable shared file is drift, not a match"
   rm -rf "$T"
 }
 
@@ -2680,6 +2687,55 @@ test_changelog_multi_source
 test_changelog_refuses_foreign_cache_dir
 test_changelog_single_remote_suppresses_defaults
 
+test_question_streaks_state_lives_with_the_install(){
+  echo "# question streaks: the store is the install's, a cleared board keeps its watermark, clear takes the lock (Codex review of 232c94c)"
+  local root; root=$(setup_env)
+  local QS="$REPO/bin/question-streaks.sh"
+  [ -x "$QS" ] || { no "question-streaks.sh executable"; return 0; }
+  mkdir -p "$root/home"
+  : > "$root/autodream/config"
+  local f; for f in "$REPO"/bin/*.sh; do ln -sf "$f" "$root/autodream/$(basename "$f")"; done
+  printf 'abc123def456\t2\t2019-12-30\t2019-12-31\tStale question?\n' > "$root/autodream/question-streaks.tsv"
+
+  # Run with no AUTODREAM_DIR at all, the documented no-environment invocation. The helper
+  # used to fall back to ~/.claude/autodream and never see this install's store.
+  local out
+  out=$(env -u AUTODREAM_DIR -u AUTODREAM_QUESTION_STATE HOME="$root/home" bash "$root/autodream/question-streaks.sh" status 2>&1)
+  case "$out" in *"Stale question?"*) ok "status run through the install link reads the install's store" ;; *) no "status run through the install link reads the install's store (got: $out)" ;; esac
+
+  # A night with no sessions writes a question-free report and must clear that store, even
+  # though run.sh has not exported AUTODREAM_DIR yet on that early path.
+  env -u AUTODREAM_DIR HOME="$root/home" AUTODREAM_CHANGELOG=0 OMP_BIN="$MOCK" \
+    AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
+    AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_NOTIFY_DRYRUN=1 \
+    PROJECTS_DIR="$root/projects" DREAMS_DIR="$root/dreams" \
+    bash "$root/autodream/run.sh" "$DATE" > "$root/run.out" 2>&1
+  assert_file "$root/dreams/$DATE.md" "precondition: the empty night wrote its report"
+  assert_eq "$(wc -l < "$root/autodream/question-streaks.tsv" | tr -d ' ')" "0" "the empty night clears the install's streak store"
+
+  # Clearing the board must not erase the watermark: rebuilding an older report afterwards
+  # would otherwise re-enter history as a new night and grow a false streak.
+  local st="$root/w.tsv"; : > "$st"
+  qsw(){ AUTODREAM_QUESTION_STATE="$st" AUTODREAM_NOTIFY_DRYRUN=1 bash "$QS" "$@" 2>&1; }
+  printf '## Open questions for the user\n\n1. **Recurring?** body\n\n<!-- autodream:open-questions=1 -->\n' > "$root/2026-03-01.md"
+  printf '## Open questions for the user\n\nNone.\n\n<!-- autodream:open-questions=0 -->\n' > "$root/2026-03-02.md"
+  qsw update "$root/2026-03-01.md" >/dev/null
+  qsw update "$root/2026-03-02.md" >/dev/null
+  out=$(qsw update "$root/2026-03-01.md")
+  case "$out" in *"older than the last counted report"*) ok "an older rebuild after a cleared board is still refused" ;; *) no "an older rebuild after a cleared board is still refused (got: $out)" ;; esac
+  assert_eq "$(wc -l < "$st" | tr -d ' ')" "0" "and the cleared board stays clear"
+
+  # clear takes the same lock as update, or an update that already read the old state puts
+  # the cleared streak back when it writes.
+  printf 'k\t1\t2026-03-03\t2026-03-03\tHeld?\n' > "$st"
+  mkdir "$st.lock"
+  AUTODREAM_QUESTION_STATE="$st" bash "$QS" clear all >/dev/null 2>&1; local rc=$?
+  rmdir "$st.lock" 2>/dev/null
+  assert_eq "$rc" "1" "clear fails while an update holds the lock"
+  assert_eq "$(wc -l < "$st" | tr -d ' ')" "1" "and leaves the state for that update"
+  rm -rf "$root"
+}
+
 test_question_streaks(){
   echo "# question streaks: count repeats across reports and escalate the stale ones"
   local root; root=$(setup_env)
@@ -2796,6 +2852,7 @@ test_question_streaks_reruns_and_mismatch(){
 
 test_question_streaks
 test_question_streaks_reruns_and_mismatch
+test_question_streaks_state_lives_with_the_install
 
 # Cross-repo drift, last. It is not a unit test — it inspects the sibling checkout, so it
 # can only run on a machine holding both — but it belongs in the same command as the rest,
