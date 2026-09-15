@@ -916,15 +916,21 @@ test_changelog_refuses_foreign_cache_dir(){
   # whether or not the guard is there, which is how the first version of this check passed
   # with the guard removed.
   mkdir -p "$ad/cache"
+  # A third foreign dir reached through a symlink inside the cache: the path string has no
+  # `..` and starts with the cache prefix, but rm -rf follows the intermediate link
+  # (Codex review of 0129fc0).
+  local linked="$root/linked"; mkdir -p "$linked/old-repo"; printf 'keep me three\n' > "$linked/old-repo/notes.txt"
+  ln -s "$linked" "$ad/cache/link"
 
   export AUTODREAM_CHANGELOG=1 AUTODREAM_CHANGELOG_MAX_LINES=abc
-  export AUTODREAM_CHANGELOG_SOURCES="Alpha|$a|CHANGELOG.md|$root/cache/a;Typo|$a|CHANGELOG.md|$precious;Dots|$a|CHANGELOG.md|$ad/cache/../../sneaky"
+  export AUTODREAM_CHANGELOG_SOURCES="Alpha|$a|CHANGELOG.md|$root/cache/a;Typo|$a|CHANGELOG.md|$precious;Dots|$a|CHANGELOG.md|$ad/cache/../../sneaky;Link|$a|CHANGELOG.md|$ad/cache/link/old-repo"
   run_dream "$root"
   unset AUTODREAM_CHANGELOG AUTODREAM_CHANGELOG_SOURCES AUTODREAM_CHANGELOG_MAX_LINES
 
   local cw="$(fdir "$root")/changelog-window.md"
   assert_file "$precious/notes.txt"          "the non-git directory and its contents survive"
   assert_file "$sneaky/notes.txt"            "a path that climbs out of the cache with .. is not treated as the cache"
+  assert_file "$linked/old-repo/notes.txt"   "a path through a symlink inside the cache is not treated as the cache"
   assert_grep "$cw" 'is a non-empty directory that is not a git clone' "its section says why it was skipped"
   assert_grep "$cw" 'Alpha in-window'        "the other source is unaffected"
   assert_grep "$root/run.out" 'AUTODREAM_CHANGELOG_MAX_LINES=.abc. is not a positive integer; using 400' "a non-numeric cap falls back to the default instead of disabling it"
@@ -2384,6 +2390,22 @@ test_no_curl_does_not_defer_a_healthy_run(){
   rm -rf "$root"
 }
 
+test_skill_fields_dropped_without_a_sidecar(){
+  echo "# a session with no stats sidecar keeps no worker-written skill fields (Codex review of 0129fc0)"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  # mock-claude writes skills_invoked:[] itself. With no sidecar to overwrite it, that list
+  # is the model's guess, and L2 would rank it as a mechanical count.
+  export AUTODREAM_STATS_BIN="$root/does-not-exist.sh"
+  run_dream "$root"
+  unset AUTODREAM_STATS_BIN
+  local h; h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
+  local fj="$(fdir "$root")/$h.json"
+  assert_eq "$(jq -r 'has("skills_invoked") or has("skills_invoked_count") or has("skills_invoked_counts") or has("skills_authored")' "$fj")" "false" \
+    "the unmeasured skill fields are removed rather than believed"
+  assert_eq "$(jq -r '.findings | type' "$fj")" "array" "the rest of the findings JSON survives"
+  rm -rf "$root"
+}
+
 test_skill_fields_are_enforced_from_the_sidecar(){
   echo "# a worker that ignores the precomputed skill stats gets overwritten, not believed"
   local root; root=$(setup_env)
@@ -2569,6 +2591,7 @@ test_missing_curl_is_not_read_as_an_outage
 test_a_transient_outage_is_ridden_out_not_deferred
 test_no_curl_does_not_defer_a_healthy_run
 test_skill_fields_are_enforced_from_the_sidecar
+test_skill_fields_dropped_without_a_sidecar
 test_malformed_worker_output_is_a_failure_with_its_evidence
 test_findings_must_be_an_array_not_merely_present
 test_rounds_used_counts_rounds_that_dispatched

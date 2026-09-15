@@ -556,6 +556,17 @@ changelog_sources() {
     "OMP" "https://github.com/STRML/oh-my-pi.git" "packages/coding-agent/CHANGELOG.md" "$AUTODREAM_DIR/cache/oh-my-pi"
 }
 
+# True only when $1's parent directory resolves, symlinks and all, inside $AUTODREAM_DIR/cache.
+# A `..` anywhere is refused before resolving, so the basename cannot climb out either.
+cache_owns() {
+  local cache parent
+  case "$1" in *..*) return 1 ;; esac
+  cache=$(cd "$AUTODREAM_DIR/cache" 2>/dev/null && pwd -P) || return 1
+  parent=$(cd "$(dirname "$1")" 2>/dev/null && pwd -P) || return 1
+  case "$parent/" in "$cache"/*) return 0 ;; esac
+  return 1
+}
+
 # Append one source's section to $5. Never returns non-zero — a source that cannot be
 # reached says so in its own section and the run carries on.
 #
@@ -577,13 +588,12 @@ changelog_one() { # $1=name $2=remote $3=path $4=repo $5=out
     # Only a cache this install owns may be cleared. AUTODREAM_CHANGELOG_SOURCES names the
     # path, so a typo pointing at a real non-git directory must not be deleted to make room
     # for a clone (debate review of e95e2f2).
-    # The check is on the path as written, so a `..` component is never inside the cache:
-    # `$AUTODREAM_DIR/cache/../x` matches the prefix and would delete x. Outside the cache
-    # nothing is deleted at all; git clone accepts a missing or empty target directory.
-    case "$repo" in
-      *..*) ;;
-      "$AUTODREAM_DIR"/cache/*) rm -rf "$repo" ;;
-    esac
+    # The path as written proves nothing: `$AUTODREAM_DIR/cache/../x` matches the prefix,
+    # and so does `$AUTODREAM_DIR/cache/link/x` where link points elsewhere, and rm -rf
+    # follows both (Codex review of 0129fc0). Resolve the parent physically and compare
+    # that. Outside the cache nothing is deleted at all; git clone accepts a missing or
+    # empty target directory.
+    if cache_owns "$repo"; then rm -rf "$repo"; fi
     if [ -e "$repo" ] && [ -n "$(ls -A "$repo" 2>/dev/null)" ]; then
       log "changelog[$name]: $repo exists, is not a git repo and is outside $AUTODREAM_DIR/cache; refusing to delete it"
       printf '## %s\n\nCache path %s is a non-empty directory that is not a git clone; %s changes not checked this run.\n\n' "$name" "$repo" "$name" >> "$out"
@@ -1567,14 +1577,28 @@ PY
   # jq is already a hard dependency of this script, so this cannot silently degrade.
   # Absent sidecar keys leave the worker values alone, so a findings dir written by an
   # older runner is not rewritten with invented zeroes.
+  # An absent sidecar is different: compute_session_stats regenerates every sidecar each
+  # run, so a missing one means session-stats.sh failed for that session, and whatever
+  # skill fields the findings JSON carries are the worker's own guess. Those are removed,
+  # never kept, or L2 ranks them as mechanical counts (Codex review of 0129fc0).
   SKILLS_ENFORCED=0
+  SKILLS_DROPPED=0
   for fjson in "$FINDINGS_DIR"/*.json; do
     case "$fjson" in *.stats.json) continue ;; esac
     [ -s "$fjson" ] || continue
-    sidecar="${fjson%.json}.stats.json"
-    [ -s "$sidecar" ] || continue
     jq -e ".findings | arrays" "$fjson" >/dev/null 2>&1 || continue
+    sidecar="${fjson%.json}.stats.json"
     skilltmp="$fjson.skills.tmp"
+    if [ ! -s "$sidecar" ]; then
+      if jq 'del(.skills_invoked, .skills_invoked_count, .skills_invoked_counts, .skills_authored)' \
+          "$fjson" > "$skilltmp" 2>/dev/null && [ -s "$skilltmp" ]; then
+        mv "$skilltmp" "$fjson"
+        SKILLS_DROPPED=$((SKILLS_DROPPED + 1))
+      else
+        rm -f "$skilltmp"
+      fi
+      continue
+    fi
     if jq --slurpfile sc "$sidecar" '
           . as $f
           | (($sc[0]) // {}) as $st
@@ -1587,7 +1611,7 @@ PY
       rm -f "$skilltmp"
     fi
   done
-  log "enforced mechanical skill fields from sidecars on $SKILLS_ENFORCED findings file(s)"
+  log "enforced mechanical skill fields from sidecars on $SKILLS_ENFORCED findings file(s); removed unmeasured skill fields from $SKILLS_DROPPED with no sidecar"
 
   # ---- Self-audit stats: runtime telemetry only the runner can see ----
   # The aggregator can't observe its own machinery — which sessions were autodream's

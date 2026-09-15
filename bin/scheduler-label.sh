@@ -63,12 +63,14 @@ conflict=""
 # job renamed to a file without "autodream" in it: a name-based glob missed both.
 for plist in "$LA_DIR"/*.plist; do
   [ -e "$plist" ] || continue
+  l="$("$PLISTBUDDY" -c 'Print :Label' "$plist" 2>/dev/null)" || continue
   # .ondemand is autodream-now's transient sibling. It writes that plist to
   # $AUTODREAM_DIR rather than here, so this glob does not normally see one;
   # the skip is for a copy someone dropped in by hand, where adopting it would
-  # nest a second .ondemand suffix onto the label.
-  case "$plist" in *.ondemand.plist) continue ;; esac
-  l="$("$PLISTBUDDY" -c 'Print :Label' "$plist" 2>/dev/null)" || continue
+  # nest a second .ondemand suffix onto the label. It goes by Label, not filename:
+  # a foreign job holding the default label in backup.ondemand.plist is still a
+  # conflict (Codex review of 0129fc0).
+  case "$l" in *.ondemand) continue ;; esac
   if rdir="$(runner_dir_of "$plist")" && [ "$rdir" = "$TARGET_REAL" ]; then
     # Our own prior install. Keep its label so a re-install stays idempotent
     # even when that label is not the default one.

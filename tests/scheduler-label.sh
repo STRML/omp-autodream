@@ -171,6 +171,13 @@ make_plist "$DEFAULT.ondemand" "$OMP" >/dev/null
 run_sut "$OMP"
 assert_eq "$DEFAULT" "$SUT_OUT" "the .ondemand sibling is not adopted as the base label"
 
+# --- row: a foreign job holds the default label in a file named *.ondemand.plist
+# launchd keys a job by Label, so the filename proves nothing (Codex review of 0129fc0).
+reset_sandbox
+mv "$(make_plist "$DEFAULT" "$CC")" "$LA/backup.ondemand.plist"
+run_sut "$OMP"
+assert_eq "3" "$SUT_RC" "a foreign default-label job is a conflict whatever its filename"
+
 # --- row: the -review sibling is skipped -----------------------------------
 reset_sandbox
 make_review_plist "com.$USER_SLUG.autodream-review" "$CC"
