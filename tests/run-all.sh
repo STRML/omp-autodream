@@ -3247,6 +3247,15 @@ test_question_streaks_reruns_and_mismatch(){
   AUTODREAM_QUESTION_STATE="$root/num.tsv" bash "$QS" clear 89709551468 >/dev/null 2>&1; krc=$?
   assert_eq "$krc" "1" "clear with a key that only equals a row key numerically fails"
   if cmp -s "$root/num.tsv" "$root/num.before"; then ok "and does not clear the numerically equal streak"; else no "and does not clear the numerically equal streak"; fi
+  # awk -v also decodes backslash escapes, so `\060...` became `0...` and matched a real key
+  # (Codex review of b67c2f1). A key is 12 lowercase hex characters; anything else is refused
+  # before awk sees it.
+  printf '#last\t2026-02-02\n080dd5de4c18\t2\t2026-02-01\t2026-02-02\tEscaped?\n' > "$root/esc.tsv"
+  cp "$root/esc.tsv" "$root/esc.before"
+  out=$(AUTODREAM_QUESTION_STATE="$root/esc.tsv" bash "$QS" clear '\06080dd5de4c18' 2>&1); krc=$?
+  assert_eq "$krc" "1" "clear with an escaped key that decodes to a real key fails"
+  case "$out" in *"not a streak key"*) ok "and says it is not a streak key" ;; *) no "and says it is not a streak key (got: $out)" ;; esac
+  if cmp -s "$root/esc.tsv" "$root/esc.before"; then ok "and does not clear the streak the escape decodes to"; else no "and does not clear the streak the escape decodes to"; fi
 
   # clear must not claim success it did not achieve.
   chmod 500 "$root" 2>/dev/null

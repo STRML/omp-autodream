@@ -321,6 +321,14 @@ cmd_status() {
 # is still on disk means tomorrow's escalation looks like the feature is broken.
 cmd_clear() {
   local what="${1:?usage: question-streaks.sh clear all|<key>}"
+  # A key is exactly what key_of prints: 12 lowercase hex characters. Refusing anything else
+  # before awk sees it closes both ways a wrong key reached a real row: awk comparing
+  # numeric-looking keys as numbers, and awk -v decoding backslash escapes (Codex reviews of
+  # 5f7ddaa and b67c2f1).
+  if [ "$what" != "all" ] && ! [[ "$what" =~ ^[0-9a-f]{12}$ ]]; then
+    echo "question-streaks: FAILED to clear: '$what' is not a streak key (12 lowercase hex characters; status lists them)" >&2
+    return 1
+  fi
   # Same lock as update. Without it an update that already read the old state writes it
   # back after this clear, and the streak the operator just cleared returns (Codex review
   # of 232c94c). The lock comes BEFORE the empty check: an update holding it may be about
