@@ -47,7 +47,7 @@ classify_failure() {
   sep='[[:space:]_-]'
 
   if printf '%s\n' "$worker_text" \
-      | grep -Eiq "context${sep}*(length|limit|window|size)|too${sep}+(long|large)|tokens?${sep}+limit|max(imum)?${sep}+(context|tokens?)|exceed(s|ed)?${sep}+(the${sep}+)?(context|token)"; then
+      | grep -Eiq "context${sep}*(length|limit|window|size)|too${sep}+(long|large)|tokens?${sep}+limit|max(imum)?${sep}+(input${sep}+)?(context|tokens?|length)|input${sep}+(length|tokens?)|exceed(s|ed)?${sep}+(the${sep}+)?(context|token)"; then
     printf '%s\n' size
     return 0
   fi
@@ -57,7 +57,7 @@ classify_failure() {
   # "HTTP status code was 500"; otherwise the reason phrase has to say it.
   code='(429|401|403|5[0-9][0-9]|5xx)([^0-9]|$)'
   if printf '%s\n' "$worker_text" \
-      | grep -Eiq "(http(/[0-9.]+)?|status|code|error)([^0-9a-z]+(http|status|code|was|is|of|returned|with))*[^0-9a-z]{1,3}${code}|rate${sep}?limit|too${sep}+many${sep}+requests|overload|quota|unauthori[sz]ed|forbidden|service${sep}+unavailable|bad${sep}+gateway|gateway${sep}+time${sep}?out|internal${sep}+server${sep}+error|invalid${sep}+api${sep}+key|auth(entication)?${sep}+(error|failed|failure)|token${sep}+expired"; then
+      | grep -Eiq "(http(/[0-9.]+)?|status|code|error)([^0-9a-z]+(http|status|code|was|is|of|returned|with))*[^0-9a-z]{1,3}${code}|(^|[^0-9a-z])5xx([^0-9a-z]|$)|rate${sep}?limit|too${sep}+many${sep}+requests|overload|quota|unauthori[sz]ed|forbidden|service${sep}+unavailable|bad${sep}+gateway|gateway${sep}+time${sep}?out|internal${sep}+server${sep}+error|invalid${sep}+api${sep}+key|auth(entication|ori[sz]ation)?${sep}+(error|failed|failure)|token${sep}+expired"; then
     printf '%s\n' provider
     return 0
   fi

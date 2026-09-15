@@ -1740,6 +1740,11 @@ size|HTTP 500 context-limit exceeded
 size|HTTP 500 context_window exceeded
 size|HTTP 500 maximum tokens exceeded
 provider|HTTP status code was 500
+provider|upstream returned 5xx
+provider|authorization failed
+provider|authorisation error
+size|HTTP 500 maximum input length exceeded
+size|HTTP 500 input too long
 size|read 5200 bytes then exited
 size|read 520 bytes then exited
 size|worker timed out after 600s

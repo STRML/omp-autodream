@@ -438,6 +438,13 @@ status, code or error label, so `read 520 bytes` is not a 5xx; a bare code needs
 reason phrase (`503 Service Unavailable`). Words match with spaces, hyphens or
 underscores, so `prompt-too-long` stays size even beside an HTTP 500.
 
+The size and provider word lists are best-effort and will never be complete: five of the
+seven review rounds on PR #26 found another phrasing. That is acceptable because of the default.
+A wording neither list knows lands in `size`, which is the owner's decision (2026-09-15):
+a session is only counted once its byte size is over the threshold, so an unexplained
+failure there is a size failure. Add a wording when a real `.err` shows one, with a
+matrix row in `test_failure_class_provider_matrix`; do not grow the lists speculatively.
+
 `run.sh` and `bin/oversized-gate.sh` look for the classifier next to themselves, then next
 to the file their symlink points at, then in `AUTODREAM_DIR`. An install made before this
 file existed has a link for every other script but not this one, and updating the
