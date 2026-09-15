@@ -908,17 +908,36 @@ test_changelog_refuses_foreign_cache_dir(){
       git commit -q -m 'alpha release' )
   local precious="$root/precious"; mkdir -p "$precious"; printf 'keep me\n' > "$precious/notes.txt"
 
+  # A second foreign dir reached through `..` from inside the cache prefix: it must not
+  # count as a cache path just because the string starts with one.
+  local sneaky="$root/sneaky"; mkdir -p "$sneaky"; printf 'keep me too\n' > "$sneaky/notes.txt"
+  local ad; ad=$(cd "$root/autodream" 2>/dev/null && pwd) || ad="$root/autodream"
+  # The cache dir must exist, or `cache/..` never resolves and rm -rf is a silent no-op
+  # whether or not the guard is there, which is how the first version of this check passed
+  # with the guard removed.
+  mkdir -p "$ad/cache"
+
   export AUTODREAM_CHANGELOG=1 AUTODREAM_CHANGELOG_MAX_LINES=abc
-  export AUTODREAM_CHANGELOG_SOURCES="Alpha|$a|CHANGELOG.md|$root/cache/a;Typo|$a|CHANGELOG.md|$precious"
+  export AUTODREAM_CHANGELOG_SOURCES="Alpha|$a|CHANGELOG.md|$root/cache/a;Typo|$a|CHANGELOG.md|$precious;Dots|$a|CHANGELOG.md|$ad/cache/../../sneaky"
   run_dream "$root"
   unset AUTODREAM_CHANGELOG AUTODREAM_CHANGELOG_SOURCES AUTODREAM_CHANGELOG_MAX_LINES
 
   local cw="$(fdir "$root")/changelog-window.md"
   assert_file "$precious/notes.txt"          "the non-git directory and its contents survive"
+  assert_file "$sneaky/notes.txt"            "a path that climbs out of the cache with .. is not treated as the cache"
   assert_grep "$cw" 'is a non-empty directory that is not a git clone' "its section says why it was skipped"
   assert_grep "$cw" 'Alpha in-window'        "the other source is unaffected"
   assert_grep "$root/run.out" 'AUTODREAM_CHANGELOG_MAX_LINES=.abc. is not a positive integer; using 400' "a non-numeric cap falls back to the default instead of disabling it"
-  rm -rf "$root"
+
+  # Second run reuses the fixture remote $a, so $root is removed only after it.
+  local root2; root2=$(setup_env); mk_session "$root2" sess1
+  export AUTODREAM_CHANGELOG=1 AUTODREAM_CHANGELOG_MAX_LINES=00
+  export AUTODREAM_CHANGELOG_SOURCES="Alpha|$a|CHANGELOG.md|$root2/cache/a"
+  run_dream "$root2"
+  unset AUTODREAM_CHANGELOG AUTODREAM_CHANGELOG_SOURCES AUTODREAM_CHANGELOG_MAX_LINES
+  assert_grep "$root2/run.out" 'AUTODREAM_CHANGELOG_MAX_LINES=.00. is not a positive integer; using 400' "a zero written as 00 is refused like 0"
+  assert_grep "$(fdir "$root2")/changelog-window.md" 'Alpha in-window' "and the section still carries its content"
+  rm -rf "$root2" "$root"
 }
 
 test_changelog_single_remote_suppresses_defaults(){

@@ -577,16 +577,18 @@ changelog_one() { # $1=name $2=remote $3=path $4=repo $5=out
     # Only a cache this install owns may be cleared. AUTODREAM_CHANGELOG_SOURCES names the
     # path, so a typo pointing at a real non-git directory must not be deleted to make room
     # for a clone (debate review of e95e2f2).
+    # The check is on the path as written, so a `..` component is never inside the cache:
+    # `$AUTODREAM_DIR/cache/../x` matches the prefix and would delete x. Outside the cache
+    # nothing is deleted at all; git clone accepts a missing or empty target directory.
     case "$repo" in
+      *..*) ;;
       "$AUTODREAM_DIR"/cache/*) rm -rf "$repo" ;;
-      *)
-        if [ -e "$repo" ] && [ -n "$(ls -A "$repo" 2>/dev/null)" ]; then
-          log "changelog[$name]: $repo exists, is not a git repo and is outside $AUTODREAM_DIR/cache; refusing to delete it"
-          printf '## %s\n\nCache path %s is a non-empty directory that is not a git clone; %s changes not checked this run.\n\n' "$name" "$repo" "$name" >> "$out"
-          return 0
-        fi
-        rm -rf "$repo" ;;
     esac
+    if [ -e "$repo" ] && [ -n "$(ls -A "$repo" 2>/dev/null)" ]; then
+      log "changelog[$name]: $repo exists, is not a git repo and is outside $AUTODREAM_DIR/cache; refusing to delete it"
+      printf '## %s\n\nCache path %s is a non-empty directory that is not a git clone; %s changes not checked this run.\n\n' "$name" "$repo" "$name" >> "$out"
+      return 0
+    fi
     log "changelog[$name]: cloning $remote -> $repo..."
     # blob:none + sparse keeps a monorepo clone cheap — oh-my-pi carries Cargo, bazel and
     # a node_modules tree, and we want one markdown file out of it. Blobs for the path we
@@ -626,11 +628,17 @@ changelog_one() { # $1=name $2=remote $3=path $4=repo $5=out
   local cap="${AUTODREAM_CHANGELOG_MAX_LINES:-400}" total
   # A non-numeric cap made the -gt test below error out as false under set -u without -e,
   # so the section went out uncapped (debate review of e95e2f2). Fall back to the default.
+  # Compare numerically, not by pattern: "00" is all digits and still zero, and head -n 00
+  # then fails and drops the section's content.
+  local cap_ok=no
   case "$cap" in
-    ''|*[!0-9]*|0)
-      log "changelog[$name]: AUTODREAM_CHANGELOG_MAX_LINES='$cap' is not a positive integer; using 400"
-      cap=400 ;;
+    ''|*[!0-9]*) ;;
+    *) [ "$cap" -gt 0 ] 2>/dev/null && cap_ok=yes ;;
   esac
+  if [ "$cap_ok" = no ]; then
+    log "changelog[$name]: AUTODREAM_CHANGELOG_MAX_LINES='$cap' is not a positive integer; using 400"
+    cap=400
+  fi
   total=$(printf '%s\n' "$added" | wc -l | tr -d ' ')
   if [ "${total:-0}" -gt "$cap" ]; then
     added=$(printf '%s\n' "$added" | head -n "$cap")
