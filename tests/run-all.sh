@@ -1736,6 +1736,10 @@ size|context-length exceeded
 size|context length exceeded (HTTP 500)
 size|HTTP 500 prompt-too-long
 size|HTTP 500 token-limit exceeded
+size|HTTP 500 context-limit exceeded
+size|HTTP 500 context_window exceeded
+size|HTTP 500 maximum tokens exceeded
+provider|HTTP status code was 500
 size|read 5200 bytes then exited
 size|read 520 bytes then exited
 size|worker timed out after 600s
@@ -1748,6 +1752,22 @@ EOF
   # The exit-code line itself is ours, not the worker's: its seconds must not read as a 5xx.
   printf 'worker exit code: 1 after 503s\n--- worker stdout, last 40 lines ---\ndone\n' > "$dir/elapsed.err"
   assert_eq "$(classify_failure "$dir/elapsed.err")" "size" "the elapsed seconds on the exit-code line are not a status code"
+  # A worker's own "--- " separator is not one of run.sh's section markers; what follows it
+  # is still the worker's stdout (Codex review of 7eda1a8).
+  printf 'worker exit code: 1 after 9s\n--- worker stdout, last 40 lines ---\n--- retrying ---\n401 Unauthorized\n' > "$dir/separator.err"
+  assert_eq "$(classify_failure "$dir/separator.err")" "provider" "a worker-printed --- line does not end its stdout section"
+  # Lines run.sh itself writes are not the worker's output. The session path sits before the
+  # exit-code line, so a path with "quota" or "error-500" in it must not make a failure
+  # provider (Codex review of 7eda1a8).
+  printf 'Working...\nworker produced no findings JSON for /tmp/quota-budget/error-500.jsonl (incomplete run: omp exited without writing output)\nworker exit code: 1 after 9s\n--- worker stdout, last 40 lines ---\ndone\n' > "$dir/path.err"
+  assert_eq "$(classify_failure "$dir/path.err")" "size" "a session path run.sh records is not read as a provider refusal"
+  # The malformed-output branch dumps up to 2000 bytes of the worker's findings JSON, often
+  # with no trailing newline, so the session line lands on the same line as the dump.
+  printf 'worker wrote output with no usable .findings key; treating as a failure\n{"note":"HTTP 500 quota"}worker produced no findings JSON for /tmp/s.jsonl (incomplete run: omp exited without writing output)\nworker exit code: 1 after 9s\n--- worker stdout, last 40 lines ---\ndone\n' > "$dir/dump.err"
+  assert_eq "$(classify_failure "$dir/dump.err")" "size" "the dumped findings JSON is not read as a provider refusal"
+  # run.sh's own network note can follow the stdout section directly when no omp log was touched.
+  printf 'worker exit code: 1 after 9s\n--- worker stdout, last 40 lines ---\ndone\nno route to api.anthropic.com when this worker failed (curl http_code=503)\n' > "$dir/netnote.err"
+  assert_eq "$(classify_failure "$dir/netnote.err")" "size" "run.sh's network note after the stdout section is not worker output"
   rm -rf "$dir"
 }
 

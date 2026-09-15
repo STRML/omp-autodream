@@ -428,9 +428,12 @@ The general rule this is an instance of: a facet the report will reason about qu
 429/auth/5xx/overload/quota refusal without a size signature; and `size` for
 everything else, including context-limit signatures, timeouts, and other nonzero
 exits. The worker's own output is its stderr (the top of the `.err`, before the
-exit-code line) plus the captured stdout section. The exit-code line is excluded because
-its seconds can read as a status code, and the appended omp log is excluded because it
-may belong to a sibling worker. A number counts as a status code only after an HTTP,
+exit-code line) plus the captured stdout section. Every line `run.sh` writes itself is
+skipped by its exact text: the timeout note, the malformed-output dump, the session-path
+line, the exit-code line, the omp log tail and the network notes. A session path or a
+dumped findings JSON can say `quota` or `HTTP 500` with no provider refusing anything,
+and the omp log may belong to a sibling worker. The stdout section ends only at
+`run.sh`'s next marker, never at a `--- ` line the worker printed itself. A number counts as a status code only after an HTTP,
 status, code or error label, so `read 520 bytes` is not a 5xx; a bare code needs its
 reason phrase (`503 Service Unavailable`). Words match with spaces, hyphens or
 underscores, so `prompt-too-long` stays size even beside an HTTP 500.
