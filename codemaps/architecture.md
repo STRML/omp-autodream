@@ -32,6 +32,11 @@ bin/run.sh  TARGET_DATE
       │       (L2 has no file tools — no memory writes under OMP)
       │
       ├─ notify.sh → open-questions inbox file ($AUTODREAM_OPEN, default `open`)
+      │
+      └─ question-streaks.sh update → question-streaks.tsv
+            at AUTODREAM_QUESTION_ESCALATE_AT consecutive reports: a second banner
+            + findings/<date>/question-escalations.txt
+            (also called on the early no-sessions path, so a question-free night clears streaks)
 ```
 
 ## Files
@@ -44,6 +49,9 @@ bin/run.sh  TARGET_DATE
 | `bin/prune-self-sessions.sh` | self-session predicate (single source of truth): list / `--delete` / `--filter` |
 | `bin/oversized-gate.sh` | recompute the #12 measurement gate over a trailing window from the sidecars/findings on disk (`--days N`, or explicit findings dirs). Recovers dates whose `run-stats.txt` predates the counters; artifacts only, no model calls |
 | `bin/failure-class.sh` | shared classifier for L1 error artifacts: size, silent worker death, provider refusal, or unclassified legacy/missing evidence |
+| `bin/question-streaks.sh` | counts how many consecutive reports asked each open question, keyed by its bold title, and escalates stale ones with a second banner. `update <report> [findings-dir]` / `status` / `clear all\|<key>`. State in `$AUTODREAM_DIR/question-streaks.tsv`. Listed in `shared-with-sibling.txt`, but differs from cc-autodream's copy until STRML/cc-autodream#71 |
+| `bin/check-shared-drift.sh` | compares the files listed in `shared-with-sibling.txt` against the sibling cc-autodream checkout, full-line comments stripped. Run last by `tests/run-all.sh`; prints SKIPPED and exits 0 when it finds no sibling (CI) |
+| `shared-with-sibling.txt` | the helpers meant to stay identical in both repos |
 | `bin/root-probe.sh` | detect the `~/.claude*/projects` buckets and decide which to index. `--consolidated`/`--unindexed`/`--list` (read-only, nightly), `--ask`/`--default-index` (install-time; writes root-choices.conf + the managed `SESSION_ROOTS` config section). Artifacts only, no model calls |
 | `bin/notify.sh` | extract "Open questions" → inbox file, counted from the `open-questions=N` marker, opened via `$AUTODREAM_OPEN` |
 | `bin/review.sh` | interactive morning triage (`claude --append-system-prompt <report>`); `AUTODREAM_TRIAGE_SURFACE=cmux` (config/env) launches it in its own cmux workspace instead of inline. Skips the session entirely (prints a notice) when the report has 0 open questions or is already triaged — reads the `<!-- autodream:open-questions=N -->` marker, falls back to prose, launches on anything ambiguous; `--force` overrides. Skip check runs before the cmux branch so a skip never spawns a workspace |
@@ -62,6 +70,8 @@ bin/run.sh  TARGET_DATE
 - A `dreams/<date>.md` exists only after a successful L2 → it is the "done" signal for the idempotency guard.
 - `prune-self-sessions.sh` matches only the FIRST user turn against autodream's own prompt framing → human sessions about autodream are not false positives.
 - claude is always invoked with the lean flags + subscription auth; never `--bare`/`CLAUDE_CODE_SIMPLE` (breaks auth).
+- `question-streaks.tsv` holds the streaks and their watermark in one file: first line `#last<TAB>YYYY-MM-DD`, then one row per streak. Every write is a temp file in the same directory plus one rename. Do not split state that must change together across two files.
+- A report without the `<!-- autodream:open-questions=N -->` marker is incomplete. `question-streaks.sh` refuses to count it. `run.sh`'s `report_complete` is looser: it accepts any line containing `autodream:open-questions=`.
 
 ## Environment overrides
 
@@ -86,6 +96,8 @@ All optional; full list (with defaults) is documented in `bin/run.sh`'s header. 
 | `AUTODREAM_TRIAGE_FOCUS` | `false` | cmux surface only: `true` switches to the new workspace on launch, `false` opens it in the background |
 | `CMUX_BIN` | `/Applications/cmux.app/.../bin/cmux` then PATH | cmux CLI, used when surface is `cmux` |
 | `AUTODREAM_CONFIG` | `$AUTODREAM_DIR/config` | sourced KEY=VALUE config (env vars override it) |
+| `AUTODREAM_QUESTION_ESCALATE_AT` | `3` | consecutive reports before a repeated open question escalates |
+| `AUTODREAM_QUESTION_STATE` | `$AUTODREAM_DIR/question-streaks.tsv` | streak store |
 
 ## Lean queries / no self-pollution (see CLAUDE.md for full detail)
 

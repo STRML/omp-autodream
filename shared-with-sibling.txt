@@ -6,8 +6,9 @@
 # cc-vs-omp-specific logic. Everything else in bin/ has legitimately diverged, most of
 # all run.sh, and listing it here would just train people to ignore the check.
 #
-# Measured 2026-09-15 with comments stripped: these four were byte-identical; every other
-# shared filename differed by 8 to 1009 code lines.
+# Measured 2026-09-15 with comments stripped: the first four were byte-identical; every
+# other shared filename differed by 8 to 1009 code lines. bin/question-streaks.sh joined
+# later and differs until STRML/cc-autodream#71 ports omp-autodream PR #25.
 #
 # To remove a file: delete its line AND say why in CLAUDE.md. Divergence is a decision,
 # not an accident, and the next person needs to know which one it was.

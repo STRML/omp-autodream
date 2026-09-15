@@ -336,6 +336,7 @@ Each of these passed a smoke test and failed in a way that produced no error:
 - **An iCloud-evicted file is not a zero-byte file.** macOS replaces it outright with a dot-prefixed `.<name>.icloud` placeholder, so a `-name '*.md'` walk matches *nothing* and the unreadable-note branch was unreachable for the only case it existed for. Placeholders get their own pass and are never manifested, so the note stays in the inbox to retry.
 - **Sourcing a user-edited config under `set -u` kills the shell.** Not the source — the shell, so `|| echo WARNING` cannot fire. `run.sh` now probes the config in a throwaway subshell purely to capture bash's own error naming the bad variable, then sources for real with nounset off. Both helper scripts need the same guard; fixing only `run.sh` left them dying instead.
 - **`mv` across filesystems is a copy, not a rename.** State staged in `$TMPDIR` and moved onto `$STATE_DIR` was never the atomic swap its comment claimed. Stage in the destination directory and gate the `mv` on the staging copy having succeeded.
+- **State that has to change together goes in one file, written with one rename.** Two files cannot be updated atomically, so every write order leaves a failure point between them. `question-streaks.sh` kept its watermark in a second file, and three Codex rounds on PR #25 in a row each found a new order in which the two disagreed. Moving the watermark into the state file's first line ended it (see "Open questions that never get answered"). When a fix starts choosing which of two files to write first, merge the files instead.
 
 ## X bookmarks as idea fuel
 
@@ -525,12 +526,17 @@ code has genuinely diverged; measured 2026-09-15 with comments stripped, `run.sh
 by 1009 code lines, `review.sh` by 93, `session-stats.sh` by 70. That is the port doing
 its job, and those files should differ.
 
-Four helpers are byte-identical by intent, and they are listed in
+Five helpers are byte-identical by intent, and they are listed in
 `shared-with-sibling.txt`:
 
 ```
 bin/cookie-cadence.sh   bin/make-notifier.sh   bin/overlap-stats.sh   bin/x-bookmarks.sh
+bin/question-streaks.sh
 ```
+
+`question-streaks.sh` differs from cc-autodream's copy until STRML/cc-autodream#71 ports
+the PR #25 fixes, so the drift check fails locally until then. CI has no sibling
+checkout and skips it.
 
 A fix to any of those is half a fix until it lands in both. That is not hypothetical. On
 2026-09-11 the X bookmarks queryId walk was fixed *here* after X moved to 16-character
@@ -595,7 +601,7 @@ Four decisions in it are load-bearing:
   sidecar reading as a real measurement. A report with no marker at all is incomplete and
   is refused too: a truncated L2 report parses as zero questions and would clear the board.
 
-Three details the Codex review of `232c94c` found, each with a test:
+Three details from the Codex reviews of PR #25, each with a test:
 
 - **The store is the install's.** A bare run of the helper (`status`, `clear`, or the
   early empty-night path in `run.sh`, which runs before `AUTODREAM_DIR` is exported)
@@ -635,7 +641,8 @@ after the suite was green. Four are why the file reads as it does now:
   one level up: every streak silently frozen, no escalation ever again, indistinguishable
   from a quiet week. A mismatch now posts a banner saying the escalation is down.
 
-It is in `shared-with-sibling.txt`, so the drift check keeps both repos' copies identical.
+It is in `shared-with-sibling.txt`, so the drift check fails while the two repos' copies
+differ, which they do until STRML/cc-autodream#71 ports the PR #25 fixes.
 Replayed against the real 09-10..14 reports it escalates on **09-12** — two nights before
 the user actually caught the bookmarks failure.
 

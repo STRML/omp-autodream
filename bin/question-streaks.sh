@@ -216,8 +216,9 @@ cmd_update() {
   titles_of "$report" > "$tmp/titles" 2>/dev/null || : > "$tmp/titles"
   local n marker; n=$(nlines "$tmp/titles"); marker=$(marker_of "$report")
 
-  # No marker means the report is incomplete, the same test run.sh's report_complete uses.
-  # An L2 run truncated before the Open questions section parses as zero questions, and
+  # No marker means the report is incomplete. This is stricter than run.sh's report_complete,
+  # which accepts any line containing `autodream:open-questions=`. An L2 run truncated
+  # before the Open questions section parses as zero questions, and
   # counting that clears every streak and advances the watermark. run.sh leaves such a
   # report in place when it cannot move it aside (Codex review of b72f0e4).
   if [ -z "$marker" ]; then
