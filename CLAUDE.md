@@ -560,14 +560,15 @@ Three details the Codex review of `232c94c` found, each with a test:
   resolves its install dir from its own symlink, the way `run.sh` does. It used to fall
   back to `~/.claude/autodream` and clear a store nobody reads. `run.sh` also passes
   `AUTODREAM_DIR` at both call sites.
-- **The watermark survives an empty board.** The newest counted date lives in
-  `question-streaks.tsv.last`, because a question-free report empties the state file and
-  the watermark used to go with it, letting an older rebuild count as a new night. A
-  watermark that exists but cannot be read refuses the update. The watermark is written
-  and moved into place before state changes, and a failure at either step refuses the
-  update. A state write that fails after that leaves the board as a night skipped on a
-  held lock would; state changed under the old watermark could recreate a streak (Codex
-  reviews of `4eea84d` and `600e6dd`).
+- **One file holds the board and its watermark.** The newest counted date is the first
+  line of `question-streaks.tsv` (`#last<TAB>YYYY-MM-DD`), so a question-free report
+  leaves that line and an older rebuild is still refused. Every write is a temp file in
+  the same directory and one rename, so a failure at any step leaves the old file whole.
+  The watermark first lived in a second file, and Codex on `232c94c`, `4eea84d` and
+  `600e6dd` each found a way for the two files to disagree that let history back in; one
+  rename has nothing to disagree about. A state file that exists but cannot be read
+  refuses the update, because reading it as empty restarts every streak. `clear` keeps the
+  watermark.
 - **`clear` takes the same lock as `update`**, before its "nothing to clear" check, and
   fails loudly when it cannot, so an update that already read the old state cannot write a
   cleared or first streak back.

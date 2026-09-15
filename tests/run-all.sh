@@ -2687,8 +2687,11 @@ test_changelog_multi_source
 test_changelog_refuses_foreign_cache_dir
 test_changelog_single_remote_suppresses_defaults
 
+# Streak rows in a state file, skipping the `#last` watermark line.
+streak_rows(){ awk '!/^#/ && NF' "$1" 2>/dev/null | wc -l | tr -d ' '; }
+
 test_question_streaks_state_lives_with_the_install(){
-  echo "# question streaks: the store is the install's, a cleared board keeps its watermark, clear takes the lock (Codex review of 232c94c)"
+  echo "# question streaks: the store is the install's, one file holds the watermark, clear takes the lock"
   local root; root=$(setup_env)
   local QS="$REPO/bin/question-streaks.sh"
   [ -x "$QS" ] || { no "question-streaks.sh executable"; return 0; }
@@ -2711,7 +2714,7 @@ test_question_streaks_state_lives_with_the_install(){
     PROJECTS_DIR="$root/projects" DREAMS_DIR="$root/dreams" \
     bash "$root/autodream/run.sh" "$DATE" > "$root/run.out" 2>&1
   assert_file "$root/dreams/$DATE.md" "precondition: the empty night wrote its report"
-  assert_eq "$(wc -l < "$root/autodream/question-streaks.tsv" | tr -d ' ')" "0" "the empty night clears the install's streak store"
+  assert_eq "$(streak_rows "$root/autodream/question-streaks.tsv")" "0" "the empty night clears the install's streak store"
 
   # Clearing the board must not erase the watermark: rebuilding an older report afterwards
   # would otherwise re-enter history as a new night and grow a false streak.
@@ -2723,7 +2726,11 @@ test_question_streaks_state_lives_with_the_install(){
   qsw update "$root/2026-03-02.md" >/dev/null
   out=$(qsw update "$root/2026-03-01.md")
   case "$out" in *"older than the last counted report"*) ok "an older rebuild after a cleared board is still refused" ;; *) no "an older rebuild after a cleared board is still refused (got: $out)" ;; esac
-  assert_eq "$(wc -l < "$st" | tr -d ' ')" "0" "and the cleared board stays clear"
+  assert_eq "$(streak_rows "$st")" "0" "and the cleared board stays clear"
+  # One file, one write. The watermark used to live beside the state, and three reviews in
+  # a row found an order of writes between the two files that let history back in.
+  assert_eq "$(head -1 "$st")" "$(printf '#last\t2026-03-02')" "the watermark is the first line of the state file"
+  assert_no_file "$st.last" "and no second watermark file is written"
 
   # clear takes the same lock as update, or an update that already read the old state puts
   # the cleared streak back when it writes.
@@ -2732,7 +2739,7 @@ test_question_streaks_state_lives_with_the_install(){
   AUTODREAM_QUESTION_STATE="$st" bash "$QS" clear all >/dev/null 2>&1; local rc=$?
   rmdir "$st.lock" 2>/dev/null
   assert_eq "$rc" "1" "clear fails while an update holds the lock"
-  assert_eq "$(wc -l < "$st" | tr -d ' ')" "1" "and leaves the state for that update"
+  assert_eq "$(streak_rows "$st")" "1" "and leaves the state for that update"
 
   # An EMPTY board is not a reason to skip the lock: an update holding it may be about to
   # write the first streak, which clear would then report as cleared (Codex review of 4eea84d).
@@ -2742,28 +2749,41 @@ test_question_streaks_state_lives_with_the_install(){
   rmdir "$st.lock" 2>/dev/null
   assert_eq "$rc" "1" "clear on an empty board still waits for the lock and fails while it is held"
 
-  # A watermark that exists but cannot be read must refuse the update, not read as absent:
-  # an older rebuild would otherwise count as a new night (Codex review of 4eea84d).
+  # A state file that exists but cannot be read is not an empty board. Reading it as empty
+  # restarts every streak and drops the watermark with it. Write-only, so a write would land.
   local st2="$root/w2.tsv"; : > "$st2"
   qs2(){ AUTODREAM_QUESTION_STATE="$st2" AUTODREAM_NOTIFY_DRYRUN=1 bash "$QS" "$@" 2>&1; }
+  printf '## Open questions for the user\n\n1. **Recurring?** body\n\n<!-- autodream:open-questions=1 -->\n' > "$root/2026-03-04.md"
   qs2 update "$root/2026-03-01.md" >/dev/null
-  qs2 update "$root/2026-03-02.md" >/dev/null
-  chmod 000 "$st2.last"
-  qs2 update "$root/2026-03-01.md" >/dev/null
-  chmod 644 "$st2.last"
-  assert_eq "$(wc -l < "$st2" | tr -d ' ')" "0" "an unreadable watermark refuses the update instead of accepting an older report"
+  cp "$st2" "$root/w2.before"
+  chmod 200 "$st2"
+  qs2 update "$root/2026-03-04.md" >/dev/null
+  chmod 644 "$st2"
+  if cmp -s "$st2" "$root/w2.before"; then ok "an unreadable state file refuses the update instead of restarting every streak"; else no "an unreadable state file refuses the update instead of restarting every streak"; fi
 
-  # A watermark that cannot be written must refuse the update too, before state changes, or
-  # the next run has no watermark to refuse an older rebuild with.
-  local st3="$root/w3.tsv"; : > "$st3"
-  mkdir "$st3.last.tmp"
+  # A state directory that cannot take a temp file leaves the state as it was.
+  mkdir -p "$root/ro"; local st3="$root/ro/w3.tsv"
   AUTODREAM_QUESTION_STATE="$st3" AUTODREAM_NOTIFY_DRYRUN=1 bash "$QS" update "$root/2026-03-01.md" >/dev/null 2>&1
-  rmdir "$st3.last.tmp" 2>/dev/null
-  assert_eq "$(wc -l < "$st3" | tr -d ' ')" "0" "a watermark that cannot be staged leaves state untouched"
+  cp "$st3" "$root/w3.before"
+  chmod 500 "$root/ro"
+  AUTODREAM_QUESTION_STATE="$st3" AUTODREAM_NOTIFY_DRYRUN=1 bash "$QS" update "$root/2026-03-04.md" >/dev/null 2>&1
+  chmod 700 "$root/ro"
+  if cmp -s "$st3" "$root/w3.before"; then ok "a state directory that refuses a temp file leaves state untouched"; else no "a state directory that refuses a temp file leaves state untouched"; fi
 
-  # The watermark's final move can fail too. State used to change first and the failed move
-  # only logged, so a cleared board kept the old watermark and an older rebuild recreated the
-  # streak (Codex review of 600e6dd). Every state write now waits on the watermark.
+  # clear all forgets the streaks and keeps the watermark, so an older rebuild afterwards is
+  # still refused. status never prints the watermark line as a streak.
+  local st6="$root/w6.tsv"; : > "$st6"
+  qs6(){ AUTODREAM_QUESTION_STATE="$st6" AUTODREAM_NOTIFY_DRYRUN=1 bash "$QS" "$@" 2>&1; }
+  qs6 update "$root/2026-03-04.md" >/dev/null
+  out=$(qs6 status)
+  case "$out" in *"#last"*) no "status does not print the watermark line (got: $out)" ;; *"Recurring?"*) ok "status does not print the watermark line" ;; *) no "status does not print the watermark line (got: $out)" ;; esac
+  qs6 clear all >/dev/null
+  assert_eq "$(head -1 "$st6")" "$(printf '#last\t2026-03-04')" "clear all keeps the watermark"
+  out=$(qs6 update "$root/2026-03-01.md")
+  case "$out" in *"older than the last counted report"*) ok "and an older rebuild after clear all is refused" ;; *) no "and an older rebuild after clear all is refused (got: $out)" ;; esac
+
+  # The final rename can fail. The whole state is one temp file renamed into place, so a
+  # failed rename leaves the old file whole: board and watermark together.
   local st4="$root/w4.tsv"; : > "$st4"
   mkdir -p "$root/failmv"
   printf '#!/bin/sh\nexit 1\n' > "$root/failmv/mv"; chmod +x "$root/failmv/mv"
@@ -2829,7 +2849,7 @@ test_question_streaks(){
   # wc -l, not `grep -c . || echo 0`: grep -c prints 0 AND exits 1 on no match, so the
   # fallback fires too and the value is "0\n0". That trap is documented in this repo and
   # it still caught this test on the first run.
-  assert_eq "$(wc -l < "$st" | tr -d " ")" "0" "a question-free report clears every streak"
+  assert_eq "$(streak_rows "$st")" "0" "a question-free report clears every streak"
 
   # A marker that promises questions while none parse means the format moved. That must be
   # reported, never silently counted as zero — the quiet version would freeze every streak
@@ -2862,25 +2882,25 @@ test_question_streaks_reruns_and_mismatch(){
   mk 2026-02-02 1 "Recurring question?"
   qs update "$root/2026-02-01.md" >/dev/null
   qs update "$root/2026-02-02.md" >/dev/null
-  assert_eq "$(awk -F'\t' '{print $2}' "$st")" "2" "two distinct reports count two"
+  assert_eq "$(awk -F'\t' '!/^#/ {print $2}' "$st")" "2" "two distinct reports count two"
 
   # AUTODREAM_FORCE=1 rebuilds the same report. Counting it again would manufacture an
   # escalation out of a rerun.
   qs update "$root/2026-02-02.md" >/dev/null
-  assert_eq "$(awk -F'\t' '{print $2}' "$st")" "2" "rebuilding the same report does not advance the streak"
+  assert_eq "$(awk -F'\t' '!/^#/ {print $2}' "$st")" "2" "rebuilding the same report does not advance the streak"
 
   # A rebuild of an OLDER date must not rewrite live state with history: 02-01 does not
   # know about anything that happened on 02-02.
   out=$(qs update "$root/2026-02-01.md")
   case "$out" in *"older than the last counted report"*) ok "an older rebuild is refused" ;; *) no "an older rebuild is refused (got: $out)" ;; esac
-  assert_eq "$(awk -F'\t' '{print $4}' "$st")" "2026-02-02" "and the live last-seen date is untouched"
+  assert_eq "$(awk -F'\t' '!/^#/ {print $4}' "$st")" "2026-02-02" "and the live last-seen date is untouched"
 
   # The marker is the report's own count. Disagreement means questions parsed as nothing;
   # touching state would silently drop a streak or freeze them all.
   mk 2026-02-03 2 "Recurring question?"   # marker says 2, only 1 bold title present
   out=$(qs update "$root/2026-02-03.md")
   case "$out" in *"but 1 parsed"*) ok "a parsed-vs-marker mismatch warns" ;; *) no "a parsed-vs-marker mismatch warns (got: $out)" ;; esac
-  assert_eq "$(awk -F'\t' '{print $2}' "$st")" "2" "and refuses to change state"
+  assert_eq "$(awk -F'\t' '!/^#/ {print $2}' "$st")" "2" "and refuses to change state"
 
   # clear must not claim success it did not achieve.
   chmod 500 "$root" 2>/dev/null
