@@ -420,6 +420,47 @@ The general rule this is an instance of: a facet the report will reason about qu
 
 `bin/oversized-gate.sh` exists because of the same incident. The #12 gate is a trailing-window judgment but `run.sh` records one night at a time, so a stretch of old-runner nights used to be unrecoverable. It recomputes the window from the `*.stats.json` sidecars and findings JSONs still on disk, which survive independently of whether the runner knew how to count them. Artifacts only, no model calls, safe to re-run. It refuses to call an empty window a measured 0%, and quotes a rule-of-three upper bound so a clean run isn't read as stronger evidence than the sample supports.
 
+`bin/failure-class.sh` is the single failure predicate sourced by both `run.sh` and
+`bin/oversized-gate.sh`. It assigns every error stub to one of four classes from its
+`.err`: `unclassified` when the file is missing, empty, or predates the
+`worker exit code:` capture; `silent` for exit 0 with the exact
+`worker stdout was empty` line; `provider` when the worker's own output shows a
+429/auth/5xx/overload/quota refusal without a size signature; and `size` for
+everything else, including context-limit signatures, timeouts, and other nonzero
+exits. The worker's own output is its stderr (the top of the `.err`, before the
+exit-code line) plus the captured stdout section. Every line `run.sh` writes itself is
+skipped by its exact text: the timeout note, the malformed-output dump, the session-path
+line, the exit-code line, the omp log tail and the network notes. A session path or a
+dumped findings JSON can say `quota` or `HTTP 500` with no provider refusing anything,
+and the omp log may belong to a sibling worker. The stdout section ends only at
+`run.sh`'s next marker, never at a `--- ` line the worker printed itself. A number counts as a status code only after an HTTP,
+status, code or error label, so `read 520 bytes` is not a 5xx; a bare code needs its
+reason phrase (`503 Service Unavailable`). Words match with spaces, hyphens or
+underscores, so `prompt-too-long` stays size even beside an HTTP 500.
+
+The size and provider word lists are best-effort and will never be complete: five of the
+seven review rounds on PR #26 found another phrasing. That is acceptable because of the default.
+A wording neither list knows lands in `size`, which is the owner's decision (2026-09-15):
+a session is only counted once its byte size is over the threshold, so an unexplained
+failure there is a size failure. Add a wording when a real `.err` shows one, with a
+matrix row in `test_failure_class_provider_matrix`; do not grow the lists speculatively.
+
+`run.sh` and `bin/oversized-gate.sh` look for the classifier next to themselves, then next
+to the file their symlink points at, then in `AUTODREAM_DIR`. An install made before this
+file existed has a link for every other script but not this one, and updating the
+checkout must not break its nightly.
+
+`run.sh` records silent, provider, and unclassified counts beside both
+`l1_findings_with_error` and `oversized_errored`. The #12 share removes all three
+classes from its numerator and denominator, so only failures with no better
+explanation count against size. On 2026-09-13 the raw ratio read 6/7 while every
+failed worker had died in omp's first-turn memory recall; the classified window now
+reports that it measured nothing about size. `bin/oversized-gate.sh` recomputes all
+four classes from artifacts even when `run-stats.txt` predates the counters. It also
+skips any date whose stats read `network_deferred: yes`, because those runs counted
+oversized sessions that never reached a worker and their share reads low (Codex
+review of 2400815).
+
 ## Running / rerunning a date
 
 ```

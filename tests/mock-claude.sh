@@ -15,6 +15,11 @@
 #                            nothing. Pins the circuit breaker's no-progress streak.
 #   MOCK_MODE=l1_incomplete  L1 writes nothing (simulates a worker that exits
 #                            without producing JSON); L2 still emits its report.
+#   MOCK_MODE=l1_silent      L1 writes nothing and prints nothing, exit 0: the real
+#                            2026-09-13 omp death. l1_incomplete still prints "done".
+#   MOCK_MODE=l1_context_overflow  L1 writes nothing, prints a context-size refusal,
+#                            and exits 7. This must count as size even though the
+#                            diagnostic also starts with "provider error".
 #   MOCK_MODE=l1_exit124     L1 exits 124 immediately; MOCK_MODE=l1_exit137 SIGKILLs
 #                            itself. Both are what GNU timeout returns for a real
 #                            deadline, so they prove classification is not by rc alone.
@@ -56,7 +61,7 @@ line2=$(printf '%s\n' "$input" | sed -n '2p')
 if [ "$line1" = "ping" ]; then
   printf 'Working...\n' >&2
   case "$mode" in
-    l1_incomplete|l1_noisy_fail|l1_hang|l1_exit124|l1_exit137) : ;;
+    l1_incomplete|l1_silent|l1_noisy_fail|l1_context_overflow|l1_hang|l1_exit124|l1_exit137) : ;;
     # exit 0 with a diagnostic on stdout instead of the requested reply
     warmup_diag) echo "error: model deepseek/deepseek-flash is not available" ;;
     *) echo ok ;;
@@ -79,6 +84,9 @@ if printf '%s' "$line1" | grep -q '^Session transcript'; then
   write_badproject() { printf '{"session_path":"%s","project":"WRONG-PROJECT","turn_count":2,"tool_call_count":0,"tools_used":[],"skills_invoked":[],"models_used":[],"notable_initiatives":[],"findings":[]}' "$sess" > "$out"; }
   case "$mode" in
     l1_incomplete) : ;;                 # never write — simulates a worker that exits empty
+    l1_silent) exit 0 ;;                # never write AND print nothing: the 2026-09-13 omp
+                                        # death (first-turn recall), exit 0 with empty stdout.
+                                        # l1_incomplete still echoes "done" below, so it is not.
     l1_malformed)                       # non-empty output that is not a findings JSON.
       # The runner used to accept any non-empty file as success, delete both diagnostics,
       # and hand this to L2 on the final round.
@@ -96,6 +104,9 @@ if printf '%s' "$line1" | grep -q '^Session transcript'; then
       # "Working..." on stderr, and run.sh sent stdout to /dev/null, so every failure
       # arrived looking identical. Pins the exit-code and stdout capture.
       echo "provider error: 429 rate_limit_exceeded"
+      exit 7 ;;
+    l1_context_overflow)
+      echo "provider error: 400 context_length_exceeded: prompt is too long"
       exit 7 ;;
     l1_exit124) exit 124 ;;             # intrinsic 124, no deadline involved. GNU timeout
                                         # propagates a child's own status, so this arrives

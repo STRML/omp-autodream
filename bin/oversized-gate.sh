@@ -1,11 +1,10 @@
 #!/bin/bash
 # Issue #12 measurement gate: what share of oversized transcripts still failed to triage?
 #
-# The gate is a trailing-window judgment ("sustained oversized_errored/oversized_total
-# >= 5% over a week opens #12"), but run.sh only ever records one night at a time, and a
-# run whose runner predated the counters (#29) records nothing at all. This recomputes
-# the window from the *.stats.json sidecars and findings JSONs still on disk, so a date
-# whose run-stats.txt is missing the keys is recoverable rather than lost.
+# The gate is a trailing-window judgment: size failures divided by oversized sessions
+# that have no silent, provider, or unclassified failure. A sustained share >= 5% over
+# a week opens #12. run.sh records one night at a time, and an old runner (#29) may omit
+# the counters, so this recomputes the window from sidecars, findings, and .err artifacts.
 #
 # It reads only artifacts. No model calls, no network, safe to re-run.
 #
@@ -21,6 +20,27 @@
 set -u
 
 AUTODREAM_DIR="${AUTODREAM_DIR:-$HOME/.claude/autodream}"
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# Follow this file's own symlink too: an install made before failure-class.sh existed links
+# this script but not the classifier (Codex review of b19ec84). Same walk as run.sh's.
+self="${BASH_SOURCE[0]}"; hops=0
+while [ -L "$self" ] && [ "$hops" -lt 8 ]; do
+  link_dir=$(cd "$(dirname "$self")" && pwd) || break
+  self=$(readlink "$self") || break
+  case $self in /*) ;; *) self="$link_dir/$self" ;; esac
+  hops=$((hops + 1))
+done
+REAL_DIR=$(cd "$(dirname "$self")" 2>/dev/null && pwd) || REAL_DIR=""
+FAILURE_CLASS=""
+for candidate in "$SCRIPT_DIR" "$REAL_DIR" "$AUTODREAM_DIR"; do
+  [ -n "$candidate" ] && [ -r "$candidate/failure-class.sh" ] && { FAILURE_CLASS="$candidate/failure-class.sh"; break; }
+done
+if [ -z "$FAILURE_CLASS" ]; then
+  printf 'fatal: required failure classifier not found next to %s, %s or %s\n' "$SCRIPT_DIR" "${REAL_DIR:-?}" "$AUTODREAM_DIR" >&2
+  exit 1
+fi
+# shellcheck source=./failure-class.sh
+. "$FAILURE_CLASS"
 THRESHOLD="${AUTODREAM_SLIM_BYTES:-262144}"
 DAYS=7
 DIRS=()
@@ -58,15 +78,35 @@ fi
 # excluded from the ratio rather than silently sized at 0.
 total_oversized=0
 total_errored=0
+total_silent=0
+total_provider=0
+total_unclassified=0
+total_deferred=0
+total_nolist=0
 total_unmeasurable=0
+dates_measured=0
 
-printf '%-12s %7s %10s %9s %8s  %s\n' DATE SESSIONS OVERSIZED ERRORED SHARE SOURCE
+printf '%-12s %7s %10s %9s %7s %8s %8s %8s  %s\n' \
+  DATE SESSIONS OVERSIZED ERRORED SILENT PROVIDER UNCLASS SHARE SOURCE
 for d in "${DIRS[@]}"; do
   date_label=$(basename "$d")
   list="$d/sessions.txt"
-  [ -r "$list" ] || { printf '%-12s %7s %10s %9s %8s  %s\n' "$date_label" - - - - "no sessions.txt"; continue; }
+  if [ ! -r "$list" ]; then
+    printf '%-12s %7s %10s %9s %7s %8s %8s %8s  %s\n' "$date_label" - - - - - - - "no sessions.txt"
+    total_nolist=$((total_nolist + 1))
+    continue
+  fi
+  # A network-deferred run stopped before its workers finished. Its oversized sessions were
+  # counted, but the ones that never ran have no stub, so its share reads lower than the
+  # evidence supports. PROMPT.md already says to keep it out of the trailing week.
+  if grep -qx 'network_deferred: yes' "$d/run-stats.txt" 2>/dev/null; then
+    printf '%-12s %7s %10s %9s %7s %8s %8s %8s  %s\n' "$date_label" - - - - - - - "network-deferred run, excluded"
+    total_deferred=$((total_deferred + 1))
+    continue
+  fi
 
-  sessions=0; oversized=0; errored=0; from_sidecar=0; unmeasurable=0
+  sessions=0; oversized=0; errored=0; silent=0; provider=0; unclassified=0
+  from_sidecar=0; unmeasurable=0
   while IFS= read -r session; do
     [ -n "$session" ] || continue
     sessions=$((sessions + 1))
@@ -90,40 +130,80 @@ for d in "${DIRS[@]}"; do
       findings="$d/$hash.json"
       if [ -f "$findings" ] && grep -q '"error":' "$findings" 2>/dev/null; then
         errored=$((errored + 1))
+        failure_class=$(classify_failure "$findings.err")
+        case "$failure_class" in
+          silent) silent=$((silent + 1)) ;;
+          provider) provider=$((provider + 1)) ;;
+          unclassified) unclassified=$((unclassified + 1)) ;;
+        esac
       fi
     fi
   done < "$list"
 
   total_oversized=$((total_oversized + oversized))
   total_errored=$((total_errored + errored))
+  total_silent=$((total_silent + silent))
+  total_provider=$((total_provider + provider))
+  total_unclassified=$((total_unclassified + unclassified))
   total_unmeasurable=$((total_unmeasurable + unmeasurable))
+  # A date counts as measured only when at least one of its sessions was sized. A list of
+  # transcripts that are all gone says nothing about size (Codex review of cdfdf3b).
+  if [ $((sessions - unmeasurable)) -gt 0 ]; then
+    dates_measured=$((dates_measured + 1))
+  fi
 
-  if [ "$oversized" -gt 0 ]; then
-    share=$(awk -v e="$errored" -v o="$oversized" 'BEGIN{printf "%.1f%%", 100*e/o}')
+  # SHARE includes only sessions whose artifacts leave size as the explanation.
+  measured=$((oversized - silent - provider - unclassified))
+  size_errored=$((errored - silent - provider - unclassified))
+  if [ "$measured" -gt 0 ]; then
+    share=$(awk -v e="$size_errored" -v o="$measured" 'BEGIN{printf "%.1f%%", 100*e/o}')
   else
     share="n/a"
   fi
   source_note="$from_sidecar/$sessions from sidecars"
   [ "$unmeasurable" -gt 0 ] && source_note="$source_note, $unmeasurable unmeasurable"
-  printf '%-12s %7s %10s %9s %8s  %s\n' "$date_label" "$sessions" "$oversized" "$errored" "$share" "$source_note"
+  printf '%-12s %7s %10s %9s %7s %8s %8s %8s  %s\n' \
+    "$date_label" "$sessions" "$oversized" "$errored" "$silent" "$provider" "$unclassified" "$share" "$source_note"
 done
 
 echo
+[ "$total_deferred" -gt 0 ] && echo "Excluded $total_deferred network-deferred date(s): no worker ran for part of those corpora."
+[ "$total_nolist" -gt 0 ] && echo "Excluded $total_nolist date(s) with no sessions.txt."
+# Every date excluded says nothing about size, and saying "no oversized transcripts" would
+# claim a measurement that never happened (Auditor verification of 6ca1584).
+if [ "$dates_measured" -eq 0 ]; then
+  echo "No date in this window could be measured. The gate has no evidence either way."
+  exit 0
+fi
 if [ "$total_oversized" -eq 0 ]; then
   echo "No oversized transcripts in this window. The gate has nothing to measure;"
   echo "that is not the same as a measured 0% and should not close #12 on its own."
+  [ "$total_unmeasurable" -gt 0 ] && echo "$total_unmeasurable session(s) could not be sized at all, so some may have been oversized."
   exit 0
 fi
 
-share=$(awk -v e="$total_errored" -v o="$total_oversized" 'BEGIN{printf "%.2f", 100*e/o}')
-# Rule of three: with 0 failures in n trials the 95% upper bound is about 3/n. Quoting it
-# keeps a clean run from being read as stronger evidence than the sample size supports.
-printf 'Window: %s oversized, %s errored, %s%%' "$total_oversized" "$total_errored" "$share"
+printf 'Window: %s oversized, %s errored, %s silent, %s provider, %s unclassified' \
+  "$total_oversized" "$total_errored" "$total_silent" "$total_provider" "$total_unclassified"
 [ "$total_unmeasurable" -gt 0 ] && printf ' (%s session(s) unmeasurable, excluded)' "$total_unmeasurable"
 printf '\n'
-if [ "$total_errored" -eq 0 ]; then
-  bound=$(awk -v n="$total_oversized" 'BEGIN{printf "%.1f", 100*3/n}')
-  echo "Zero failures in $total_oversized samples; 95% upper bound about $bound% (rule of three)."
+
+# Every explained non-size failure leaves both sides of the ratio. When nothing else is
+# left, the window has no evidence about transcript size and gets no verdict.
+measured=$((total_oversized - total_silent - total_provider - total_unclassified))
+size_errored=$((total_errored - total_silent - total_provider - total_unclassified))
+if [ "$measured" -eq 0 ]; then
+  echo "The window measured nothing about size after excluding silent, provider, and"
+  echo "unclassified failures. Fix those causes, then re-measure."
+  exit 0
+fi
+
+share=$(awk -v e="$size_errored" -v o="$measured" 'BEGIN{printf "%.2f", 100*e/o}')
+printf 'Size-attributable: %s errored of %s, %s%%\n' "$size_errored" "$measured" "$share"
+# Rule of three: with 0 failures in n trials the 95% upper bound is about 3/n. Quoting it
+# keeps a clean run from being read as stronger evidence than the sample size supports.
+if [ "$size_errored" -eq 0 ]; then
+  bound=$(awk -v n="$measured" 'BEGIN{printf "%.1f", 100*3/n}')
+  echo "Zero failures in $measured samples; 95% upper bound about $bound% (rule of three)."
 fi
 if awk -v s="$share" 'BEGIN{exit !(s + 0 >= 5)}'; then
   echo "GATE OPEN: at or above the 5% threshold. Issue #12 (chunk-summarize) is unblocked."
