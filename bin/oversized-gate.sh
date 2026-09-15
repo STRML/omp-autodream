@@ -21,10 +21,22 @@ set -u
 
 AUTODREAM_DIR="${AUTODREAM_DIR:-$HOME/.claude/autodream}"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-FAILURE_CLASS="$SCRIPT_DIR/failure-class.sh"
-[ -r "$FAILURE_CLASS" ] || FAILURE_CLASS="$AUTODREAM_DIR/failure-class.sh"
-if [ ! -r "$FAILURE_CLASS" ]; then
-  printf 'fatal: required failure classifier not found: %s\n' "$FAILURE_CLASS" >&2
+# Follow this file's own symlink too: an install made before failure-class.sh existed links
+# this script but not the classifier (Codex review of b19ec84). Same walk as run.sh's.
+self="${BASH_SOURCE[0]}"; hops=0
+while [ -L "$self" ] && [ "$hops" -lt 8 ]; do
+  link_dir=$(cd "$(dirname "$self")" && pwd) || break
+  self=$(readlink "$self") || break
+  case $self in /*) ;; *) self="$link_dir/$self" ;; esac
+  hops=$((hops + 1))
+done
+REAL_DIR=$(cd "$(dirname "$self")" 2>/dev/null && pwd) || REAL_DIR=""
+FAILURE_CLASS=""
+for candidate in "$SCRIPT_DIR" "$REAL_DIR" "$AUTODREAM_DIR"; do
+  [ -n "$candidate" ] && [ -r "$candidate/failure-class.sh" ] && { FAILURE_CLASS="$candidate/failure-class.sh"; break; }
+done
+if [ -z "$FAILURE_CLASS" ]; then
+  printf 'fatal: required failure classifier not found next to %s, %s or %s\n' "$SCRIPT_DIR" "${REAL_DIR:-?}" "$AUTODREAM_DIR" >&2
   exit 1
 fi
 # shellcheck source=./failure-class.sh

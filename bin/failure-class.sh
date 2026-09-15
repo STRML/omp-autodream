@@ -2,7 +2,7 @@
 # Classify one L1 worker failure from its surviving .err artifact.
 
 classify_failure() {
-  local errfile="$1" exit_code stdout_section
+  local errfile="$1" exit_code worker_text sep
 
   if [ ! -s "$errfile" ]; then
     printf '%s\n' unclassified
@@ -22,20 +22,31 @@ classify_failure() {
     return 0
   fi
 
-  stdout_section=$(awk '
+  # Only what the worker itself printed: its stderr, which omp writes at the top of the
+  # .err before run.sh appends the exit-code line, and the captured stdout section. The
+  # exit-code line is ours (its seconds could read as a status code), and the appended
+  # omp log may belong to a sibling worker, so both stay out (Codex review of b19ec84).
+  worker_text=$(awk '
+    /^worker exit code: / { after_exit = 1; next }
+    !after_exit { print; next }
     /^--- worker stdout, last 40 lines ---$/ { in_stdout = 1; next }
     in_stdout && /^--- / { exit }
     in_stdout { print }
   ' "$errfile")
 
-  if printf '%s\n' "$stdout_section" \
-      | grep -Eiq 'context[[:space:]_-]length|too[[:space:]]+long|too[[:space:]]+large|token[[:space:]]+limit|maximum[[:space:]]+context|prompt[[:space:]]+is[[:space:]]+too[[:space:]]+long'; then
+  # Providers and models spell the same words with spaces, hyphens or underscores.
+  sep='[[:space:]_-]'
+
+  if printf '%s\n' "$worker_text" \
+      | grep -Eiq "context${sep}*length|too${sep}+(long|large)|token${sep}+limit|maximum${sep}+context"; then
     printf '%s\n' size
     return 0
   fi
 
-  if printf '%s\n' "$stdout_section" \
-      | grep -Eiq '(^|[^0-9])(429|401|403|5[0-9][0-9]|5xx)([^0-9]|$)|rate[[:space:]_-]?limit|too[[:space:]]+many[[:space:]]+requests|overload|quota|unauthori[sz]ed|forbidden|invalid[[:space:]_-]+api[[:space:]_-]+key|auth(entication)?[[:space:]_-]+(error|failed|failure)|token[[:space:]_-]+expired'; then
+  # A bare number is not a status code: "read 520 bytes" is not a 5xx. A code counts only
+  # after an HTTP, status, code or error label; otherwise the reason phrase has to say it.
+  if printf '%s\n' "$worker_text" \
+      | grep -Eiq "(http(/[0-9.]+)?|status|code|error)[^0-9a-z]{0,3}(429|401|403|5[0-9][0-9]|5xx)([^0-9]|$)|rate${sep}?limit|too${sep}+many${sep}+requests|overload|quota|unauthori[sz]ed|forbidden|service${sep}+unavailable|bad${sep}+gateway|gateway${sep}+time${sep}?out|internal${sep}+server${sep}+error|invalid${sep}+api${sep}+key|auth(entication)?${sep}+(error|failed|failure)|token${sep}+expired"; then
     printf '%s\n' provider
     return 0
   fi

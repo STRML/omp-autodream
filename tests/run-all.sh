@@ -1730,12 +1730,47 @@ provider|rate-limited by provider
 provider|Too Many Requests
 provider|error: invalid-api-key
 provider|unauthorised
+provider|status 500 from provider
+provider|HTTP/1.1 502 Bad Gateway
 size|context-length exceeded
 size|context length exceeded (HTTP 500)
+size|HTTP 500 prompt-too-long
+size|HTTP 500 token-limit exceeded
 size|read 5200 bytes then exited
+size|read 520 bytes then exited
 size|worker timed out after 600s
 EOF
+
+  # A refusal the worker printed only on stderr is its own output too. omp's stderr lands
+  # at the top of the .err, before the exit-code line (Codex review of b19ec84).
+  printf '401 Unauthorized\nworker exit code: 1 after 9s\n--- worker stdout, last 40 lines ---\ndone\n' > "$dir/stderr.err"
+  assert_eq "$(classify_failure "$dir/stderr.err")" "provider" "a refusal on the worker's stderr is provider"
+  # The exit-code line itself is ours, not the worker's: its seconds must not read as a 5xx.
+  printf 'worker exit code: 1 after 503s\n--- worker stdout, last 40 lines ---\ndone\n' > "$dir/elapsed.err"
+  assert_eq "$(classify_failure "$dir/elapsed.err")" "size" "the elapsed seconds on the exit-code line are not a status code"
   rm -rf "$dir"
+}
+
+test_failure_class_found_through_an_old_install(){
+  echo "# an install made before failure-class.sh existed still finds it through the runner symlink (Codex review of b19ec84)"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  # install.sh links each script by name, so an install from before this PR has every
+  # link except failure-class.sh. Updating the checkout must not break its nightly.
+  local f; for f in "$REPO"/bin/*.sh; do
+    case "$f" in */failure-class.sh) continue ;; esac
+    ln -sf "$f" "$root/autodream/$(basename "$f")"
+  done
+  AUTODREAM_CHANGELOG=0 OMP_BIN="$MOCK" \
+  AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
+  AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=2 \
+  PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
+  bash "$root/autodream/run.sh" "$DATE" > "$root/run.out" 2>&1
+  assert_nogrep "$root/run.out" 'required failure classifier not found' "run.sh finds the classifier next to the file its link points at"
+  assert_file "$root/dreams/$DATE.md" "and the run still produces a report"
+  local gate_out; gate_out=$(AUTODREAM_DIR="$root/autodream" bash "$root/autodream/oversized-gate.sh" "$(fdir "$root")" 2>&1)
+  printf '%s' "$gate_out" > "$root/gate.out"
+  assert_nogrep "$root/gate.out" 'required failure classifier not found' "oversized-gate.sh finds it the same way"
+  rm -rf "$root"
 }
 
 test_oversized_gate_script_mixed_size_and_provider(){
@@ -2218,6 +2253,7 @@ test_oversized_gate_script_missing_err
 test_oversized_gate_script_err_without_exit_code
 test_oversized_gate_script_stdout_section_boundary
 test_failure_class_provider_matrix
+test_failure_class_found_through_an_old_install
 test_oversized_gate_script_mixed_size_and_provider
 test_oversized_gate_script_empty
 test_oversized_gate_script_unmeasurable_only

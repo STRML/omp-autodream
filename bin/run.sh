@@ -250,14 +250,6 @@ SESSIONS_LIST="$FINDINGS_DIR/sessions.txt"
 # transcript?". Resolve it next to this script first (works for the repo copy and the
 # ~/.claude/autodream symlink), then fall back to the install dir.
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-FAILURE_CLASS="$SCRIPT_DIR/failure-class.sh"
-[ -r "$FAILURE_CLASS" ] || FAILURE_CLASS="$AUTODREAM_DIR/failure-class.sh"
-if [ ! -r "$FAILURE_CLASS" ]; then
-  printf 'fatal: required failure classifier not found: %s\n' "$FAILURE_CLASS" >&2
-  exit 1
-fi
-# shellcheck source=./failure-class.sh
-. "$FAILURE_CLASS"
 PRUNE="$SCRIPT_DIR/prune-self-sessions.sh"
 [ -x "$PRUNE" ] || PRUNE="$AUTODREAM_DIR/prune-self-sessions.sh"
 # Root prober — decides which $HOME/.claude*/projects dirs to scan (see root-probe.sh).
@@ -369,6 +361,21 @@ elif [ -n "$(git -C "$RUNNER_REPO_DIR" status --porcelain --untracked-files=no 2
 else
   RUNNER_DIRTY=no
 fi
+
+# The failure classifier is looked up after the runner walk above, because an install
+# made before failure-class.sh existed has a link for every other script but not this
+# one, and updating the checkout must not break that install's nightly (Codex review of
+# b19ec84). The directory the run.sh link points at always has it.
+FAILURE_CLASS=""
+for candidate in "$SCRIPT_DIR" "$RUNNER_REPO_DIR" "$AUTODREAM_DIR"; do
+  [ -n "$candidate" ] && [ -r "$candidate/failure-class.sh" ] && { FAILURE_CLASS="$candidate/failure-class.sh"; break; }
+done
+if [ -z "$FAILURE_CLASS" ]; then
+  printf 'fatal: required failure classifier not found next to %s, %s or %s\n' "$SCRIPT_DIR" "${RUNNER_REPO_DIR:-?}" "$AUTODREAM_DIR" >&2
+  exit 1
+fi
+# shellcheck source=./failure-class.sh
+. "$FAILURE_CLASS"
 
 mkdir -p "$FINDINGS_DIR" "$DREAMS_DIR" "$LOG_DIR" "$WORK_DIR"
 

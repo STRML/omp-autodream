@@ -424,11 +424,21 @@ The general rule this is an instance of: a facet the report will reason about qu
 `bin/oversized-gate.sh`. It assigns every error stub to one of four classes from its
 `.err`: `unclassified` when the file is missing, empty, or predates the
 `worker exit code:` capture; `silent` for exit 0 with the exact
-`worker stdout was empty` line; `provider` when the captured worker-stdout section
-shows a 429/auth/5xx/overload/quota refusal without a size signature; and `size` for
+`worker stdout was empty` line; `provider` when the worker's own output shows a
+429/auth/5xx/overload/quota refusal without a size signature; and `size` for
 everything else, including context-limit signatures, timeouts, and other nonzero
-exits. Provider and size matching stops at the next `--- ` section so a 429 in the
-appended omp log, which may belong to a sibling worker, cannot reclassify this one.
+exits. The worker's own output is its stderr (the top of the `.err`, before the
+exit-code line) plus the captured stdout section. The exit-code line is excluded because
+its seconds can read as a status code, and the appended omp log is excluded because it
+may belong to a sibling worker. A number counts as a status code only after an HTTP,
+status, code or error label, so `read 520 bytes` is not a 5xx; a bare code needs its
+reason phrase (`503 Service Unavailable`). Words match with spaces, hyphens or
+underscores, so `prompt-too-long` stays size even beside an HTTP 500.
+
+`run.sh` and `bin/oversized-gate.sh` look for the classifier next to themselves, then next
+to the file their symlink points at, then in `AUTODREAM_DIR`. An install made before this
+file existed has a link for every other script but not this one, and updating the
+checkout must not break its nightly.
 
 `run.sh` records silent, provider, and unclassified counts beside both
 `l1_findings_with_error` and `oversized_errored`. The #12 share removes all three
