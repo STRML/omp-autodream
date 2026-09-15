@@ -2519,6 +2519,13 @@ test_oversized_gate_script_deferred(){
   printf '%s' "$out" > "$root/gate.out"
   assert_grep   "$root/gate.out" 'network-deferred run, excluded' "the deferred date is named and excluded"
   assert_nogrep "$root/gate.out" 'GATE CLOSED'                    "a date where no worker ran must not close the gate"
+  # Every date excluded is not the same as nothing oversized (Auditor verification of 6ca1584).
+  # A dir with no sessions.txt is the other way a date drops out, so the window holds both.
+  local empty="$root/2020-01-03"; mkdir -p "$empty"
+  out=$(AUTODREAM_SLIM_BYTES=100 bash "$GATE" "$fd" "$empty" 2>&1)
+  printf '%s' "$out" > "$root/gate.out"
+  assert_nogrep "$root/gate.out" 'No oversized transcripts' "an all-excluded window does not claim nothing was oversized"
+  assert_grep   "$root/gate.out" 'No date in this window could be measured' "it says no date was measurable"
   rm -rf "$root"
 }
 

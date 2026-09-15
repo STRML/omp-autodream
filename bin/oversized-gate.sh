@@ -70,14 +70,20 @@ total_silent=0
 total_provider=0
 total_unclassified=0
 total_deferred=0
+total_nolist=0
 total_unmeasurable=0
+dates_measured=0
 
 printf '%-12s %7s %10s %9s %7s %8s %8s %8s  %s\n' \
   DATE SESSIONS OVERSIZED ERRORED SILENT PROVIDER UNCLASS SHARE SOURCE
 for d in "${DIRS[@]}"; do
   date_label=$(basename "$d")
   list="$d/sessions.txt"
-  [ -r "$list" ] || { printf '%-12s %7s %10s %9s %7s %8s %8s %8s  %s\n' "$date_label" - - - - - - - "no sessions.txt"; continue; }
+  if [ ! -r "$list" ]; then
+    printf '%-12s %7s %10s %9s %7s %8s %8s %8s  %s\n' "$date_label" - - - - - - - "no sessions.txt"
+    total_nolist=$((total_nolist + 1))
+    continue
+  fi
   # A network-deferred run stopped before its workers finished. Its oversized sessions were
   # counted, but the ones that never ran have no stub, so its share reads lower than the
   # evidence supports. PROMPT.md already says to keep it out of the trailing week.
@@ -86,6 +92,7 @@ for d in "${DIRS[@]}"; do
     total_deferred=$((total_deferred + 1))
     continue
   fi
+  dates_measured=$((dates_measured + 1))
 
   sessions=0; oversized=0; errored=0; silent=0; provider=0; unclassified=0
   from_sidecar=0; unmeasurable=0
@@ -145,9 +152,17 @@ done
 
 echo
 [ "$total_deferred" -gt 0 ] && echo "Excluded $total_deferred network-deferred date(s): no worker ran for part of those corpora."
+[ "$total_nolist" -gt 0 ] && echo "Excluded $total_nolist date(s) with no sessions.txt."
+# Every date excluded says nothing about size, and saying "no oversized transcripts" would
+# claim a measurement that never happened (Auditor verification of 6ca1584).
+if [ "$dates_measured" -eq 0 ]; then
+  echo "No date in this window could be measured. The gate has no evidence either way."
+  exit 0
+fi
 if [ "$total_oversized" -eq 0 ]; then
   echo "No oversized transcripts in this window. The gate has nothing to measure;"
   echo "that is not the same as a measured 0% and should not close #12 on its own."
+  [ "$total_unmeasurable" -gt 0 ] && echo "$total_unmeasurable session(s) could not be sized at all, so some may have been oversized."
   exit 0
 fi
 
