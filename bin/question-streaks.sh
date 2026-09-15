@@ -333,6 +333,12 @@ cmd_clear() {
   trap 'release_lock' RETURN
   unreadable_state && { echo "question-streaks: FAILED to clear: cannot read $STATE" >&2; return 1; }
   [ "$(nrows)" -gt 0 ] || { echo "question-streaks: nothing to clear"; return 0; }
+  # An unknown key is a failure, not a no-op. Printing "cleared" for a mistyped key leaves
+  # the real streak escalating tomorrow (#32). `status` lists the keys.
+  if [ "$what" != "all" ] && ! rows_of | awk -F'\t' -v k="$what" '$1 == k {f=1} END {exit !f}'; then
+    echo "question-streaks: FAILED to clear: no streak with key $what (status lists the keys)" >&2
+    return 1
+  fi
   # Forget streaks, keep the watermark: an older rebuild after a clear is still history.
   local tmp; tmp="$(mktemp)" || { echo "question-streaks: FAILED to stage a rewrite of $STATE" >&2; return 1; }
   rows_of | awk -F'\t' -v k="$what" 'k != "all" && $1 != k' > "$tmp"

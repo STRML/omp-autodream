@@ -3232,6 +3232,14 @@ test_question_streaks_reruns_and_mismatch(){
   qs update "$root/2026-02-06.md" >/dev/null
   if cmp -s "$st" "$root/st.before"; then ok "a report truncated after a question title is refused too"; else no "a report truncated after a question title is refused too"; fi
 
+  # clear with a key no streak carries printed "cleared" and exited 0, so a mistyped key left
+  # the streak escalating after the operator was told it was forgotten (#32).
+  local krc
+  out=$(qs clear deadbeef0000); krc=$?
+  assert_eq "$krc" "1" "clear with an unknown key fails"
+  case "$out" in *"no streak with key deadbeef0000"*) ok "and names the key it could not find" ;; *) no "and names the key it could not find (got: $out)" ;; esac
+  if cmp -s "$st" "$root/st.before"; then ok "and leaves the state untouched"; else no "and leaves the state untouched"; fi
+
   # clear must not claim success it did not achieve.
   chmod 500 "$root" 2>/dev/null
   out=$(AUTODREAM_QUESTION_STATE="$root/nope/state.tsv" bash "$QS" clear all 2>&1); local rc=$?
