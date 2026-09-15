@@ -3232,6 +3232,31 @@ test_question_streaks_reruns_and_mismatch(){
   qs update "$root/2026-02-06.md" >/dev/null
   if cmp -s "$st" "$root/st.before"; then ok "a report truncated after a question title is refused too"; else no "a report truncated after a question title is refused too"; fi
 
+  # clear with a key no streak carries printed "cleared" and exited 0, so a mistyped key left
+  # the streak escalating after the operator was told it was forgotten (#32).
+  local krc
+  out=$(qs clear deadbeef0000); krc=$?
+  assert_eq "$krc" "1" "clear with an unknown key fails"
+  case "$out" in *"no streak with key deadbeef0000"*) ok "and names the key it could not find" ;; *) no "and names the key it could not find (got: $out)" ;; esac
+  if cmp -s "$st" "$root/st.before"; then ok "and leaves the state untouched"; else no "and leaves the state untouched"; fi
+  # Keys are hex, so a key can be all digits. awk compares two numeric-looking strings as
+  # numbers, so `clear 89709551468` matched the row `089709551468` and cleared the wrong
+  # streak (Codex review of 5f7ddaa). Keys compare as strings.
+  printf '#last\t2026-02-02\n089709551468\t2\t2026-02-01\t2026-02-02\tDigits only?\n' > "$root/num.tsv"
+  cp "$root/num.tsv" "$root/num.before"
+  AUTODREAM_QUESTION_STATE="$root/num.tsv" bash "$QS" clear 89709551468 >/dev/null 2>&1; krc=$?
+  assert_eq "$krc" "1" "clear with a key that only equals a row key numerically fails"
+  if cmp -s "$root/num.tsv" "$root/num.before"; then ok "and does not clear the numerically equal streak"; else no "and does not clear the numerically equal streak"; fi
+  # awk -v also decodes backslash escapes, so `\060...` became `0...` and matched a real key
+  # (Codex review of b67c2f1). A key is 12 lowercase hex characters; anything else is refused
+  # before awk sees it.
+  printf '#last\t2026-02-02\n080dd5de4c18\t2\t2026-02-01\t2026-02-02\tEscaped?\n' > "$root/esc.tsv"
+  cp "$root/esc.tsv" "$root/esc.before"
+  out=$(AUTODREAM_QUESTION_STATE="$root/esc.tsv" bash "$QS" clear '\06080dd5de4c18' 2>&1); krc=$?
+  assert_eq "$krc" "1" "clear with an escaped key that decodes to a real key fails"
+  case "$out" in *"not a streak key"*) ok "and says it is not a streak key" ;; *) no "and says it is not a streak key (got: $out)" ;; esac
+  if cmp -s "$root/esc.tsv" "$root/esc.before"; then ok "and does not clear the streak the escape decodes to"; else no "and does not clear the streak the escape decodes to"; fi
+
   # clear must not claim success it did not achieve.
   chmod 500 "$root" 2>/dev/null
   out=$(AUTODREAM_QUESTION_STATE="$root/nope/state.tsv" bash "$QS" clear all 2>&1); local rc=$?
