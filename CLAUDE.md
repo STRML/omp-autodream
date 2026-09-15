@@ -641,7 +641,8 @@ after the suite was green. Four are why the file reads as it does now:
   one level up: every streak silently frozen, no escalation ever again, indistinguishable
   from a quiet week. A mismatch now posts a banner saying the escalation is down.
 
-It is in `shared-with-sibling.txt`, so the drift check keeps both repos' copies identical.
+It is in `shared-with-sibling.txt`, so the drift check fails while the two repos' copies
+differ, which they do until STRML/cc-autodream#71 ports the PR #25 fixes.
 Replayed against the real 09-10..14 reports it escalates on **09-12** — two nights before
 the user actually caught the bookmarks failure.
 

@@ -49,7 +49,7 @@ bin/run.sh  TARGET_DATE
 | `bin/prune-self-sessions.sh` | self-session predicate (single source of truth): list / `--delete` / `--filter` |
 | `bin/oversized-gate.sh` | recompute the #12 measurement gate over a trailing window from the sidecars/findings on disk (`--days N`, or explicit findings dirs). Recovers dates whose `run-stats.txt` predates the counters; artifacts only, no model calls |
 | `bin/failure-class.sh` | shared classifier for L1 error artifacts: size, silent worker death, provider refusal, or unclassified legacy/missing evidence |
-| `bin/question-streaks.sh` | counts how many consecutive reports asked each open question, keyed by its bold title, and escalates stale ones with a second banner. `update <report> [findings-dir]` / `status` / `clear all\|<key>`. State in `$AUTODREAM_DIR/question-streaks.tsv`. Shared verbatim with cc-autodream |
+| `bin/question-streaks.sh` | counts how many consecutive reports asked each open question, keyed by its bold title, and escalates stale ones with a second banner. `update <report> [findings-dir]` / `status` / `clear all\|<key>`. State in `$AUTODREAM_DIR/question-streaks.tsv`. Listed in `shared-with-sibling.txt`, but differs from cc-autodream's copy until STRML/cc-autodream#71 |
 | `bin/check-shared-drift.sh` | compares the files listed in `shared-with-sibling.txt` against the sibling cc-autodream checkout, full-line comments stripped. Run last by `tests/run-all.sh`; prints SKIPPED and exits 0 when it finds no sibling (CI) |
 | `shared-with-sibling.txt` | the helpers meant to stay identical in both repos |
 | `bin/root-probe.sh` | detect the `~/.claude*/projects` buckets and decide which to index. `--consolidated`/`--unindexed`/`--list` (read-only, nightly), `--ask`/`--default-index` (install-time; writes root-choices.conf + the managed `SESSION_ROOTS` config section). Artifacts only, no model calls |
@@ -71,7 +71,7 @@ bin/run.sh  TARGET_DATE
 - `prune-self-sessions.sh` matches only the FIRST user turn against autodream's own prompt framing → human sessions about autodream are not false positives.
 - claude is always invoked with the lean flags + subscription auth; never `--bare`/`CLAUDE_CODE_SIMPLE` (breaks auth).
 - `question-streaks.tsv` holds the streaks and their watermark in one file: first line `#last<TAB>YYYY-MM-DD`, then one row per streak. Every write is a temp file in the same directory plus one rename. Do not split state that must change together across two files.
-- A report without the `<!-- autodream:open-questions=N -->` marker is incomplete. `question-streaks.sh` refuses to count it, the same test `run.sh`'s `report_complete` uses.
+- A report without the `<!-- autodream:open-questions=N -->` marker is incomplete. `question-streaks.sh` refuses to count it. `run.sh`'s `report_complete` is looser: it accepts any line containing `autodream:open-questions=`.
 
 ## Environment overrides
 
