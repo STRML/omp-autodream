@@ -62,6 +62,7 @@ link "$REPO_DIR/bin/oversized-gate.sh"       "$TARGET/oversized-gate.sh"
 link "$REPO_DIR/bin/cookie-cadence.sh"       "$TARGET/cookie-cadence.sh"
 link "$REPO_DIR/bin/vault-notes.sh"          "$TARGET/vault-notes.sh"
 link "$REPO_DIR/bin/x-bookmarks.sh"          "$TARGET/x-bookmarks.sh"
+link "$REPO_DIR/bin/question-streaks.sh"     "$TARGET/question-streaks.sh"
 link "$REPO_DIR/bin/root-probe.sh"           "$TARGET/root-probe.sh"
 link "$REPO_DIR/bin/skills-inventory.sh"     "$TARGET/skills-inventory.sh"
 link "$REPO_DIR/prompts/PROMPT.md"      "$TARGET/PROMPT.md"
@@ -69,16 +70,12 @@ link "$REPO_DIR/prompts/SESSION_TRIAGE.md" "$TARGET/SESSION_TRIAGE.md"
 
 chmod +x "$REPO_DIR/bin/"*.sh
 
-# --------------------------------------------------- advisor-off overlay --
-# OMP boots the opus advisor on every headless compile of a run unless told not to,
-# burning subscription budget. run.sh passes the overlay below as --config to every
-# worker (env NO_ADVISOR_CFG). Written here once so a fresh install is complete.
-cat > "$TARGET/l1-no-advisor.yml" <<'YAML'
-advisor:
-  enabled: false
-  subagents: false
-YAML
-chmod 644 "$TARGET/l1-no-advisor.yml"
+# --------------------------------------------------- worker overlay --
+# run.sh passes this overlay as --config to every worker (env NO_ADVISOR_CFG). It turns
+# off the advisor, local provider probes and first-turn memory recall; the file's own
+# comments say why. Linked rather than written here: a heredoc copy drifted from the
+# installed file and a fresh install silently lost disabledProviders.
+link "$REPO_DIR/l1-no-advisor.yml" "$TARGET/l1-no-advisor.yml"
 
 # --------------------------------------------------- session roots --
 # autodream scans the OMP session store — a single root, $HOME/.omp/agent/sessions.
@@ -123,20 +120,17 @@ install_schedule() {
   local la_dir="$HOME/Library/LaunchAgents"
   mkdir -p "$la_dir"
 
-  # Reuse an existing autodream label if one is already installed (keeps the
-  # namespace stable across re-installs and shared with autodream-now's .ondemand
-  # sibling); else synthesize com.<user>.autodream. Match the plist that runs
-  # run.sh — not siblings like *-review.
-  local label="" plist l
-  for plist in "$la_dir"/*autodream*.plist; do
-    [ -e "$plist" ] || continue
-    case "$plist" in *.ondemand.plist) continue ;; esac
-    /usr/bin/grep -q 'run\.sh' "$plist" 2>/dev/null || continue
-    if l="$(/usr/libexec/PlistBuddy -c 'Print :Label' "$plist" 2>/dev/null)"; then
-      label="$l"; break
-    fi
-  done
-  [ -n "$label" ] || label="com.$(id -un | tr -dc 'a-zA-Z0-9').autodream"
+  # Which label this install owns. scheduler-label.sh reuses our own prior label
+  # when there is one (so a re-install stays idempotent), never adopts a plist
+  # that runs someone else's run.sh, and exits 3 rather than overwrite a foreign
+  # job holding our default name. See #14: matching on the string "run.sh" alone
+  # took over cc-autodream's job on this host and killed it for 18 days.
+  local label="" rc=0
+  label="$("$REPO_DIR/bin/scheduler-label.sh" "$TARGET")" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "  Skipping the schedule. Fix the conflict above, or re-run with --no-schedule." >&2
+    return "$rc"
+  fi
 
   # launchd agents start with a minimal PATH; seed it with the dirs of the tools
   # the pipeline shells out to (claude, git, bash) plus the usual suspects.
@@ -160,7 +154,7 @@ install_schedule() {
   local domain
   domain="gui/$(id -u)"
 
-  cat > "$target_plist" <<PLIST
+  cat > "$target_plist" <<PLIST || { echo "  ERROR: could not write $target_plist" >&2; return 1; }
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -208,7 +202,14 @@ PLIST
   # Clear any prior instance, then bootstrap. RunAtLoad is false, so this arms the
   # schedule without firing a run now.
   launchctl bootout   "$domain/$label" 2>/dev/null || true
-  launchctl bootstrap "$domain" "$target_plist"
+  # Guarded explicitly rather than left to `set -e`: the caller invokes this
+  # function as `install_schedule || rc=$?` to catch the exit-3 refusal, and that
+  # form disables errexit for the entire body. An unguarded failure here would
+  # print "scheduled:" over a job that was never bootstrapped.
+  launchctl bootstrap "$domain" "$target_plist" || {
+    echo "  ERROR: launchctl bootstrap failed for $label ($target_plist)" >&2
+    return 1
+  }
   echo "  scheduled: $label  (daily 03:15/06:15/09:15/12:15)  -> $target_plist"
 
   # ---- Review triage LaunchAgent ----
@@ -292,7 +293,7 @@ PLIST
     return 0
   fi
   local review_plist="$la_dir/$review_label.plist"
-  cat > "$review_plist" <<PLIST
+  cat > "$review_plist" <<PLIST || { echo "  ERROR: could not write $review_plist" >&2; return 1; }
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -359,21 +360,43 @@ PLIST
     }
   fi
   launchctl bootout   "$domain/$review_label" 2>/dev/null || true
-  launchctl bootstrap "$domain" "$review_plist"
+  launchctl bootstrap "$domain" "$review_plist" || {
+    echo "  ERROR: launchctl bootstrap failed for $review_label ($review_plist)" >&2
+    return 1
+  }
   echo "  scheduled: $review_label  (daily 08:00/09:15/12:15/15:30/18:15)  -> $review_plist"
 }
 
 echo
 if [ "$SCHEDULE" = 1 ] && command -v launchctl >/dev/null 2>&1; then
   echo "Installing nightly schedule (launchd):"
-  install_schedule
-  echo
-  echo "  Guarantee the Mac is awake for the 03:15 trigger (launchd won't wake it):"
-  echo "    sudo pmset repeat wake MTWRFSU 03:10:00"
+  # Only the REFUSAL (exit 3) is survivable: a foreign job holds our label, the
+  # symlinks are installed and the run still works by hand. install_schedule's
+  # other non-zero returns are real scheduling failures - a plist that fails
+  # plutil -lint, a launchctl bootstrap that did not take - and before this
+  # helper existed `set -e` made every one of them a failed install. Swallowing
+  # those would report "everything is in place" over exactly the silent-broken-
+  # schedule state that #14 cost 18 days to notice.
+  schedule_rc=0
+  install_schedule || schedule_rc=$?
+  if [ "$schedule_rc" -eq 3 ]; then
+    echo "  Schedule not installed: another install holds our label. Everything else is in place." >&2
+  elif [ "$schedule_rc" -ne 0 ]; then
+    echo "  Schedule FAILED (exit $schedule_rc). The symlinks are installed; the schedule is not." >&2
+    exit "$schedule_rc"
+  fi
+  # Only advise the wake schedule when there is a job to wake for. Printing it
+  # after a refusal tells the user to arm a 03:15 wake for a trigger that was
+  # deliberately not installed.
+  if [ "$schedule_rc" -eq 0 ]; then
+    echo
+    echo "  Guarantee the Mac is awake for the 03:15 trigger (launchd won't wake it):"
+    echo "    sudo pmset repeat wake MTWRFSU 03:10:00"
+  fi
 elif [ "$SCHEDULE" = 1 ]; then
   echo "Skipping schedule: launchctl not found (not macOS?). See launchd/ for the template."
 else
-  echo "Skipping schedule (--no-schedule). See launchd/com.user.autodream.plist.example to add one."
+  echo "Skipping schedule (--no-schedule). See launchd/com.user.omp-autodream.plist.example to add one."
 fi
 
 echo

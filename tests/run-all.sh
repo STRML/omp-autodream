@@ -100,13 +100,24 @@ run_dream(){ # $1=root ; inherits MOCK_MODE/MOCK_CAPTURE_DIR/FANOUT + changelog 
   # depend on) the REAL host's skill tree. A suite that passes or fails on whatever
   # skills happen to be installed locally is not a suite.
   mkdir -p "$1/home"
+  # The worker failure path probes the network with a real curl, so every test with a
+  # failing worker started making real outbound calls at 5s apiece — the suite promises
+  # it never touches the network, and a promise that decays silently is worse than none.
+  # Default every run to a curl that reports a reachable host; the tests that care about
+  # an outage set TEST_CURL_SHIMMED=1 and put their own shim on PATH first.
+  if [ -z "${TEST_CURL_SHIMMED:-}" ]; then
+    mkdir -p "$1/shim-default"
+    printf '#!/bin/bash\nprintf %s "200"\n' "'%s'" > "$1/shim-default/curl"
+    chmod +x "$1/shim-default/curl"
+    PATH="$1/shim-default:$PATH"
+  fi
   # OMP_BIN uses ${VAR-default} (no colon) so a caller that exports it EMPTY keeps the
   # empty value: that is how the resolution test asks run.sh to find omp on PATH instead
   # of being handed the mock. Every other test leaves it unset and still gets the mock.
   AUTODREAM_CHANGELOG="${AUTODREAM_CHANGELOG:-0}" OMP_BIN="${OMP_BIN-$MOCK}" \
   AUTODREAM_CONFIG="${AUTODREAM_CONFIG:-$1/autodream/config}" \
   AUTODREAM_CONSUME_DATE="${AUTODREAM_CONSUME_DATE:-$DATE}" \
-  AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS="${AUTODREAM_L1_ROUNDS:-2}" \
+  AUTODREAM_NETCHECK="${AUTODREAM_NETCHECK:-0}" AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS="${AUTODREAM_L1_ROUNDS:-2}" \
   PROJECTS_DIR="$1/projects" HOME="$1/home" AUTODREAM_DIR="$1/autodream" DREAMS_DIR="$1/dreams" \
   bash "$RUN" "$DATE" > "$1/run.out" 2>&1
   # The run's own exit code, captured while $? still holds it: the previous bug lived
@@ -568,7 +579,7 @@ test_session_stats(){
   MOCK=1 "$OMP_MOCK" "$fixture" carriers
   "$REPO/bin/session-stats.sh" "$fixture" "$out"
   assert_eq "$(jq -r 'keys | sort | join(",")' "$out")" \
-    "duration_minutes,isSidechain,models_used,tool_call_count,tools_used,transcript_bytes,transcript_mtime,turn_count,user_message_count,user_turn_timestamps" \
+    "duration_minutes,isSidechain,models_used,skills_authored,skills_invoked,skills_invoked_count,skills_invoked_counts,tool_call_count,tools_used,transcript_bytes,transcript_mtime,turn_count,user_message_count,user_turn_timestamps" \
     "stats output has exactly the specified fields"
   assert_eq "$(jq -r '.user_turn_timestamps | length' "$out")" "0" "no timestamped user turns in this fixture -> empty user_turn_timestamps"
   assert_eq "$(jq -r .user_message_count "$out")" "1" "toolResult records are excluded from user message count"
@@ -594,6 +605,19 @@ test_session_stats(){
   assert_eq "$(jq -r .tool_call_count "$out")" "3" "sidechain tool calls are counted mechanically"
   assert_eq "$(jq -r '.tools_used | join(",")' "$out")" "Bash,Read,Write" "sidechain tools are sorted and unique"
   assert_eq "$(jq -r .isSidechain "$out")" "true" "sidechain marker is copied"
+
+  # Skill invocation is measured, not guessed. The 2026-09-04 report concluded the
+  # ~200-skill inventory never fires, from a session that called manage_skill ten
+  # times — those calls wrote skills, they did not run any, and skills_invoked was a
+  # field the L1 model filled in by eye. In OMP an invocation leaves exactly one
+  # custom_message of customType "skill-prompt"; nothing else does.
+  fixture="$root/skills.jsonl"; out="$root/skills.stats.json"
+  MOCK=1 "$OMP_MOCK" "$fixture" skills
+  "$REPO/bin/session-stats.sh" "$fixture" "$out"
+  assert_eq "$(jq -r '.skills_invoked | join(",")' "$out")" "deslop,triage" "invoked skills are read from skill-prompt records, unique and sorted"
+  assert_eq "$(jq -r .skills_invoked_count "$out")" "3" "the count keeps repeat invocations the unique list drops"
+  assert_eq "$(jq -r '.skills_authored | join(",")' "$out")" "rs3-gui-navigation,update-omp-fork" "manage_skill calls are reported as authoring, not invocation"
+  assert_eq "$(jq -r '.skills_invoked | index("not-a-skill") // "absent"' "$out")" "absent" "a non-skill custom_message that quotes the same phrasing is ignored"
   rm -rf "$root"
 }
 
@@ -785,6 +809,167 @@ test_changelog(){
   rm -rf "$root"
 }
 
+test_breaker_needs_two_barren_rounds_not_one(){
+  echo "# a round that recovered sessions must not be counted barren by the round after it"
+  local root; root=$(setup_env)
+  mk_session "$root" sess1; mk_session "$root" sess2; mk_session "$root" sess3
+  mkdir -p "$root/mockstate"
+  # Exactly one session ever succeeds: round 1 goes 3 missing -> 2, rounds 2+ recover none.
+  # The first version of the breaker compared each round's ending count against the PREVIOUS
+  # round's ending count, so round 2 alone (2 == 2) tripped it and logged that rounds 1 and 2
+  # both recovered nothing — false, round 1 recovered one. The streak must reach 2, so the
+  # earliest honest trip is round 3.
+  export MOCK_MODE=l1_partial_then_stall MOCK_STATE_DIR="$root/mockstate"
+  AUTODREAM_L1_ROUNDS=5 run_dream "$root"
+  unset MOCK_MODE MOCK_STATE_DIR
+
+  assert_grep   "$root/run.out" 'L1 triage round 3/5' "round 3 still runs — round 2 alone cannot trip the breaker"
+  assert_nogrep  "$root/run.out" 'rounds 1 and 2 both recovered nothing' "the breaker never claims a productive round was barren"
+  assert_grep   "$(fdir "$root")/run-stats.txt" 'l1_breaker_fired: yes' "it does still fire once two rounds really are barren"
+  assert_grep   "$(fdir "$root")/run-stats.txt" 'l1_missing_after_retries: 0' "the stub round still lands"
+  rm -rf "$root"
+}
+
+test_warmup_empty_stdout_is_a_failure_not_ok(){
+  echo "# the warmup must not read omp's stderr chatter as a successful reply"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  # l1_incomplete writes nothing to stdout. omp prints 'Working...' on stderr on every run,
+  # so a warmup that captured 2>&1 saw non-empty output and recorded `ok` for precisely the
+  # exit-0/empty-stdout failure it was added to expose.
+  export MOCK_MODE=l1_incomplete
+  AUTODREAM_L1_ROUNDS=1 run_dream "$root"
+  unset MOCK_MODE
+  assert_nogrep "$(fdir "$root")/run-stats.txt" 'l1_warmup: ok' "an empty-stdout warmup is never recorded as ok"
+  rm -rf "$root"
+}
+
+test_warmup_diagnostic_stdout_is_a_failure_not_ok(){
+  echo "# a warmup that exits 0 with a diagnostic instead of the reply is a failure (debate review of e95e2f2)"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  export MOCK_MODE=warmup_diag
+  AUTODREAM_L1_ROUNDS=1 run_dream "$root"
+  unset MOCK_MODE
+  assert_grep "$(fdir "$root")/run-stats.txt" 'l1_warmup: failed' "non-empty stdout that is not the reply records failed"
+  rm -rf "$root"
+}
+
+test_changelog_multi_source(){
+  echo "# multi-source changelog: per-harness sections, isolated failures, no log leakage"
+  command -v git >/dev/null 2>&1 || { echo "  skip - git not available"; return 0; }
+  local root; root=$(setup_env); mk_session "$root" sess1
+
+  # Two local fixture 'remotes'. The second keeps its changelog at a NESTED path, which is
+  # the OMP shape — a monorepo with no root CHANGELOG — and the reason path is per-source.
+  local a="$root/up-a"; mkdir -p "$a"
+  ( cd "$a" && git init -q && git config user.email t@t.invalid && git config user.name t
+    printf '# Changelog\n\n## 9.9.9\n\n- Alpha in-window\n' > CHANGELOG.md
+    git add CHANGELOG.md
+    GIT_AUTHOR_DATE="2020-01-02T12:00:00" GIT_COMMITTER_DATE="2020-01-02T12:00:00" \
+      git commit -q -m 'alpha release' )
+
+  local b="$root/up-b"; mkdir -p "$b/packages/coding-agent"
+  ( cd "$b" && git init -q && git config user.email t@t.invalid && git config user.name t
+    printf '# Changelog\n\n## 8.8.8\n\n- Beta in-window\n' > packages/coding-agent/CHANGELOG.md
+    git add packages/coding-agent/CHANGELOG.md
+    GIT_AUTHOR_DATE="2020-01-02T12:00:00" GIT_COMMITTER_DATE="2020-01-02T12:00:00" \
+      git commit -q -m 'beta release' )
+
+  # Third source points at a path that is not a repo: its clone must fail into its own
+  # section without costing the other two theirs.
+  export AUTODREAM_CHANGELOG=1
+  export AUTODREAM_CHANGELOG_SOURCES="Alpha|$a|CHANGELOG.md|$root/cache/a;Beta|$b|packages/coding-agent/CHANGELOG.md|$root/cache/b;Ghost|$root/nope.git|CHANGELOG.md|$root/cache/ghost"
+  run_dream "$root"
+  unset AUTODREAM_CHANGELOG AUTODREAM_CHANGELOG_SOURCES
+
+  local cw="$(fdir "$root")/changelog-window.md"
+  assert_file   "$cw" "changelog-window.md written"
+  assert_grep   "$cw" '^## Alpha'            "the first harness gets its own section"
+  assert_grep   "$cw" '^## Beta'             "the second harness gets its own section"
+  assert_grep   "$cw" '^## Ghost'            "an unreachable harness still gets a section"
+  assert_grep   "$cw" 'Alpha in-window'      "the first harness's entry is captured"
+  assert_grep   "$cw" 'Beta in-window'       "a nested changelog path is captured"
+  assert_grep   "$cw" 'Git clone failed'     "the unreachable harness reports its failure"
+  # The bug this pins: log() writes to stdout, so building the file inside a redirected
+  # block files the runner's own progress lines as upstream release notes.
+  assert_nogrep "$cw" 'changelog\['          "no runner log lines leak into the report input"
+  assert_nogrep "$cw" 'cloning'              "no clone progress leaks into the report input"
+  rm -rf "$root"
+}
+
+test_changelog_refuses_foreign_cache_dir(){
+  echo "# a configured cache path that is a real non-git directory is never deleted (debate review of e95e2f2)"
+  command -v git >/dev/null 2>&1 || { echo "  skip - git not available"; return 0; }
+  local root; root=$(setup_env); mk_session "$root" sess1
+  local a="$root/up-a"; mkdir -p "$a"
+  ( cd "$a" && git init -q && git config user.email t@t.invalid && git config user.name t
+    printf '# Changelog\n\n## 9.9.9\n\n- Alpha in-window\n' > CHANGELOG.md
+    git add CHANGELOG.md
+    GIT_AUTHOR_DATE="2020-01-02T12:00:00" GIT_COMMITTER_DATE="2020-01-02T12:00:00" \
+      git commit -q -m 'alpha release' )
+  local precious="$root/precious"; mkdir -p "$precious"; printf 'keep me\n' > "$precious/notes.txt"
+
+  # A second foreign dir reached through `..` from inside the cache prefix: it must not
+  # count as a cache path just because the string starts with one.
+  local sneaky="$root/sneaky"; mkdir -p "$sneaky"; printf 'keep me too\n' > "$sneaky/notes.txt"
+  local ad; ad=$(cd "$root/autodream" 2>/dev/null && pwd) || ad="$root/autodream"
+  # The cache dir must exist, or `cache/..` never resolves and rm -rf is a silent no-op
+  # whether or not the guard is there, which is how the first version of this check passed
+  # with the guard removed.
+  mkdir -p "$ad/cache"
+  # A third foreign dir reached through a symlink inside the cache: the path string has no
+  # `..` and starts with the cache prefix, but rm -rf follows the intermediate link
+  # (Codex review of 0129fc0).
+  local linked="$root/linked"; mkdir -p "$linked/old-repo"; printf 'keep me three\n' > "$linked/old-repo/notes.txt"
+  ln -s "$linked" "$ad/cache/link"
+
+  export AUTODREAM_CHANGELOG=1 AUTODREAM_CHANGELOG_MAX_LINES=abc
+  export AUTODREAM_CHANGELOG_SOURCES="Alpha|$a|CHANGELOG.md|$root/cache/a;Typo|$a|CHANGELOG.md|$precious;Dots|$a|CHANGELOG.md|$ad/cache/../../sneaky;Link|$a|CHANGELOG.md|$ad/cache/link/old-repo"
+  run_dream "$root"
+  unset AUTODREAM_CHANGELOG AUTODREAM_CHANGELOG_SOURCES AUTODREAM_CHANGELOG_MAX_LINES
+
+  local cw="$(fdir "$root")/changelog-window.md"
+  assert_file "$precious/notes.txt"          "the non-git directory and its contents survive"
+  assert_file "$sneaky/notes.txt"            "a path that climbs out of the cache with .. is not treated as the cache"
+  assert_file "$linked/old-repo/notes.txt"   "a path through a symlink inside the cache is not treated as the cache"
+  assert_grep "$cw" 'is a non-empty directory that is not a git clone' "its section says why it was skipped"
+  assert_grep "$cw" 'Alpha in-window'        "the other source is unaffected"
+  assert_grep "$root/run.out" 'AUTODREAM_CHANGELOG_MAX_LINES=.abc. is not a positive integer; using 400' "a non-numeric cap falls back to the default instead of disabling it"
+
+  # Second run reuses the fixture remote $a, so $root is removed only after it.
+  local root2; root2=$(setup_env); mk_session "$root2" sess1
+  export AUTODREAM_CHANGELOG=1 AUTODREAM_CHANGELOG_MAX_LINES=00
+  export AUTODREAM_CHANGELOG_SOURCES="Alpha|$a|CHANGELOG.md|$root2/cache/a"
+  run_dream "$root2"
+  unset AUTODREAM_CHANGELOG AUTODREAM_CHANGELOG_SOURCES AUTODREAM_CHANGELOG_MAX_LINES
+  assert_grep "$root2/run.out" 'AUTODREAM_CHANGELOG_MAX_LINES=.00. is not a positive integer; using 400' "a zero written as 00 is refused like 0"
+  assert_grep "$(fdir "$root2")/changelog-window.md" 'Alpha in-window' "and the section still carries its content"
+  rm -rf "$root2" "$root"
+}
+
+test_changelog_single_remote_suppresses_defaults(){
+  echo "# CHANGELOG_REMOTE selects one source and suppresses the default three"
+  command -v git >/dev/null 2>&1 || { echo "  skip - git not available"; return 0; }
+  local root; root=$(setup_env); mk_session "$root" sess1
+  local up="$root/upstream"; mkdir -p "$up"
+  ( cd "$up" && git init -q && git config user.email t@t.invalid && git config user.name t
+    printf '# Changelog\n\n## 7.7.7\n\n- Solo in-window\n' > CHANGELOG.md
+    git add CHANGELOG.md
+    GIT_AUTHOR_DATE="2020-01-02T12:00:00" GIT_COMMITTER_DATE="2020-01-02T12:00:00" \
+      git commit -q -m 'solo release' )
+
+  export AUTODREAM_CHANGELOG=1 CHANGELOG_REMOTE="$up" CLAUDE_CODE_REPO="$root/cache/cc"
+  run_dream "$root"
+  unset AUTODREAM_CHANGELOG CHANGELOG_REMOTE CLAUDE_CODE_REPO
+
+  local cw="$(fdir "$root")/changelog-window.md"
+  assert_grep   "$cw" 'Solo in-window' "the named remote is read"
+  # Load-bearing: without the suppression the suite would clone three real remotes, and
+  # the promise that it never touches the network would break silently.
+  assert_nogrep "$cw" '^## Codex'      "the Codex default is suppressed"
+  assert_nogrep "$cw" '^## OMP'        "the OMP default is suppressed"
+  rm -rf "$root"
+}
+
 test_prune_helper(){
   echo "# prune-self-sessions helper: list / filter / delete"
   local PR="$REPO/bin/prune-self-sessions.sh"
@@ -968,6 +1153,21 @@ test_l1_timeout_must_be_positive(){
   local root2; root2=$(setup_env); mk_session "$root2" sess1
   export AUTODREAM_L1_TIMEOUT=abc; run_dream "$root2"; unset AUTODREAM_L1_TIMEOUT
   assert_grep "$root2/run.out" 'must be a positive integer' "a non-numeric timeout is rejected"
+  rm -rf "$root" "$root2"
+}
+
+test_l1_warmup_timeout_must_be_positive(){
+  echo "# a zero or non-numeric warmup timeout is refused at startup (Codex review of #25)"
+  # The warmup runs ahead of every recovery path, so a 0 that GNU timeout reads as
+  # "no deadline" can wedge the run before the network wait, retries or breaker.
+  local root; root=$(setup_env); mk_session "$root" sess1
+  export AUTODREAM_L1_WARMUP_TIMEOUT=0; run_dream "$root"; unset AUTODREAM_L1_WARMUP_TIMEOUT
+  assert_grep "$root/run.out" 'AUTODREAM_L1_WARMUP_TIMEOUT must be greater than 0' "zero warmup timeout is rejected with a reason"
+  assert_no_file "$root/dreams/$DATE.md" "the run refuses to start rather than risk an unbounded warmup"
+
+  local root2; root2=$(setup_env); mk_session "$root2" sess1
+  export AUTODREAM_L1_WARMUP_TIMEOUT=abc; run_dream "$root2"; unset AUTODREAM_L1_WARMUP_TIMEOUT
+  assert_grep "$root2/run.out" 'AUTODREAM_L1_WARMUP_TIMEOUT must be a positive integer' "a non-numeric warmup timeout is rejected"
   rm -rf "$root" "$root2"
 }
 
@@ -1199,6 +1399,12 @@ test_stats_sidecar_malformed_counted(){
   local stats="$(fdir "$root")/run-stats.txt"
   assert_grep "$stats" 'stats_sidecars_unparseable: 1' "missing transcript_bytes counts as unparseable"
   assert_grep "$stats" 'oversized_total: 1'            "oversized session still counted via the live-size fallback"
+  # The same stub carries no skill keys, so the worker's skill fields are its guess
+  # (Codex review of cd309b6).
+  local fj; fj="$(fdir "$root")/$(hash_of "$root/projects/proj-a/sess1.jsonl").json"
+  assert_eq "$(jq -r 'has("skills_invoked") or has("skills_invoked_count") or has("skills_invoked_counts") or has("skills_authored")' "$fj")" "false" \
+    "a sidecar without skill keys leaves no worker-written skill fields"
+  assert_grep "$stats" 'skills_unmeasured: 1' "and the session is counted as unmeasured"
   rm -rf "$root"
 }
 
@@ -1767,6 +1973,7 @@ test_l1_hang_is_bounded
 test_omp_resolution_and_provenance
 test_intrinsic_124_is_not_a_timeout
 test_l1_timeout_must_be_positive
+test_l1_warmup_timeout_must_be_positive
 test_idempotency_guard
 test_self_audit_stats
 test_self_audit_stats_failure_denominator
@@ -2070,7 +2277,398 @@ test_skills_inventory_python_failure_exits_1(){
   rm -rf "$T"
 }
 
+# ---- Network failures must not read as transcript failures (2026-09-04) --------------
+# On 2026-09-04 the Mac had no route at 03:15. Every worker died in ~9s, the runner
+# retried them five times against the same dead network, and the report that came out
+# blamed transcript size: oversized_errored/oversized_total was 3/4, which is the
+# threshold that opens issue #12. Re-running those three transcripts by hand later, with
+# a live network, produced findings for all three in 73-78s. Nothing in the artifacts
+# could have told the two apart, so these tests pin the three signals that now can.
+
+# A curl that always answers with one HTTP code, so net_up can be steered without a
+# network. 000 is what curl reports when there is no route, which is exactly what net_up
+# tests for.
+shim_curl(){ # $1=sandbox root, $2=http_code to report
+  mkdir -p "$1/shim"
+  printf '#!/bin/bash\nprintf %s "%s"\n' "'%s'" "$2" > "$1/shim/curl"
+  chmod +x "$1/shim/curl"
+  printf '%s' "$1/shim"
+}
+
+test_network_down_defers_the_date(){
+  echo "# a round that cannot be dispatched defers the date instead of reporting on a short corpus"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  local shim; shim=$(shim_curl "$root" 000)
+  # CAP=0 makes wait_for_network give up on its first check, so the test never sleeps.
+  TEST_CURL_SHIMMED=1   PATH="$shim:$PATH" AUTODREAM_NETCHECK=1 AUTODREAM_NETCHECK_CAP=0 run_dream "$root"
+  local h; h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
+  assert_eq      "$(cat "$root/run.exit")" "1"         "a deferred run exits non-zero"
+  assert_no_file "$root/dreams/$DATE.md"               "no report is written from a dead-network run"
+  assert_no_file "$(fdir "$root")/$h.json"             "no worker was dispatched at all"
+  assert_grep    "$(fdir "$root")/run-stats.txt" 'network_deferred: yes' "run-stats records the deferral"
+  assert_grep    "$root/run.out" 'Deferring'           "the log says the date was deferred"
+  rm -rf "$root"
+}
+
+test_route_lost_after_the_precheck_still_defers(){
+  echo "# a route lost AFTER the pre-dispatch check must defer, not publish a short corpus"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  local shim; shim=$(shim_curl "$root" 000)
+  local h; h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
+  # NETCHECK=0 skips the pre-dispatch check, which is precisely the gap: the check only
+  # proves the route was up when the round started. The worker then fails while the
+  # failure-path probe sees no route — the round-5 shape from 2026-09-04.
+  # ROUNDS=1 means this is also the final round, where the stub used to be written.
+  export MOCK_MODE=l1_incomplete
+  TEST_CURL_SHIMMED=1   PATH="$shim:$PATH" AUTODREAM_NETCHECK=0 AUTODREAM_SLIM_BYTES=10 AUTODREAM_L1_ROUNDS=1 run_dream "$root"
+  unset MOCK_MODE
+  local stats="$(fdir "$root")/run-stats.txt"
+  # No stub. A stub carries a .findings key, and jq -e counts an empty array as present,
+  # so writing one marks the session done: MISSING hits zero, the run stops deferring, and
+  # the next run skips the session forever because its slot is filled.
+  assert_no_file "$(fdir "$root")/$h.json"   "no findings stub is written for a network-down failure"
+  assert_no_file "$root/dreams/$DATE.md"     "no report is published on an outage-short corpus"
+  assert_eq      "$(cat "$root/run.exit")" "1" "the run exits non-zero"
+  assert_grep    "$stats" 'network_deferred: yes'   "run-stats records the post-dispatch deferral"
+  assert_grep    "$stats" 'oversized_errored: 0'    "an unstubbed session cannot reach the oversized-error counter"
+  assert_grep    "$(fdir "$root")/$h.json.err" 'no route to api.anthropic.com' ".err names the real cause"
+  # Ledger carries hash + round + verdict so a later round can overrule an earlier one.
+  assert_grep    "$(fdir "$root")/l1-netdown.txt" "^$h 1 true\$" "the ledger records the round and the verdict"
+  rm -rf "$root"
+}
+
+test_missing_curl_is_not_read_as_an_outage(){
+  echo "# a host without curl must not have every failure classified as a network outage"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  local h; h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
+  # An empty shim dir placed FIRST on PATH cannot hide curl, so hide it by pointing PATH
+  # at a dir holding only the binaries run.sh needs. Simpler and more honest: a curl that
+  # does not exist is simulated by a shim that exits 127 the way a missing command does.
+  mkdir -p "$root/nocurl"
+  printf '#!/bin/bash\nexit 127\n' > "$root/nocurl/curl"; chmod +x "$root/nocurl/curl"
+  export MOCK_MODE=l1_incomplete
+  TEST_CURL_SHIMMED=1   PATH="$root/nocurl:$PATH" AUTODREAM_NETCHECK=0 AUTODREAM_SLIM_BYTES=10 AUTODREAM_L1_ROUNDS=1 run_dream "$root"
+  unset MOCK_MODE
+  # A curl that cannot run answers nothing. Classifying that as an outage would defer
+  # every date forever on a machine without curl, so the failure stays unclassified: no
+  # ledger entry, no deferral, and the .err says why rather than leaving it to inference.
+  assert_grep    "$(fdir "$root")/$h.json.err" 'curl could not be run here' ".err says the check could not answer"
+  assert_nogrep  "$(fdir "$root")/l1-netdown.txt" "^$h " "an unclassifiable failure is never ledgered as an outage"
+  assert_grep    "$(fdir "$root")/run-stats.txt" 'network_deferred: no' "and it does not defer the date"
+  rm -rf "$root"
+}
+
+test_a_transient_outage_is_ridden_out_not_deferred(){
+  echo "# a network blip in one round must burn a retry, not defer the whole date"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  # A curl that reports no route on its first call and a reachable host afterwards. The
+  # first version of this fix broke out of the retry loop the moment any worker failed
+  # with a network flavour, which threw the retry budget away: one transient DNS timeout
+  # deferred the date for three hours instead of succeeding on round 2.
+  mkdir -p "$root/shim"
+  printf '#!/bin/bash\nc="$root/shim/n"\nn=$(cat "$c" 2>/dev/null || echo 0)\necho $((n+1)) > "$c"\nif [ "$n" -lt 1 ]; then printf %s "000"; else printf %s "200"; fi\n' "'%s'" "'%s'" \
+    | sed "s|\$root|$root|g" > "$root/shim/curl"
+  chmod +x "$root/shim/curl"
+  # l1_flaky fails the first dispatch per session and succeeds on the retry, so round 1
+  # fails while curl says no route and round 2 succeeds while it says 200.
+  export MOCK_MODE=l1_flaky
+  TEST_CURL_SHIMMED=1 PATH="$root/shim:$PATH" AUTODREAM_NETCHECK=0 AUTODREAM_L1_ROUNDS=2 run_dream "$root"
+  unset MOCK_MODE
+  local h; h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
+  assert_file "$(fdir "$root")/$h.json"  "the retry succeeded rather than being cut short"
+  assert_file "$root/dreams/$DATE.md"    "a recovered run still publishes its report"
+  assert_grep "$(fdir "$root")/run-stats.txt" 'network_deferred: no' "a blip that recovered is not a deferral"
+  rm -rf "$root"
+}
+
+test_no_curl_does_not_defer_a_healthy_run(){
+  echo "# a host without curl must not defer every run for 1800s of unanswerable checks"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  # net_up ran curl unconditionally and read its empty output as "no route", so a machine
+  # without curl looped to the full cap and deferred a run that was working fine. The
+  # worker-failure path grew the command -v guard first; net_up did not have it.
+  mkdir -p "$root/shim"
+  printf '#!/bin/bash\nexit 127\n' > "$root/shim/curl"; chmod +x "$root/shim/curl"
+  # NETCHECK=1 with a tiny cap: if the guard is missing this defers, and fast.
+  TEST_CURL_SHIMMED=1 PATH="$root/shim:$PATH" AUTODREAM_NETCHECK=1 AUTODREAM_NETCHECK_CAP=0 run_dream "$root"
+  assert_file "$root/dreams/$DATE.md" "the run completed instead of deferring on an unrunnable check"
+  assert_grep "$(fdir "$root")/run-stats.txt" 'network_deferred: no' "an unanswerable check is not an outage"
+  rm -rf "$root"
+}
+
+test_skill_fields_dropped_without_a_sidecar(){
+  echo "# a session with no stats sidecar keeps no worker-written skill fields (Codex review of 0129fc0)"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  # mock-claude writes skills_invoked:[] itself. With no sidecar to overwrite it, that list
+  # is the model's guess, and L2 would rank it as a mechanical count.
+  export AUTODREAM_STATS_BIN="$root/does-not-exist.sh"
+  run_dream "$root"
+  unset AUTODREAM_STATS_BIN
+  local h; h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
+  local fj="$(fdir "$root")/$h.json"
+  assert_eq "$(jq -r 'has("skills_invoked") or has("skills_invoked_count") or has("skills_invoked_counts") or has("skills_authored")' "$fj")" "false" \
+    "the unmeasured skill fields are removed rather than believed"
+  assert_eq "$(jq -r '.findings | type' "$fj")" "array" "the rest of the findings JSON survives"
+  # Absence alone cannot say why: gated stubs and older findings carry no skill fields
+  # either. The runner records the count (Codex review of 1ee66e4).
+  assert_grep "$(fdir "$root")/run-stats.txt" 'skills_unmeasured: 1' "run-stats counts the session whose skills went unmeasured"
+  rm -rf "$root"
+}
+
+test_shared_drift_check_from_a_worktree(){
+  echo "# check-shared-drift.sh names the repo by its main checkout, so a git worktree still finds the sibling"
+  command -v git >/dev/null 2>&1 || { echo "  skip - git not available"; return 0; }
+  # Physical path: on macOS mktemp hands back /var/..., git reports /private/var/..., and the
+  # sibling path the script prints comes from git.
+  local T; T=$(cd "$(mktemp -d)" && pwd -P)
+  # A worktree gets its own directory name (omp-autodream-pr25), and inferring the sibling
+  # from that name exited 2 and failed the whole suite in every worktree.
+  mkdir -p "$T/omp-autodream/bin" "$T/cc-autodream/bin"
+  cp "$REPO/bin/check-shared-drift.sh" "$T/omp-autodream/bin/"
+  printf 'bin/a.sh\n' > "$T/omp-autodream/shared-with-sibling.txt"
+  printf 'echo same\n' > "$T/omp-autodream/bin/a.sh"
+  printf 'echo same\n' > "$T/cc-autodream/bin/a.sh"
+  ( cd "$T/omp-autodream" && git init -q && git config user.email t@t.invalid && git config user.name t \
+      && git add -A && git commit -q -m init && git worktree add -q "$T/omp-autodream-feature" 2>/dev/null )
+  local out rc
+  out=$(env -u AUTODREAM_SIBLING_REPO bash "$T/omp-autodream-feature/bin/check-shared-drift.sh" 2>&1); rc=$?
+  assert_eq "$rc" "0" "a worktree with a matching sibling exits 0"
+  case "$out" in *"ok — 1 shared file(s) match $T/cc-autodream"*) ok "and it compared against the sibling next to the main checkout" ;;
+    *) no "and it compared against the sibling next to the main checkout (got [$out])" ;; esac
+  printf 'echo drifted\n' > "$T/cc-autodream/bin/a.sh"
+  env -u AUTODREAM_SIBLING_REPO bash "$T/omp-autodream-feature/bin/check-shared-drift.sh" >/dev/null 2>&1; rc=$?
+  assert_eq "$rc" "1" "real drift seen from the worktree still fails"
+  # A checkout with a name the script does not know and no git is a degraded measurement:
+  # say SKIPPED and exit 0, the same contract as a sibling that is not on disk.
+  mkdir -p "$T/elsewhere/bin"; cp "$REPO/bin/check-shared-drift.sh" "$T/elsewhere/bin/"
+  printf 'bin/a.sh\n' > "$T/elsewhere/shared-with-sibling.txt"
+  out=$(env -u AUTODREAM_SIBLING_REPO bash "$T/elsewhere/bin/check-shared-drift.sh" 2>&1); rc=$?
+  assert_eq "$rc" "0" "an unrecognised checkout name skips instead of failing the suite"
+  case "$out" in *SKIPPED*) ok "and says it skipped" ;; *) no "and says it skipped (got [$out])" ;; esac
+  # Two unreadable copies used to strip to two empty files and compare equal (Codex review
+  # of 232c94c). A file the check cannot read has not been verified, so it is drift.
+  printf 'echo same\n' > "$T/cc-autodream/bin/a.sh"
+  chmod 000 "$T/omp-autodream-feature/bin/a.sh" "$T/cc-autodream/bin/a.sh"
+  env -u AUTODREAM_SIBLING_REPO bash "$T/omp-autodream-feature/bin/check-shared-drift.sh" >/dev/null 2>&1; rc=$?
+  chmod 644 "$T/omp-autodream-feature/bin/a.sh" "$T/cc-autodream/bin/a.sh"
+  assert_eq "$rc" "1" "an unreadable shared file is drift, not a match"
+  rm -rf "$T"
+}
+
+test_skill_fields_dropped_with_a_partial_sidecar(){
+  echo "# a sidecar missing any of the four skill keys is unmeasured, not half-enforced (Codex review of 33bf9b1)"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  # skills_invoked present, skills_invoked_count(s) and skills_authored absent: copying the
+  # one key and keeping the worker's other three would rank guesses as counts.
+  local stub="$root/stats-partial.sh"
+  printf '%s\n' '#!/bin/bash' 'printf %s "{\"transcript_bytes\":10,\"user_message_count\":5,\"tool_call_count\":9,\"skills_invoked\":[\"x\"]}" > "$2"' > "$stub"
+  chmod +x "$stub"
+  export AUTODREAM_STATS_BIN="$stub"
+  run_dream "$root"
+  unset AUTODREAM_STATS_BIN
+  local fj; fj="$(fdir "$root")/$(hash_of "$root/projects/proj-a/sess1.jsonl").json"
+  assert_eq "$(jq -r 'has("skills_invoked") or has("skills_invoked_count") or has("skills_invoked_counts") or has("skills_authored")' "$fj")" "false" \
+    "every skill field is removed when the sidecar lacks any of them"
+  assert_grep "$(fdir "$root")/run-stats.txt" 'skills_unmeasured: 1' "and the session is counted as unmeasured"
+  assert_nogrep "$root/run.out" 'with no sidecar' "the log does not claim the sidecar was missing"
+  rm -rf "$root"
+}
+
+test_skill_fields_are_enforced_from_the_sidecar(){
+  echo "# a worker that ignores the precomputed skill stats gets overwritten, not believed"
+  local root; root=$(setup_env)
+  # A session that really did invoke a skill. mock-claude always writes skills_invoked:[]
+  # (see write_findings), which is exactly the worker behaviour that produced the
+  # 2026-09-04 "zero skills across 3,988 tool calls" claim. The runner must not take it.
+  local f="$root/projects/proj-a/sess1.jsonl"
+  printf '%s\n' \
+    '{"type":"message","message":{"role":"user","content":[{"type":"text","text":"/triage"}]}}' \
+    '{"type":"message","message":{"role":"user","content":[{"type":"text","text":"keep going"}]}}' \
+    '{"type":"custom_message","customType":"skill-prompt","content":"[IMPORTANT: User invoked the \"triage\" skill; follow its instructions. Full skill below.]"}' \
+    '{"type":"custom_message","customType":"skill-prompt","content":"[IMPORTANT: User invoked the \"triage\" skill; follow its instructions. Full skill below.]"}' \
+    '{"type":"custom_message","customType":"skill-prompt","content":"[IMPORTANT: User invoked the \"deslop\" skill; follow its instructions. Full skill below.]"}' \
+    '{"type":"custom","customType":"tool_execution_start","data":{"toolName":"Read"}}' \
+    > "$f"
+  touch -t "$STAMP" "$f"
+  run_dream "$root"
+  local h; h=$(hash_of "$f")
+  assert_eq "$(jq -r '.skills_invoked | join(",")' "$(fdir "$root")/$h.json")" "deslop,triage" \
+    "the findings JSON carries the measured skills, not the worker's empty list"
+  assert_eq "$(jq -r '.skills_invoked_counts.triage' "$(fdir "$root")/$h.json")" "2" \
+    "per-skill counts survive into the findings so 'top 5 by count' can be ranked"
+  assert_eq "$(jq -r '.skills_invoked_count' "$(fdir "$root")/$h.json")" "3" \
+    "the total counts invocations, not distinct skills"
+  assert_grep "$(fdir "$root")/run-stats.txt" 'skills_unmeasured: 0' "a run with every sidecar present records zero unmeasured, not nothing"
+  rm -rf "$root"
+}
+
+test_malformed_worker_output_is_a_failure_with_its_evidence(){
+  echo "# non-empty output that is not findings JSON must fail loudly, keeping the diagnostics"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  local h; h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
+  export MOCK_MODE=l1_malformed
+  AUTODREAM_L1_ROUNDS=1 run_dream "$root"
+  unset MOCK_MODE
+  assert_file    "$(fdir "$root")/$h.json.err" "the .err survives instead of being deleted as a success"
+  assert_grep    "$(fdir "$root")/$h.json.err" 'no usable .findings key' ".err says why the output was rejected"
+  assert_grep    "$(fdir "$root")/$h.json.err" 'this is not json at all' ".err keeps what the worker actually wrote"
+  assert_nogrep  "$(fdir "$root")/$h.json" 'this is not json at all' "the malformed file never reaches L2"
+  rm -rf "$root"
+}
+
+test_findings_must_be_an_array_not_merely_present(){
+  echo "# .findings that is a string or object is not a result, and must not reach L2"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  local h; h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
+  export MOCK_MODE=l1_wrongtype
+  AUTODREAM_L1_ROUNDS=1 run_dream "$root"
+  unset MOCK_MODE
+  assert_file   "$(fdir "$root")/$h.json.err" "the schema-invalid write is treated as a failure"
+  assert_grep   "$(fdir "$root")/$h.json.err" 'no usable .findings key' ".err says why it was rejected"
+  assert_nogrep "$(fdir "$root")/$h.json" 'oops' "the schema-invalid file never reaches L2"
+  rm -rf "$root"
+}
+
+test_stale_wrongtype_findings_is_redispatched(){
+  echo "# a stale schema-invalid findings file from a prior run must be re-run, not skipped"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  local h; h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
+  # Seed the exact shape a previous run could have left: .findings present but a string.
+  # The dispatcher guard said "done" and exited, while l1_missing_count said "missing",
+  # so nothing ever rewrote it and L2 aggregated it anyway. Three sites answer this
+  # question and all three must agree.
+  mkdir -p "$(fdir "$root")"
+  printf '{"session_path":"STALE","findings":"oops"}' > "$(fdir "$root")/$h.json"
+  run_dream "$root"
+  assert_nogrep "$(fdir "$root")/$h.json" 'oops'  "the stale invalid file was replaced, not skipped"
+  assert_eq "$(jq -r '.findings | type' "$(fdir "$root")/$h.json")" "array" "the rewritten file has a real findings array"
+  rm -rf "$root"
+}
+
+test_rounds_used_counts_rounds_that_dispatched(){
+  echo "# a round that deferred before dispatching must not be counted as a round used"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  local shim; shim=$(shim_curl "$root" 000)
+  TEST_CURL_SHIMMED=1 PATH="$shim:$PATH" AUTODREAM_NETCHECK=1 AUTODREAM_NETCHECK_CAP=0 run_dream "$root"
+  assert_grep "$(fdir "$root")/run-stats.txt" 'l1_rounds_used: 0' "zero rounds dispatched is reported as zero"
+  # And the L2-scoped keys exist even though the run returned before the aggregator.
+  assert_grep "$(fdir "$root")/run-stats.txt" 'network_deferred_l2: no'      "the L2 keys are written on the L1-deferral path too"
+  assert_grep "$(fdir "$root")/run-stats.txt" 'network_down_seconds_l2: 0'   "an L2 that never ran waited zero seconds"
+  rm -rf "$root"
+}
+
+test_unexecutable_curl_is_not_read_as_an_outage(){
+  echo "# a curl that exists but cannot be executed (exit 126) is unclassifiable, not down"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  mkdir -p "$root/shim"
+  # No shebang and no exec permission on the target: bash reports 126, not 127.
+  printf 'not-an-executable\n' > "$root/shim/curl"; chmod 644 "$root/shim/curl"
+  TEST_CURL_SHIMMED=1 PATH="$root/shim:$PATH" AUTODREAM_NETCHECK=1 AUTODREAM_NETCHECK_CAP=0 run_dream "$root"
+  assert_file "$root/dreams/$DATE.md" "the run completed rather than deferring on an unrunnable curl"
+  assert_grep "$(fdir "$root")/run-stats.txt" 'network_deferred: no' "126 is treated the same as 127"
+  rm -rf "$root"
+}
+
+test_worker_failure_records_exit_code_and_stdout(){
+  echo "# a failed worker's .err carries its exit code and its stdout, not just 'Working...'"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  local shim; shim=$(shim_curl "$root" 200)   # network is fine; the worker is not
+  local h; h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
+  export MOCK_MODE=l1_noisy_fail
+  TEST_CURL_SHIMMED=1   PATH="$shim:$PATH" AUTODREAM_L1_ROUNDS=1 run_dream "$root"
+  unset MOCK_MODE
+  local err="$(fdir "$root")/$h.json.err"
+  assert_grep    "$err" 'worker exit code: 7'          ".err records the worker's exit code"
+  assert_grep    "$err" 'rate_limit_exceeded'          ".err carries the stdout that explains the failure"
+  assert_nogrep  "$err" 'no route to api'              "a reachable host is not reported as an outage"
+  assert_no_file "$(fdir "$root")/$h.json.out"         "the stdout capture is cleaned up"
+  rm -rf "$root"
+}
+
+test_warmup_runs_before_the_fanout(){
+  echo "# the auth warmup is one serial call that lands before round 1 dispatches"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  run_dream "$root"
+  # Ordering is the whole feature. A warmup that runs alongside the fanout refreshes
+  # nothing, because the workers it was meant to protect are already racing it.
+  local warm round
+  warm=$(grep -n 'L1 auth warmup' "$root/run.out" | head -1 | cut -d: -f1)
+  round=$(grep -n 'L1 triage round 1/' "$root/run.out" | head -1 | cut -d: -f1)
+  assert_grep "$root/run.out" 'L1 auth warmup'          "the warmup is logged"
+  [ -n "$warm" ] && [ -n "$round" ] && [ "$warm" -lt "$round" ] \
+    && ok "the warmup completes before the first round dispatches" \
+    || no "the warmup completes before the first round dispatches (warmup line $warm, round line $round)"
+  assert_grep "$(fdir "$root")/run-stats.txt" 'l1_warmup: ok' "run-stats records the warmup result"
+  rm -rf "$root"
+}
+
+test_warmup_can_be_disabled(){
+  echo "# AUTODREAM_L1_WARMUP=0 skips the call and says so rather than reporting a pass"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  AUTODREAM_L1_WARMUP=0 run_dream "$root"
+  # 'skipped' and 'ok' must never be the same token: a self-audit reading l1_warmup has
+  # to be able to tell a warmup that passed from one that never ran.
+  assert_grep   "$(fdir "$root")/run-stats.txt" 'l1_warmup: skipped' "a disabled warmup is recorded as skipped"
+  assert_nogrep "$root/run.out" 'L1 auth warmup'                     "and nothing is dispatched for it"
+  assert_file   "$root/dreams/$DATE.md"                              "the run still completes normally"
+  rm -rf "$root"
+}
+
+test_a_deterministic_failure_trips_the_breaker(){
+  echo "# two rounds recovering nothing cut the retry budget instead of spending all five"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  local h; h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
+  # l1_incomplete never writes output, so every round fails identically — the 2026-09-05
+  # through 2026-09-10 shape, where five rounds bought sixteen empty stubs and the stats
+  # they left read as a healthy retry loop.
+  export MOCK_MODE=l1_incomplete
+  AUTODREAM_L1_ROUNDS=5 run_dream "$root"
+  unset MOCK_MODE
+  local stats="$(fdir "$root")/run-stats.txt"
+  assert_grep   "$root/run.out" 'L1 circuit breaker'      "the breaker announces itself"
+  assert_grep   "$stats" 'l1_breaker_fired: yes'          "run-stats records that the budget was cut"
+  assert_grep   "$root/run.out" 'L1 triage round 2/5'     "round 2 still runs (one bad round proves nothing)"
+  assert_nogrep "$root/run.out" 'L1 triage round 3/5'     "rounds 3 and 4 are skipped"
+  assert_nogrep "$root/run.out" 'L1 triage round 4/5'     "no further retry round is dispatched"
+  # The stub round is not optional. Without it the slot stays empty, which the deferral
+  # logic reads as a dead network rather than a dead worker.
+  assert_file   "$(fdir "$root")/$h.json"                 "the stub round still writes the metadata stub"
+  assert_grep   "$stats" 'l1_missing_after_retries: 0'    "no session is left in a missing state"
+  assert_grep   "$stats" 'network_deferred: no'           "a deterministic worker failure is not an outage"
+  rm -rf "$root"
+}
+
+test_a_flaky_worker_does_not_trip_the_breaker(){
+  echo "# a worker that recovers on retry must keep its retry budget"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  # l1_flaky fails the first dispatch per session and succeeds on the second. Round 2
+  # recovers the session, so the breaker's two-rounds-of-no-progress condition is never
+  # met — this is the case the retry loop exists for and the breaker must not steal.
+  export MOCK_MODE=l1_flaky
+  AUTODREAM_L1_ROUNDS=5 run_dream "$root"
+  unset MOCK_MODE
+  assert_grep   "$(fdir "$root")/run-stats.txt" 'l1_breaker_fired: no' "the breaker stays out of a recovering run"
+  assert_nogrep "$root/run.out" 'L1 circuit breaker'                   "and never announces itself"
+  assert_file   "$root/dreams/$DATE.md"                                "the run produces its report"
+  rm -rf "$root"
+}
+
 # ---- run the new tests ----
+test_network_down_defers_the_date
+test_route_lost_after_the_precheck_still_defers
+test_missing_curl_is_not_read_as_an_outage
+test_a_transient_outage_is_ridden_out_not_deferred
+test_no_curl_does_not_defer_a_healthy_run
+test_skill_fields_are_enforced_from_the_sidecar
+test_skill_fields_dropped_without_a_sidecar
+test_skill_fields_dropped_with_a_partial_sidecar
+test_shared_drift_check_from_a_worktree
+test_malformed_worker_output_is_a_failure_with_its_evidence
+test_findings_must_be_an_array_not_merely_present
+test_rounds_used_counts_rounds_that_dispatched
+test_stale_wrongtype_findings_is_redispatched
+test_unexecutable_curl_is_not_read_as_an_outage
+test_worker_failure_records_exit_code_and_stdout
 test_skills_inventory
 test_skills_inventory_python_failure_exits_1
 test_omp_singleroot_autodetect
@@ -2078,6 +2676,276 @@ test_omp_singleroot_empty_store_no_abort
 test_rootprobe_remembers_choice
 test_rootprobe_no_write_mode_flags_but_does_not_write
 test_rootprobe_empty_home
+test_warmup_runs_before_the_fanout
+test_warmup_can_be_disabled
+test_a_deterministic_failure_trips_the_breaker
+test_a_flaky_worker_does_not_trip_the_breaker
+test_breaker_needs_two_barren_rounds_not_one
+test_warmup_empty_stdout_is_a_failure_not_ok
+test_warmup_diagnostic_stdout_is_a_failure_not_ok
+test_changelog_multi_source
+test_changelog_refuses_foreign_cache_dir
+test_changelog_single_remote_suppresses_defaults
+
+# Streak rows in a state file, skipping the `#last` watermark line.
+streak_rows(){ awk '!/^#/ && NF' "$1" 2>/dev/null | wc -l | tr -d ' '; }
+
+test_question_streaks_state_lives_with_the_install(){
+  echo "# question streaks: the store is the install's, one file holds the watermark, clear takes the lock"
+  local root; root=$(setup_env)
+  local QS="$REPO/bin/question-streaks.sh"
+  [ -x "$QS" ] || { no "question-streaks.sh executable"; return 0; }
+  mkdir -p "$root/home"
+  : > "$root/autodream/config"
+  local f; for f in "$REPO"/bin/*.sh; do ln -sf "$f" "$root/autodream/$(basename "$f")"; done
+  printf 'abc123def456\t2\t2019-12-30\t2019-12-31\tStale question?\n' > "$root/autodream/question-streaks.tsv"
+
+  # Run with no AUTODREAM_DIR at all, the documented no-environment invocation. The helper
+  # used to fall back to ~/.claude/autodream and never see this install's store.
+  local out
+  out=$(env -u AUTODREAM_DIR -u AUTODREAM_QUESTION_STATE HOME="$root/home" bash "$root/autodream/question-streaks.sh" status 2>&1)
+  case "$out" in *"Stale question?"*) ok "status run through the install link reads the install's store" ;; *) no "status run through the install link reads the install's store (got: $out)" ;; esac
+
+  # A night with no sessions writes a question-free report and must clear that store, even
+  # though run.sh has not exported AUTODREAM_DIR yet on that early path.
+  env -u AUTODREAM_DIR HOME="$root/home" AUTODREAM_CHANGELOG=0 OMP_BIN="$MOCK" \
+    AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
+    AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_NOTIFY_DRYRUN=1 \
+    PROJECTS_DIR="$root/projects" DREAMS_DIR="$root/dreams" \
+    bash "$root/autodream/run.sh" "$DATE" > "$root/run.out" 2>&1
+  assert_file "$root/dreams/$DATE.md" "precondition: the empty night wrote its report"
+  assert_eq "$(streak_rows "$root/autodream/question-streaks.tsv")" "0" "the empty night clears the install's streak store"
+
+  # Clearing the board must not erase the watermark: rebuilding an older report afterwards
+  # would otherwise re-enter history as a new night and grow a false streak.
+  local st="$root/w.tsv"; : > "$st"
+  qsw(){ AUTODREAM_QUESTION_STATE="$st" AUTODREAM_NOTIFY_DRYRUN=1 bash "$QS" "$@" 2>&1; }
+  printf '## Open questions for the user\n\n1. **Recurring?** body\n\n<!-- autodream:open-questions=1 -->\n' > "$root/2026-03-01.md"
+  printf '## Open questions for the user\n\nNone.\n\n<!-- autodream:open-questions=0 -->\n' > "$root/2026-03-02.md"
+  qsw update "$root/2026-03-01.md" >/dev/null
+  qsw update "$root/2026-03-02.md" >/dev/null
+  out=$(qsw update "$root/2026-03-01.md")
+  case "$out" in *"older than the last counted report"*) ok "an older rebuild after a cleared board is still refused" ;; *) no "an older rebuild after a cleared board is still refused (got: $out)" ;; esac
+  assert_eq "$(streak_rows "$st")" "0" "and the cleared board stays clear"
+  # One file, one write. The watermark used to live beside the state, and three reviews in
+  # a row found an order of writes between the two files that let history back in.
+  assert_eq "$(head -1 "$st")" "$(printf '#last\t2026-03-02')" "the watermark is the first line of the state file"
+  assert_no_file "$st.last" "and no second watermark file is written"
+
+  # clear takes the same lock as update, or an update that already read the old state puts
+  # the cleared streak back when it writes.
+  printf 'k\t1\t2026-03-03\t2026-03-03\tHeld?\n' > "$st"
+  mkdir "$st.lock"
+  AUTODREAM_QUESTION_STATE="$st" bash "$QS" clear all >/dev/null 2>&1; local rc=$?
+  rmdir "$st.lock" 2>/dev/null
+  assert_eq "$rc" "1" "clear fails while an update holds the lock"
+  assert_eq "$(streak_rows "$st")" "1" "and leaves the state for that update"
+
+  # An EMPTY board is not a reason to skip the lock: an update holding it may be about to
+  # write the first streak, which clear would then report as cleared (Codex review of 4eea84d).
+  : > "$st"
+  mkdir "$st.lock"
+  AUTODREAM_QUESTION_STATE="$st" bash "$QS" clear all >/dev/null 2>&1; rc=$?
+  rmdir "$st.lock" 2>/dev/null
+  assert_eq "$rc" "1" "clear on an empty board still waits for the lock and fails while it is held"
+
+  # A state file that exists but cannot be read is not an empty board. Reading it as empty
+  # restarts every streak and drops the watermark with it. Write-only, so a write would land.
+  local st2="$root/w2.tsv"; : > "$st2"
+  qs2(){ AUTODREAM_QUESTION_STATE="$st2" AUTODREAM_NOTIFY_DRYRUN=1 bash "$QS" "$@" 2>&1; }
+  printf '## Open questions for the user\n\n1. **Recurring?** body\n\n<!-- autodream:open-questions=1 -->\n' > "$root/2026-03-04.md"
+  qs2 update "$root/2026-03-01.md" >/dev/null
+  cp "$st2" "$root/w2.before"
+  chmod 200 "$st2"
+  qs2 update "$root/2026-03-04.md" >/dev/null
+  chmod 644 "$st2"
+  if cmp -s "$st2" "$root/w2.before"; then ok "an unreadable state file refuses the update instead of restarting every streak"; else no "an unreadable state file refuses the update instead of restarting every streak"; fi
+
+  # A state directory that cannot take a temp file leaves the state as it was.
+  mkdir -p "$root/ro"; local st3="$root/ro/w3.tsv"
+  AUTODREAM_QUESTION_STATE="$st3" AUTODREAM_NOTIFY_DRYRUN=1 bash "$QS" update "$root/2026-03-01.md" >/dev/null 2>&1
+  cp "$st3" "$root/w3.before"
+  chmod 500 "$root/ro"
+  AUTODREAM_QUESTION_STATE="$st3" AUTODREAM_NOTIFY_DRYRUN=1 bash "$QS" update "$root/2026-03-04.md" >/dev/null 2>&1
+  chmod 700 "$root/ro"
+  if cmp -s "$st3" "$root/w3.before"; then ok "a state directory that refuses a temp file leaves state untouched"; else no "a state directory that refuses a temp file leaves state untouched"; fi
+
+  # clear all forgets the streaks and keeps the watermark, so an older rebuild afterwards is
+  # still refused. status never prints the watermark line as a streak.
+  local st6="$root/w6.tsv"; : > "$st6"
+  qs6(){ AUTODREAM_QUESTION_STATE="$st6" AUTODREAM_NOTIFY_DRYRUN=1 bash "$QS" "$@" 2>&1; }
+  qs6 update "$root/2026-03-04.md" >/dev/null
+  out=$(qs6 status)
+  case "$out" in *"#last"*) no "status does not print the watermark line (got: $out)" ;; *"Recurring?"*) ok "status does not print the watermark line" ;; *) no "status does not print the watermark line (got: $out)" ;; esac
+  qs6 clear all >/dev/null
+  assert_eq "$(head -1 "$st6")" "$(printf '#last\t2026-03-04')" "clear all keeps the watermark"
+  out=$(qs6 update "$root/2026-03-01.md")
+  case "$out" in *"older than the last counted report"*) ok "and an older rebuild after clear all is refused" ;; *) no "and an older rebuild after clear all is refused (got: $out)" ;; esac
+
+  # A state path whose directory does not exist yet. The lock lives beside the state, so
+  # the directory has to exist before the lock is taken, or every update reads as a held
+  # lock and exits without ever creating the state (Codex review of b72f0e4).
+  local nested="$root/new/nested/question-streaks.tsv"
+  AUTODREAM_QUESTION_STATE="$nested" AUTODREAM_NOTIFY_DRYRUN=1 bash "$QS" update "$root/2026-03-04.md" >/dev/null 2>&1
+  assert_eq "$(streak_rows "$nested")" "1" "the first update on a new state directory creates the state"
+
+  # The final rename can fail. The whole state is one temp file renamed into place, so a
+  # failed rename leaves the old file whole: board and watermark together.
+  local st4="$root/w4.tsv"; : > "$st4"
+  mkdir -p "$root/failmv"
+  printf '#!/bin/sh\nexit 1\n' > "$root/failmv/mv"; chmod +x "$root/failmv/mv"
+  printf '## Open questions for the user\n\n1. **Another?** body\n\n<!-- autodream:open-questions=1 -->\n' > "$root/2026-03-03.md"
+  AUTODREAM_QUESTION_STATE="$st4" AUTODREAM_NOTIFY_DRYRUN=1 bash "$QS" update "$root/2026-03-01.md" >/dev/null 2>&1
+  cp "$st4" "$root/w4.before"
+  PATH="$root/failmv:$PATH" AUTODREAM_QUESTION_STATE="$st4" AUTODREAM_NOTIFY_DRYRUN=1 bash "$QS" update "$root/2026-03-02.md" >/dev/null 2>&1
+  if cmp -s "$st4" "$root/w4.before"; then ok "a failed watermark move on a question-free report leaves the board as it was"; else no "a failed watermark move on a question-free report leaves the board as it was"; fi
+  PATH="$root/failmv:$PATH" AUTODREAM_QUESTION_STATE="$st4" AUTODREAM_NOTIFY_DRYRUN=1 bash "$QS" update "$root/2026-03-03.md" >/dev/null 2>&1
+  if cmp -s "$st4" "$root/w4.before"; then ok "a failed watermark move on a report with questions leaves the board as it was"; else no "a failed watermark move on a report with questions leaves the board as it was"; fi
+  rm -rf "$root"
+}
+
+test_question_streaks(){
+  echo "# question streaks: count repeats across reports and escalate the stale ones"
+  local root; root=$(setup_env)
+  local QS="$REPO/bin/question-streaks.sh"
+  [ -x "$QS" ] || { no "question-streaks.sh executable"; return 0; }
+  local st="$root/streaks.tsv"; : > "$st"
+  local out
+  qs(){ AUTODREAM_QUESTION_STATE="$st" AUTODREAM_NOTIFY_DRYRUN=1 bash "$QS" "$@" 2>&1; }
+
+  mk_report(){ # $1=date  $2..=bold titles
+    local d="$1"; shift
+    { printf '## Open questions for the user\n\n'
+      local i=1
+      for t in "$@"; do printf '%d. **%s** body text that is rewritten every night\n' "$i" "$t"; i=$(( i + 1 )); done
+      printf '\n<!-- autodream:open-questions=%d -->\n' "$#"
+    } > "$root/$d.md"
+  }
+
+  # The real shape this was built from: the title is byte-identical night to night while
+  # the body prose is rewritten, so an exact key on the title is enough.
+  mk_report 2026-01-01 "Fix the X bookmarks walker, or turn the feature off?" "Something else?"
+  mk_report 2026-01-02 "Fix the X bookmarks walker, or turn the feature off?"
+  mk_report 2026-01-03 "Fix the X bookmarks walker, or turn the feature off?"
+
+  out=$(qs update "$root/2026-01-01.md")
+  assert_eq "$(printf '%s' "$out" | grep -c 'past 3 consecutive')" "1" "night 1 reports its count"
+  case "$out" in *"0 at or past"*) ok "night 1 escalates nothing" ;; *) no "night 1 escalates nothing (got: $out)" ;; esac
+
+  out=$(qs update "$root/2026-01-02.md")
+  case "$out" in *"0 at or past"*) ok "night 2 still escalates nothing" ;; *) no "night 2 still escalates nothing" ;; esac
+  # The question that vanished must stop counting rather than linger forever.
+  assert_eq "$(grep -c 'Something else' "$st")" "0" "a question absent from a later report is dropped"
+
+  out=$(qs update "$root/2026-01-03.md")
+  case "$out" in
+    *"3 consecutive reports"*) ok "night 3 escalates the repeated question" ;;
+    *) no "night 3 escalates the repeated question (got: $out)" ;;
+  esac
+  case "$out" in *"Fix the X bookmarks walker"*) ok "the escalation names the question" ;; *) no "the escalation names the question" ;; esac
+
+  # Streaks count consecutive REPORTS, not calendar days — a night that produced no report
+  # must not reset one, since surviving failing nights is the whole point.
+  mk_report 2026-01-09 "Fix the X bookmarks walker, or turn the feature off?"
+  out=$(qs update "$root/2026-01-09.md")
+  case "$out" in *"4 consecutive reports"*) ok "a date gap does not reset the streak" ;; *) no "a date gap does not reset the streak (got: $out)" ;; esac
+
+  # A report with genuinely zero questions clears the board.
+  printf '## Open questions for the user\n\nNone.\n\n<!-- autodream:open-questions=0 -->\n' > "$root/2026-01-10.md"
+  qs update "$root/2026-01-10.md" >/dev/null
+  # wc -l, not `grep -c . || echo 0`: grep -c prints 0 AND exits 1 on no match, so the
+  # fallback fires too and the value is "0\n0". That trap is documented in this repo and
+  # it still caught this test on the first run.
+  assert_eq "$(streak_rows "$st")" "0" "a question-free report clears every streak"
+
+  # A marker that promises questions while none parse means the format moved. That must be
+  # reported, never silently counted as zero — the quiet version would freeze every streak
+  # at its last value and the escalation would never fire again.
+  printf '## Open questions for the user\n\n1. no bold title here?\n\n<!-- autodream:open-questions=1 -->\n' > "$root/2026-01-11.md"
+  out=$(qs update "$root/2026-01-11.md")
+  case "$out" in *"title format changed"*) ok "a changed title format warns instead of counting zero" ;; *) no "a changed title format warns instead of counting zero (got: $out)" ;; esac
+
+  rm -rf "$root"
+}
+
+test_question_streaks_reruns_and_mismatch(){
+  echo "# question streaks: reruns, backwards rebuilds, count mismatch, clear failure"
+  local root; root=$(setup_env)
+  local QS="$REPO/bin/question-streaks.sh"
+  [ -x "$QS" ] || { no "question-streaks.sh executable"; return 0; }
+  local st="$root/streaks.tsv"; : > "$st"
+  local out
+  qs(){ AUTODREAM_QUESTION_STATE="$st" AUTODREAM_NOTIFY_DRYRUN=1 bash "$QS" "$@" 2>&1; }
+  mk(){ # $1=date $2=marker $3..=titles
+    local d="$1" m="$2"; shift 2
+    { printf '## Open questions for the user\n\n'
+      local i=1
+      for t in "$@"; do printf '%d. **%s** nightly-rewritten body\n' "$i" "$t"; i=$(( i + 1 )); done
+      printf '\n<!-- autodream:open-questions=%d -->\n' "$m"
+    } > "$root/$d.md"
+  }
+
+  mk 2026-02-01 1 "Recurring question?"
+  mk 2026-02-02 1 "Recurring question?"
+  qs update "$root/2026-02-01.md" >/dev/null
+  qs update "$root/2026-02-02.md" >/dev/null
+  assert_eq "$(awk -F'\t' '!/^#/ {print $2}' "$st")" "2" "two distinct reports count two"
+
+  # AUTODREAM_FORCE=1 rebuilds the same report. Counting it again would manufacture an
+  # escalation out of a rerun.
+  qs update "$root/2026-02-02.md" >/dev/null
+  assert_eq "$(awk -F'\t' '!/^#/ {print $2}' "$st")" "2" "rebuilding the same report does not advance the streak"
+
+  # A rebuild of an OLDER date must not rewrite live state with history: 02-01 does not
+  # know about anything that happened on 02-02.
+  out=$(qs update "$root/2026-02-01.md")
+  case "$out" in *"older than the last counted report"*) ok "an older rebuild is refused" ;; *) no "an older rebuild is refused (got: $out)" ;; esac
+  assert_eq "$(awk -F'\t' '!/^#/ {print $4}' "$st")" "2026-02-02" "and the live last-seen date is untouched"
+
+  # The marker is the report's own count. Disagreement means questions parsed as nothing;
+  # touching state would silently drop a streak or freeze them all.
+  mk 2026-02-03 2 "Recurring question?"   # marker says 2, only 1 bold title present
+  out=$(qs update "$root/2026-02-03.md")
+  case "$out" in *"but 1 parsed"*) ok "a parsed-vs-marker mismatch warns" ;; *) no "a parsed-vs-marker mismatch warns (got: $out)" ;; esac
+  assert_eq "$(awk -F'\t' '!/^#/ {print $2}' "$st")" "2" "and refuses to change state"
+
+  # A report with no count marker is incomplete: an L2 run truncated before the Open
+  # questions section, left in place when run.sh could not move it aside. Parsing it as
+  # zero questions cleared every streak and advanced the watermark (Codex review of b72f0e4).
+  printf '# Autodream\n\n## Activity snapshot\n- 7 sessions\n' > "$root/2026-02-05.md"
+  printf '## Open questions for the user\n\n1. **Recurring question?** body cut off mid-' > "$root/2026-02-06.md"
+  cp "$st" "$root/st.before"
+  out=$(qs update "$root/2026-02-05.md")
+  case "$out" in *"no open-questions marker"*) ok "a report truncated before its questions is refused as incomplete" ;; *) no "a report truncated before its questions is refused as incomplete (got: $out)" ;; esac
+  if cmp -s "$st" "$root/st.before"; then ok "and does not clear the board"; else no "and does not clear the board"; fi
+  qs update "$root/2026-02-06.md" >/dev/null
+  if cmp -s "$st" "$root/st.before"; then ok "a report truncated after a question title is refused too"; else no "a report truncated after a question title is refused too"; fi
+
+  # clear must not claim success it did not achieve.
+  chmod 500 "$root" 2>/dev/null
+  out=$(AUTODREAM_QUESTION_STATE="$root/nope/state.tsv" bash "$QS" clear all 2>&1); local rc=$?
+  chmod 700 "$root" 2>/dev/null
+  assert_eq "$rc" "0" "clear on a missing state file is a no-op, not an error"
+
+  rm -rf "$root"
+}
+
+test_question_streaks
+test_question_streaks_reruns_and_mismatch
+test_question_streaks_state_lives_with_the_install
+
+# Cross-repo drift, last. It is not a unit test — it inspects the sibling checkout, so it
+# can only run on a machine holding both — but it belongs in the same command as the rest,
+# because the failure it catches is one no amount of in-repo testing can see. Both repos
+# passed their own suites for the four nights cc-autodream's bookmark walk was broken.
+# SKIPPED (no sibling) exits 0 and says so; drift exits 1 and counts as a failure here.
+echo
+echo "# cross-repo: shared files must not drift from the sibling autodream repo"
+if bash "$REPO/bin/check-shared-drift.sh"; then
+  ok "shared files match the sibling repo (or the check skipped and said so)"
+else
+  no "shared files have drifted from the sibling repo"
+fi
 
 echo
 echo "----------------------------------------"

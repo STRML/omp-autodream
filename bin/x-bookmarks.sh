@@ -228,25 +228,42 @@ detect_query_id() {
   if [ -n "$chunk_id" ]; then
     name=$(grep -oE "${chunk_id}:\"[^\"]+\"" "$html" 2>/dev/null | head -1 | sed 's/^[0-9]*:"//; s/"$//')
     # The id appears in both the name map and the hash map; the hash map's value is the
-    # short hex, and it is the later occurrence.
-    hash=$(grep -oE "${chunk_id}:\"[a-f0-9]{7,8}\"" "$html" 2>/dev/null | tail -1 | sed 's/^[0-9]*:"//; s/"$//')
+    # pure-hex one, and it is the later occurrence. The width is NOT fixed and must not be
+    # pinned: this read `{7,8}` until 2026-09-11, when X moved to 16-char hashes
+    # (`34778:"c316cbd4536390c0"`). The regex then matched nothing, `hash` came back empty,
+    # no candidate URL was ever built, and the walk reported "could not find the Bookmarks
+    # queryId in any X JS bundle" on every run from at least 2026-09-05. The quotes on both
+    # ends are what keep this from matching the name entry instead.
+    hash=$(grep -oE "${chunk_id}:\"[a-f0-9]{7,64}\"" "$html" 2>/dev/null | tail -1 | sed 's/^[0-9]*:"//; s/"$//')
     if [ -n "$name" ] && [ -n "$hash" ]; then
-      # X writes 8-char hashes into filenames but sometimes stores 7 in the map.
+      # The filename carries one more hex digit than the map stores — `main.<16>a.js` in the
+      # page beside `main:"<16>"` in the map, and the Bookmarks chunk resolved at
+      # `<name>.c316cbd4536390c0a.js` against a map value of `c316cbd4536390c0`. That digit
+      # is not derivable from the map, so enumerate it. `a` first because both chunks
+      # observed on 2026-09-11 used it, so the common path costs one request; the bare hash
+      # is second in case X ever stops truncating. Each miss is a cheap 404 and the loop
+      # below stops at the first bundle that yields a queryId.
       local sfx
-      for sfx in "$hash" "${hash}a" "${hash}b"; do
+      for sfx in "${hash}a" "$hash" "${hash}b" "${hash}c" "${hash}d" "${hash}e" "${hash}f" \
+                 "${hash}0" "${hash}1" "${hash}2" "${hash}3" "${hash}4" \
+                 "${hash}5" "${hash}6" "${hash}7" "${hash}8" "${hash}9"; do
         printf 'https://abs.twimg.com/responsive-web/client-web/%s.%s.js\n' "$name" "$sfx" >> "$cands"
       done
     fi
   fi
 
+  # Order-preserving dedupe, NOT `sort -u`. The suffix candidates above are deliberately
+  # ordered cheapest-first, and sorting threw that away — the digit variants would sort
+  # ahead of `a`, so the one that actually resolves came last and the cap cut it off first.
   local url qid n=0
   while IFS= read -r url; do
     [ -n "$url" ] || continue
-    n=$(( n + 1 )); [ "$n" -gt 8 ] && break
+    # Bounded, but wide enough to walk the whole suffix enumeration plus main/vendor.
+    n=$(( n + 1 )); [ "$n" -gt 24 ] && break
     curl_x -H 'referer: https://x.com/' -o "$TMP/chunk.js" "$url" >/dev/null 2>&1 || continue
     qid=$(extract_qid "$TMP/chunk.js")
     if [ -n "$qid" ]; then printf '%s' "$qid"; return 0; fi
-  done < <(sort -u "$cands")
+  done < <(awk '!seen[$0]++' "$cands")
 
   fail "could not find the Bookmarks queryId in any X JS bundle (X changed its bundle layout; see the grounding note in this script)"
   return 1

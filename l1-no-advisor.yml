@@ -1,3 +1,17 @@
 advisor:
   enabled: false
   subagents: false
+# Headless workers are pinned to a remote model, so probing local engines can only
+# cost time. On 2026-09-06 all 18 worker processes across three rounds died with a
+# localhost provider probe as their last log line, right after the Mac woke from a
+# 56-minute outage; the probe took 3.6s instead of the 0.15ms a refused connection
+# costs. Nothing here ever wants ollama, llama.cpp or lm-studio.
+disabledProviders:
+  - ollama
+  - llama.cpp
+  - lm-studio
+# First-turn mnemopi recall makes headless -p workers exit 0 with empty stdout before the
+# first model call. Verified 2026-09-14: 30 of 30 failed 09-13 workers stopped there, and the two
+# sessions that failed every round succeeded once this was off. Workers need no memory.
+mnemopi:
+  autoRecall: false

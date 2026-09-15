@@ -9,14 +9,20 @@ Cross-slice interfaces for porting cc-autodream to OMP. All slices agree on thes
   `$OMP_BIN --allow-home -p --permission-mode bypassPermissions --no-session-persistence --strict-mcp-config --disable-slash-commands --config "$NO_ADVISOR_CFG" [--model <L1_MODEL>]`
 - Tools grant: L1 workers get `--tools=Read,Write` (read the transcript, write the findings JSON); the L2 aggregator gets `--tools=Glob,Read` — no Write/Edit, because L2 emits the report on stdout only and must never touch files. Both flags are accepted by omp.
 
-## Advisor-off overlay (REQUIRED on every worker)
-- File: `$AUTODREAM_DIR/l1-no-advisor.yml` (written by install.sh), content:
+## Worker overlay (REQUIRED on every worker)
+- File: `$AUTODREAM_DIR/l1-no-advisor.yml`, a symlink install.sh creates to the repo's `l1-no-advisor.yml`. It sets:
   ```yaml
   advisor:
     enabled: false
     subagents: false
+  disabledProviders: [ollama, llama.cpp, lm-studio]
+  mnemopi:
+    autoRecall: false
   ```
-- Passed as `--config` to every L1 worker AND the L2 aggregator so no headless worker boots the opus advisor (verified: it DOES fire in print mode otherwise). env `NO_ADVISOR_CFG`.
+- Passed as `--config` to every L1 worker AND the L2 aggregator. env `NO_ADVISOR_CFG`.
+  - `advisor`: no headless worker boots the opus advisor (verified: it DOES fire in print mode otherwise).
+  - `disabledProviders`: no worker spends startup probing local engines.
+  - `mnemopi.autoRecall: false`: first-turn recall made `-p` workers exit 0 with empty stdout before the first model call (verified 2026-09-14).
 
 ## Session roots (OMP)
 - OMP sessions live at `$HOME/.omp/agent/sessions/<project-encoded>/<TS>_<uuid>.jsonl`, one JSONL per session dir, project-encoded dirs like `-git-rush-rushautoworks`/`--private-tmp--`.
@@ -39,9 +45,21 @@ Cross-slice interfaces for porting cc-autodream to OMP. All slices agree on thes
 - L2 report delivery changed: the aggregator has NO Write tool. It prints the report on stdout ending with an `AUTODREAM_REPORT_END` line; run.sh strips everything from the LAST sentinel into `dreams/<date>.md` (atomic tmp+rename) and appends the post-sentinel `report:` + 3-line summary to the run log. A capture is a validated delivery only with the sentinel present AND the `autodream:open-questions=` marker.
 
 ## L1/L2 models
-- L1: `runinfra/deepseek-v4-flash` (env `AUTODREAM_L1_MODEL`, default that).
+- L1: `deepseek/deepseek-flash` (env `AUTODREAM_L1_MODEL`, default that). This said
+  `runinfra/deepseek-v4-flash` until 2026-09-11 while the code ran `anthropic/claude-haiku`;
+  nothing sets the env var, so the invocation's `:-` default is the model in force, and
+  that runinfra id is not in `models.yml`. Alternate measured the same day:
+  `zai/glm-5.3-flash`, ~4x slower, static apiKey instead of OAuth.
 - L2: `anthropic/claude-opus-5` (env `AUTODREAM_L2_MODEL`, default that). Auth: agent.db OAuth (file-based, safe at 3am).
-- L1 auth risk: runinfra key is in the login keychain (`!security` escape). At 3am a locked keychain would kill L1. MITIGATION: run.sh sources `RUNINFRA_API_KEY` from `$AUTODREAM_DIR/x-credentials` (chmod 600) if present, else falls back to keychain; documented. (x-credentials already exists for x-bookmarks.)
+- L1 auth: `deepseek` uses `auth: oauth` from `models.yml`, so no key is needed and none is
+  read. The keychain mitigation described here before 2026-09-11 was never implemented —
+  `run.sh` sources `$AUTODREAM_DIR/x-credentials` and has no keychain fallback, and the
+  installed x-credentials holds only the X/Twitter cookie pair. A key that lives solely in
+  the keychain reaches the workers unset.
+- Both layers serialize one throwaway model call before the L1 fan-out (`l1_warmup` in
+  run-stats, `AUTODREAM_L1_WARMUP=0` to disable). It was added against a suspected
+  cold-token race that turned out not to be the cause, and it stays because it is cheap
+  and never fatal.
 
 ## Tests
 - `tests/run-all.sh` must pass. `tests/mock-claude.sh` → add `tests/mock-omp.sh` emitting minimal `{type:"message"}` transcripts; keep existing fixtures' intent.

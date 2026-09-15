@@ -4,7 +4,7 @@
 # ssh sessions die on disconnect, etc). launchd owns the process, so the run
 # survives the caller going away and has no time cap.
 #
-# It bootstraps a TRANSIENT one-shot LaunchAgent (label "<base>.ondemand") that runs
+# It bootstraps a TRANSIENT one-shot LaunchAgent (label "<base>.ondemand.<install hash>") that runs
 # run.sh once and exits. It never touches the scheduled nightly job.
 #
 # Usage:
@@ -55,8 +55,22 @@ RUN_SH="$BIN_DIR/run.sh"
 # ------------------------------------------------------------- state locations --
 # Defaults mirror run.sh's own defaults; honor the same env overrides so a
 # customized install (different AUTODREAM_DIR / DREAMS_DIR) still works.
-AUTODREAM_DIR="${AUTODREAM_DIR:-$HOME/.omp/agent/autodream}"
-DREAMS_DIR="${DREAMS_DIR:-$HOME/.omp/agent/dreams}"
+# Resolve the install dir from our own location, the same idiom as the siblings.
+# scheduler-label.sh decides ownership by comparing a plist's runner dir against
+# this value, so a hardcoded default never matched a custom-path install
+# (./install.sh /custom) and the .ondemand label silently left that install's
+# namespace. Unresolved BASH_SOURCE on purpose: the symlink's own directory is
+# the install dir, while BIN_DIR below resolves through to the repo.
+AUTODREAM_DIR="${AUTODREAM_DIR:-}"
+if [ -z "$AUTODREAM_DIR" ]; then
+  AUTODREAM_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+  if [ -z "$AUTODREAM_DIR" ] || { [ ! -f "$AUTODREAM_DIR/config" ] && [ ! -f "$AUTODREAM_DIR/l1-no-advisor.yml" ]; }; then
+    # This port's default, not the shared idiom's legacy ~/.claude/autodream:
+    # running straight from the checkout used to land here and still should.
+    AUTODREAM_DIR="$HOME/.omp/agent/autodream"
+  fi
+fi
+DREAMS_DIR="${DREAMS_DIR:-$(dirname "$AUTODREAM_DIR")/dreams}"
 mkdir -p "$AUTODREAM_DIR/logs"
 
 # Target date: explicit arg, else "yesterday" computed exactly like run.sh does —
@@ -71,20 +85,20 @@ fi
 # --------------------------------------------------------------- launchd label --
 UID_NUM="$(id -u)"
 DOMAIN="gui/$UID_NUM"
-# Reuse the base label from the installed scheduled job so the transient label sits
-# in the same namespace. Pick the plist that actually runs run.sh — not siblings
-# like *-review (review.sh). Otherwise synthesize one.
-BASE_LABEL=""
-for plist in "$HOME"/Library/LaunchAgents/*autodream*.plist; do
-  [ -e "$plist" ] || continue
-  case "$plist" in *.ondemand.plist) continue ;; esac
-  /usr/bin/grep -q 'run\.sh' "$plist" 2>/dev/null || continue
-  if l="$(/usr/libexec/PlistBuddy -c 'Print :Label' "$plist" 2>/dev/null)"; then
-    BASE_LABEL="$l"; break
-  fi
-done
-[ -n "$BASE_LABEL" ] || BASE_LABEL="com.$(id -un | tr -dc 'a-zA-Z0-9').autodream"
-LABEL="${BASE_LABEL}.ondemand"
+# Reuse the base label from OUR installed scheduled job so the transient label sits
+# in the same namespace. scheduler-label.sh owns that decision for install.sh too;
+# it will not hand back a label belonging to another autodream install (#14). A
+# conflict on the default name is not fatal here - we only borrow the namespace.
+BASE_LABEL="$("$BIN_DIR/scheduler-label.sh" "$AUTODREAM_DIR" 2>/dev/null || true)"
+[ -n "$BASE_LABEL" ] || BASE_LABEL="com.$(id -un | tr -dc 'a-zA-Z0-9').omp-autodream"
+# The on-demand label always carries a hash of the resolved install dir. The bootout below
+# evicts whatever holds this label, and another install's on-demand plist lives in its own
+# AUTODREAM_DIR where no scan can see it. Two installs share a base label whenever one
+# holds the default or neither has a scheduled job, so no base-label check can rule the
+# collision out (Codex review of 1ee66e4 and cd309b6). pwd -P keeps the hash the same for
+# a trailing slash or a symlinked path, so bootout still finds this install's prior run.
+INSTALL_REAL="$(cd "$AUTODREAM_DIR" 2>/dev/null && pwd -P)" || INSTALL_REAL="${AUTODREAM_DIR%/}"
+LABEL="${BASE_LABEL}.ondemand.$(printf '%s' "$INSTALL_REAL" | shasum -a 1 | cut -c1-8)"
 PLIST="$AUTODREAM_DIR/${LABEL}.plist"
 
 # ----------------------------------------------------------------------- PATH --

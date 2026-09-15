@@ -18,25 +18,24 @@
     sudo pmset repeat wake MTWRFSU 03:10:00
 
   Install:
-    cp launchd/com.user.autodream.plist.example \
-       ~/Library/LaunchAgents/com.user.autodream.plist
+    cp launchd/com.user.omp-autodream.plist.example \
+       ~/Library/LaunchAgents/com.user.omp-autodream.plist
     # Edit the plist: replace REPLACE_WITH_USERNAME and any paths that differ.
-    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.autodream.plist
-    launchctl kickstart -k gui/$(id -u)/com.user.autodream    # run now to test
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.omp-autodream.plist
+    launchctl kickstart -k gui/$(id -u)/com.user.omp-autodream    # run now to test
 
-  Logs land at $HOME/.claude/autodream/logs/launchd.{out,err}.log and
-  $HOME/.claude/autodream/logs/run-YYYY-MM-DD.log.
+  Logs land at $HOME/.omp/agent/autodream/logs/launchd.{out,err}.log and
+  $HOME/.omp/agent/autodream/logs/run-YYYY-MM-DD.log.
 -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.user.autodream</string>
+    <string>com.user.omp-autodream</string>
 
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>-lc</string>
-        <string>$HOME/.claude/autodream/run.sh</string>
+        <string>/Users/REPLACE_WITH_USERNAME/.omp/agent/autodream/run.sh</string>
     </array>
 
     <!-- Several catch-up triggers; the idempotency guard makes all-but-one a no-op. -->
@@ -52,9 +51,9 @@
     <false/>
 
     <key>StandardOutPath</key>
-    <string>/Users/REPLACE_WITH_USERNAME/.claude/autodream/logs/launchd.out.log</string>
+    <string>/Users/REPLACE_WITH_USERNAME/.omp/agent/autodream/logs/launchd.out.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/REPLACE_WITH_USERNAME/.claude/autodream/logs/launchd.err.log</string>
+    <string>/Users/REPLACE_WITH_USERNAME/.omp/agent/autodream/logs/launchd.err.log</string>
 
     <key>EnvironmentVariables</key>
     <dict>
