@@ -15,3 +15,4 @@ bin/cookie-cadence.sh
 bin/make-notifier.sh
 bin/overlap-stats.sh
 bin/x-bookmarks.sh
+bin/question-streaks.sh

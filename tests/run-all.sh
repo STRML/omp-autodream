@@ -2626,6 +2626,123 @@ test_changelog_multi_source
 test_changelog_refuses_foreign_cache_dir
 test_changelog_single_remote_suppresses_defaults
 
+test_question_streaks(){
+  echo "# question streaks: count repeats across reports and escalate the stale ones"
+  local root; root=$(setup_env)
+  local QS="$REPO/bin/question-streaks.sh"
+  [ -x "$QS" ] || { no "question-streaks.sh executable"; return 0; }
+  local st="$root/streaks.tsv"; : > "$st"
+  local out
+  qs(){ AUTODREAM_QUESTION_STATE="$st" AUTODREAM_NOTIFY_DRYRUN=1 bash "$QS" "$@" 2>&1; }
+
+  mk_report(){ # $1=date  $2..=bold titles
+    local d="$1"; shift
+    { printf '## Open questions for the user\n\n'
+      local i=1
+      for t in "$@"; do printf '%d. **%s** body text that is rewritten every night\n' "$i" "$t"; i=$(( i + 1 )); done
+      printf '\n<!-- autodream:open-questions=%d -->\n' "$#"
+    } > "$root/$d.md"
+  }
+
+  # The real shape this was built from: the title is byte-identical night to night while
+  # the body prose is rewritten, so an exact key on the title is enough.
+  mk_report 2026-01-01 "Fix the X bookmarks walker, or turn the feature off?" "Something else?"
+  mk_report 2026-01-02 "Fix the X bookmarks walker, or turn the feature off?"
+  mk_report 2026-01-03 "Fix the X bookmarks walker, or turn the feature off?"
+
+  out=$(qs update "$root/2026-01-01.md")
+  assert_eq "$(printf '%s' "$out" | grep -c 'past 3 consecutive')" "1" "night 1 reports its count"
+  case "$out" in *"0 at or past"*) ok "night 1 escalates nothing" ;; *) no "night 1 escalates nothing (got: $out)" ;; esac
+
+  out=$(qs update "$root/2026-01-02.md")
+  case "$out" in *"0 at or past"*) ok "night 2 still escalates nothing" ;; *) no "night 2 still escalates nothing" ;; esac
+  # The question that vanished must stop counting rather than linger forever.
+  assert_eq "$(grep -c 'Something else' "$st")" "0" "a question absent from a later report is dropped"
+
+  out=$(qs update "$root/2026-01-03.md")
+  case "$out" in
+    *"3 consecutive reports"*) ok "night 3 escalates the repeated question" ;;
+    *) no "night 3 escalates the repeated question (got: $out)" ;;
+  esac
+  case "$out" in *"Fix the X bookmarks walker"*) ok "the escalation names the question" ;; *) no "the escalation names the question" ;; esac
+
+  # Streaks count consecutive REPORTS, not calendar days — a night that produced no report
+  # must not reset one, since surviving failing nights is the whole point.
+  mk_report 2026-01-09 "Fix the X bookmarks walker, or turn the feature off?"
+  out=$(qs update "$root/2026-01-09.md")
+  case "$out" in *"4 consecutive reports"*) ok "a date gap does not reset the streak" ;; *) no "a date gap does not reset the streak (got: $out)" ;; esac
+
+  # A report with genuinely zero questions clears the board.
+  printf '## Open questions for the user\n\nNone.\n\n<!-- autodream:open-questions=0 -->\n' > "$root/2026-01-10.md"
+  qs update "$root/2026-01-10.md" >/dev/null
+  # wc -l, not `grep -c . || echo 0`: grep -c prints 0 AND exits 1 on no match, so the
+  # fallback fires too and the value is "0\n0". That trap is documented in this repo and
+  # it still caught this test on the first run.
+  assert_eq "$(wc -l < "$st" | tr -d " ")" "0" "a question-free report clears every streak"
+
+  # A marker that promises questions while none parse means the format moved. That must be
+  # reported, never silently counted as zero — the quiet version would freeze every streak
+  # at its last value and the escalation would never fire again.
+  printf '## Open questions for the user\n\n1. no bold title here?\n\n<!-- autodream:open-questions=1 -->\n' > "$root/2026-01-11.md"
+  out=$(qs update "$root/2026-01-11.md")
+  case "$out" in *"title format changed"*) ok "a changed title format warns instead of counting zero" ;; *) no "a changed title format warns instead of counting zero (got: $out)" ;; esac
+
+  rm -rf "$root"
+}
+
+test_question_streaks_reruns_and_mismatch(){
+  echo "# question streaks: reruns, backwards rebuilds, count mismatch, clear failure"
+  local root; root=$(setup_env)
+  local QS="$REPO/bin/question-streaks.sh"
+  [ -x "$QS" ] || { no "question-streaks.sh executable"; return 0; }
+  local st="$root/streaks.tsv"; : > "$st"
+  local out
+  qs(){ AUTODREAM_QUESTION_STATE="$st" AUTODREAM_NOTIFY_DRYRUN=1 bash "$QS" "$@" 2>&1; }
+  mk(){ # $1=date $2=marker $3..=titles
+    local d="$1" m="$2"; shift 2
+    { printf '## Open questions for the user\n\n'
+      local i=1
+      for t in "$@"; do printf '%d. **%s** nightly-rewritten body\n' "$i" "$t"; i=$(( i + 1 )); done
+      printf '\n<!-- autodream:open-questions=%d -->\n' "$m"
+    } > "$root/$d.md"
+  }
+
+  mk 2026-02-01 1 "Recurring question?"
+  mk 2026-02-02 1 "Recurring question?"
+  qs update "$root/2026-02-01.md" >/dev/null
+  qs update "$root/2026-02-02.md" >/dev/null
+  assert_eq "$(awk -F'\t' '{print $2}' "$st")" "2" "two distinct reports count two"
+
+  # AUTODREAM_FORCE=1 rebuilds the same report. Counting it again would manufacture an
+  # escalation out of a rerun.
+  qs update "$root/2026-02-02.md" >/dev/null
+  assert_eq "$(awk -F'\t' '{print $2}' "$st")" "2" "rebuilding the same report does not advance the streak"
+
+  # A rebuild of an OLDER date must not rewrite live state with history: 02-01 does not
+  # know about anything that happened on 02-02.
+  out=$(qs update "$root/2026-02-01.md")
+  case "$out" in *"older than the last counted report"*) ok "an older rebuild is refused" ;; *) no "an older rebuild is refused (got: $out)" ;; esac
+  assert_eq "$(awk -F'\t' '{print $4}' "$st")" "2026-02-02" "and the live last-seen date is untouched"
+
+  # The marker is the report's own count. Disagreement means questions parsed as nothing;
+  # touching state would silently drop a streak or freeze them all.
+  mk 2026-02-03 2 "Recurring question?"   # marker says 2, only 1 bold title present
+  out=$(qs update "$root/2026-02-03.md")
+  case "$out" in *"but 1 parsed"*) ok "a parsed-vs-marker mismatch warns" ;; *) no "a parsed-vs-marker mismatch warns (got: $out)" ;; esac
+  assert_eq "$(awk -F'\t' '{print $2}' "$st")" "2" "and refuses to change state"
+
+  # clear must not claim success it did not achieve.
+  chmod 500 "$root" 2>/dev/null
+  out=$(AUTODREAM_QUESTION_STATE="$root/nope/state.tsv" bash "$QS" clear all 2>&1); local rc=$?
+  chmod 700 "$root" 2>/dev/null
+  assert_eq "$rc" "0" "clear on a missing state file is a no-op, not an error"
+
+  rm -rf "$root"
+}
+
+test_question_streaks
+test_question_streaks_reruns_and_mismatch
+
 # Cross-repo drift, last. It is not a unit test — it inspects the sibling checkout, so it
 # can only run on a machine holding both — but it belongs in the same command as the rest,
 # because the failure it catches is one no amount of in-repo testing can see. Both repos

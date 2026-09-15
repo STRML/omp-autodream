@@ -1240,6 +1240,15 @@ No Claude Code sessions were modified on this date.
 
 <!-- autodream:open-questions=0 -->
 EOF
+    # A question-free report still counts as a report. Without this the streak
+    # store would keep yesterday's questions alive across an empty night, and a
+    # question that reappeared two reports later would be called consecutive when
+    # it was not. The early return below is why this cannot live at the usual call
+    # site next to notify.sh.
+    if [ -x "$AUTODREAM_DIR/question-streaks.sh" ]; then
+      "$AUTODREAM_DIR/question-streaks.sh" update "$REPORT_PATH" "$FINDINGS_DIR" \
+        || log "question-streaks returned non-zero (continuing)"
+    fi
     return 0
   fi
 
@@ -2045,6 +2054,17 @@ PY
     if [ -x "$AUTODREAM_DIR/notify.sh" ]; then
       log "writing open-questions inbox file..."
       "$AUTODREAM_DIR/notify.sh" "$REPORT_PATH" || log "notify step returned non-zero (continuing)"
+    fi
+
+    # ---- Escalate questions this report has now asked N nights running ----
+    # After notify.sh, deliberately: the nightly banner goes out either way, and this adds
+    # a second, differently-worded one only when a question has gone stale. The failure it
+    # answers is not a missing signal but an unchanging one — the X bookmarks question was
+    # asked six times across ten failing nights, each night's banner identical to the last,
+    # and nothing moved until the user noticed by accident. Never fatal; it is bookkeeping.
+    if [ -x "$AUTODREAM_DIR/question-streaks.sh" ]; then
+      "$AUTODREAM_DIR/question-streaks.sh" update "$REPORT_PATH" "$FINDINGS_DIR" \
+        || log "question-streaks returned non-zero (continuing)"
     fi
 
     # ---- Consume what L2 just read ----

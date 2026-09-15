@@ -18,10 +18,15 @@
 #
 # WHAT IT COMPARES
 #
-# Only the files named in shared-with-sibling.txt, and only their code — comments are
-# stripped before the compare. The prose legitimately differs (each repo dates its own
-# incident notes), and a drift check that fired on a comment would be turned off within a
-# week. What must not differ is what runs.
+# Only the files named in shared-with-sibling.txt, and only their code. FULL-LINE comments
+# are stripped before the compare, so each repo can date its own incident notes in a
+# comment block without tripping this.
+#
+# Inline trailing comments are NOT stripped, and that is deliberate rather than an
+# oversight: `sed 's/#.*//'` cannot tell a comment from a `#` inside a string or a regex,
+# and silently corrupting the thing you are diffing is worse than being slightly strict.
+# So `foo  # note` differing from `foo  # other note` DOES report drift. For files that
+# are meant to be identical that is the right answer anyway — port the comment too.
 #
 # WHEN THE SIBLING IS ABSENT
 #

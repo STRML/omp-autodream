@@ -501,9 +501,11 @@ entire time**, because each was internally consistent — which is precisely why
 test could ever have caught it.
 
 `bin/check-shared-drift.sh` now compares those files against the sibling checkout and
-`tests/run-all.sh` runs it last. It strips comments before comparing, because each repo
-dates its own incident notes and a check that fired on prose would be disabled within a
-week; what must not differ is what runs. With no sibling on disk it prints SKIPPED and
+`tests/run-all.sh` runs it last. It strips FULL-LINE comments before comparing, so each repo can
+date its own incident notes in a comment block. An inline trailing comment is not
+stripped and does count as drift — `sed` cannot tell a `#` in a comment from one in a
+string or a regex, and for files meant to be identical "port the comment too" is the
+right answer anyway. With no sibling on disk it prints SKIPPED and
 exits 0 **loudly**, naming the path it looked for — the same rule as `overlap_measured`
 and `stats_sidecars_unparseable`: a degraded measurement says so rather than reading as a
 pass. It is verified by re-introducing the real regression, not by a fixture.
@@ -511,6 +513,66 @@ pass. It is verified by re-introducing the real regression, not by a fixture.
 The habit that generalizes: **a review finding is a class, not a site.** Before fixing
 anything under `bin/`, check whether the sibling ships the same file. One `grep` on
 2026-09-11 would have saved four failing nights in the other install.
+
+## Open questions that never get answered
+
+The nightly asks; nothing makes it louder when the asking stops working. Between
+2026-09-05 and 09-14 the X bookmarks walk was broken, every report said
+`x_queryid_source: failed`, and the Open questions section asked "Fix the X bookmarks
+walker, or turn the feature off?" six times. Ten nights, six asks, one banner a night that
+looked exactly like the night before. Nothing moved until the user noticed the *other*
+install's reports had gone quiet.
+
+Detection was never the problem. **A signal that repeats at constant volume is a signal you
+learn to skim.**
+
+`bin/question-streaks.sh` counts the repeats and makes the Nth ask look different from the
+first. `run.sh` calls it right after `notify.sh`, so the normal banner still goes out every
+night and a second, differently-worded one fires only for questions that have gone stale.
+Escalations also land in `findings/<date>/question-escalations.txt`.
+
+Four decisions in it are load-bearing:
+
+- **A question is keyed by its bolded title, exactly.** Verified against five consecutive
+  reports (2026-09-10..14): the body prose is rewritten nightly, but the title is
+  BYTE-identical across all of them. So no fuzzy scoring is needed, and heavier
+  normalization would risk collapsing two genuinely different questions onto one key and
+  silently merging their streaks.
+- **The count is mechanical, not the model's.** L2 already writes "Sixth ask" into its own
+  prose, but that is the model counting its own history out of context — exactly the kind
+  of number that drifts. This one is derived from the reports on disk.
+- **A streak counts consecutive REPORTS, not calendar days.** A night that produced no
+  report must not reset one; surviving the failing nights is the entire point. A question
+  absent from a report that *was* produced is treated as resolved and forgotten, so nothing
+  has to be cleared by hand.
+- **A marker promising questions while none parse is a warning, not a zero.** If PROMPT.md
+  ever stops emitting bold titles, the quiet failure would freeze every streak at its last
+  value and the escalation would never fire again — the same class of bug as a broken
+  sidecar reading as a real measurement.
+
+Threshold is `AUTODREAM_QUESTION_ESCALATE_AT` (default 3). `question-streaks.sh status`
+prints the current streaks; `clear all|<key>` forgets one after you have acted on it.
+
+`/debate:run tight` found seven defects in the first draft, all in the new code and all
+after the suite was green. Four are why the file reads as it does now:
+
+- **Reruns forged escalations.** `AUTODREAM_FORCE=1 run.sh <today>` re-counted a report
+  already counted, and rebuilding an OLDER date rewrote live state with history. Updates
+  are now idempotent per report date and refuse to go backwards.
+- **A zero-question report never cleared anything**, because `run.sh` returns early on the
+  nothing-was-triaged path, before the usual call site. That path calls the updater too
+  now — otherwise a question reappearing two reports later was called consecutive.
+- **Concurrency could lose an increment.** The scheduled nightly and `autodream-now.sh`
+  carry different launchd labels, so one-instance-per-label does not keep them apart. The
+  read-modify-write takes an atomic `mkdir` lock, reclaims a stale one by age, and SKIPS
+  rather than blocks when it cannot get it.
+- **A parser breakage only wrote to the run log.** That is this feature's own failure mode
+  one level up: every streak silently frozen, no escalation ever again, indistinguishable
+  from a quiet week. A mismatch now posts a banner saying the escalation is down.
+
+It is in `shared-with-sibling.txt`, so the drift check keeps both repos' copies identical.
+Replayed against the real 09-10..14 reports it escalates on **09-12** — two nights before
+the user actually caught the bookmarks failure.
 
 ## Gotchas (host environment)
 
