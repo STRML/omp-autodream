@@ -208,6 +208,31 @@ run_sut "$OMP"
 assert_eq "$DEFAULT" "$SUT_OUT" "with both installs present, ours is adopted"
 assert_eq "0" "$SUT_RC" "with both installs present, exit is 0"
 
+# --- row: a foreign job holds the default label in a file named for something else ---
+# launchd keys a job by Label, not filename. install.sh would boot out this label
+# and overwrite the job even though "autodream" is nowhere in the file name.
+reset_sandbox
+mv "$(make_plist "$DEFAULT" "$CC")" "$LA/backup.plist"
+run_sut "$OMP"
+assert_eq "3" "$SUT_RC" "the default label in backup.plist, running another install, is a conflict"
+case "$SUT_ERR" in
+  *"$LA/backup.plist"*) ok "the conflict names backup.plist" ;;
+  *) nope "the conflict names backup.plist" "stderr was [$SUT_ERR]" ;;
+esac
+
+# --- row: the default label is held by a job that runs no run.sh at all ----------
+reset_sandbox
+make_review_plist "$DEFAULT" "$CC"
+run_sut "$OMP"
+assert_eq "3" "$SUT_RC" "the default label held by a job with no run.sh is a conflict"
+
+# --- row: our own job, renamed into a file without "autodream" in its name --------
+reset_sandbox
+mv "$(make_plist "com.example.nightly" "$OMP")" "$LA/nightly.plist"
+run_sut "$OMP"
+assert_eq "com.example.nightly" "$SUT_OUT" "our own job is adopted whatever its file is called"
+assert_eq "0" "$SUT_RC" "adopting a renamed file exits 0"
+
 
 # --- install.sh must not write a plist it was refused --------------------------
 # The helper only advises. The regression stops only if install.sh honours the

@@ -1096,6 +1096,21 @@ test_l1_timeout_must_be_positive(){
   rm -rf "$root" "$root2"
 }
 
+test_l1_warmup_timeout_must_be_positive(){
+  echo "# a zero or non-numeric warmup timeout is refused at startup (Codex review of #25)"
+  # The warmup runs ahead of every recovery path, so a 0 that GNU timeout reads as
+  # "no deadline" can wedge the run before the network wait, retries or breaker.
+  local root; root=$(setup_env); mk_session "$root" sess1
+  export AUTODREAM_L1_WARMUP_TIMEOUT=0; run_dream "$root"; unset AUTODREAM_L1_WARMUP_TIMEOUT
+  assert_grep "$root/run.out" 'AUTODREAM_L1_WARMUP_TIMEOUT must be greater than 0' "zero warmup timeout is rejected with a reason"
+  assert_no_file "$root/dreams/$DATE.md" "the run refuses to start rather than risk an unbounded warmup"
+
+  local root2; root2=$(setup_env); mk_session "$root2" sess1
+  export AUTODREAM_L1_WARMUP_TIMEOUT=abc; run_dream "$root2"; unset AUTODREAM_L1_WARMUP_TIMEOUT
+  assert_grep "$root2/run.out" 'AUTODREAM_L1_WARMUP_TIMEOUT must be a positive integer' "a non-numeric warmup timeout is rejected"
+  rm -rf "$root" "$root2"
+}
+
 test_idempotency_guard(){
   echo "# existing report short-circuits the run (launchd catch-up no-op)"
   local root; root=$(setup_env); mk_session "$root" sess1
@@ -1892,6 +1907,7 @@ test_l1_hang_is_bounded
 test_omp_resolution_and_provenance
 test_intrinsic_124_is_not_a_timeout
 test_l1_timeout_must_be_positive
+test_l1_warmup_timeout_must_be_positive
 test_idempotency_guard
 test_self_audit_stats
 test_self_audit_stats_failure_denominator

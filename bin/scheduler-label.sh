@@ -57,21 +57,26 @@ runner_dir_of() {
 
 label=""
 conflict=""
-for plist in "$LA_DIR"/*autodream*.plist; do
+# Every plist, not just *autodream*.plist. launchd keys a job by its Label, never
+# by its filename, so a foreign job holding the default label in backup.plist is
+# still the job install.sh would boot out and overwrite. The same goes for our own
+# job renamed to a file without "autodream" in it: a name-based glob missed both.
+for plist in "$LA_DIR"/*.plist; do
   [ -e "$plist" ] || continue
   # .ondemand is autodream-now's transient sibling. It writes that plist to
   # $AUTODREAM_DIR rather than here, so this glob does not normally see one;
   # the skip is for a copy someone dropped in by hand, where adopting it would
   # nest a second .ondemand suffix onto the label.
   case "$plist" in *.ondemand.plist) continue ;; esac
-  rdir="$(runner_dir_of "$plist")" || continue
   l="$("$PLISTBUDDY" -c 'Print :Label' "$plist" 2>/dev/null)" || continue
-  if [ "$rdir" = "$TARGET_REAL" ]; then
+  if rdir="$(runner_dir_of "$plist")" && [ "$rdir" = "$TARGET_REAL" ]; then
     # Our own prior install. Keep its label so a re-install stays idempotent
     # even when that label is not the default one.
     label="$l"
     break
   fi
+  # The default label held by anything that is not our runner is a conflict,
+  # including a job that runs no run.sh at all.
   [ "$l" = "$DEFAULT_LABEL" ] && conflict="$plist"
 done
 

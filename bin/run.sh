@@ -49,6 +49,8 @@
 #                        One serial model call before the parallel dispatch, so a cold
 #                        OAuth token is refreshed once instead of by FANOUT workers at
 #                        once. Never fatal; result lands in run-stats as l1_warmup.
+#   AUTODREAM_L1_WARMUP_TIMEOUT seconds before the warmup is killed    default: 120
+#                        Must be a positive integer (0 would disable the deadline).
 #   AUTODREAM_L2_ATTEMPTS max L2 attempts to produce a report        default: 3
 #   AUTODREAM_RETRY_WAIT seconds to pause between retry rounds       default: 60
 #   AUTODREAM_NETCHECK   set 0 to skip the pre-dispatch network check default: 1
@@ -214,6 +216,14 @@ AUTODREAM_L1_TIMEOUT="${AUTODREAM_L1_TIMEOUT:-1200}"
 case "$AUTODREAM_L1_TIMEOUT" in
   ''|*[!0-9]*) echo "FATAL: AUTODREAM_L1_TIMEOUT must be a positive integer (got '$AUTODREAM_L1_TIMEOUT')" >&2; exit 1 ;;
   *) [ "$AUTODREAM_L1_TIMEOUT" -gt 0 ] || { echo "FATAL: AUTODREAM_L1_TIMEOUT must be greater than 0 (0 disables the timeout entirely)" >&2; exit 1; } ;;
+esac
+# The warmup runs before every recovery path (see "auth warmup" below), so an unbounded
+# warmup wedges the run. Same two failure modes as the L1 timeout: 0 means no deadline
+# under GNU timeout, and a non-numeric value fails the call. Refuse both here.
+AUTODREAM_L1_WARMUP_TIMEOUT="${AUTODREAM_L1_WARMUP_TIMEOUT:-120}"
+case "$AUTODREAM_L1_WARMUP_TIMEOUT" in
+  ''|*[!0-9]*) echo "FATAL: AUTODREAM_L1_WARMUP_TIMEOUT must be a positive integer (got '$AUTODREAM_L1_WARMUP_TIMEOUT')" >&2; exit 1 ;;
+  *) [ "$AUTODREAM_L1_WARMUP_TIMEOUT" -gt 0 ] || { echo "FATAL: AUTODREAM_L1_WARMUP_TIMEOUT must be greater than 0 (0 disables the warmup deadline entirely)" >&2; exit 1; } ;;
 esac
 # SIGKILL grace after the SIGTERM. The worst-case bound is therefore
 # AUTODREAM_L1_TIMEOUT + L1_KILL_GRACE, not AUTODREAM_L1_TIMEOUT.
@@ -1276,7 +1286,7 @@ EOF
     log "L1 auth warmup skipped: no timeout binary, and an unbounded warmup can wedge the run before every retry path"
   else
     warmup_errf="$FINDINGS_DIR/l1-warmup.err"
-    warmup_out=$(printf 'ping\n' | "$TIMEOUT_BIN" -k 10 "${AUTODREAM_L1_WARMUP_TIMEOUT:-120}" "$OMP_BIN" \
+    warmup_out=$(printf 'ping\n' | "$TIMEOUT_BIN" -k 10 "$AUTODREAM_L1_WARMUP_TIMEOUT" "$OMP_BIN" \
       --allow-home \
       -p \
       --approval-mode yolo \
