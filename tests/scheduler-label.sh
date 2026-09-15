@@ -179,24 +179,32 @@ run_sut "$OMP"
 assert_eq "3" "$SUT_RC" "a foreign default-label job is a conflict whatever its filename"
 
 # --- row: autodream-now's on-demand label -----------------------------------
-# A second install that holds the default label builds the same "<default>.ondemand"
-# label, so a bootout from this install would evict its on-demand run (Codex review
-# of 1ee66e4). Its plist lives in its own AUTODREAM_DIR, never in LaunchAgents, so the
-# scan above cannot see it; the conflict status is the only signal.
+# autodream-now boots out its on-demand label before every run, and that plist lives in
+# the install's own AUTODREAM_DIR where no LaunchAgents scan can see it. Any two installs
+# that share a base label - a foreign holder of the default, or two --no-schedule
+# installs that both fall back to it - would share the on-demand label and evict each
+# other's runs (Codex review of 1ee66e4 and cd309b6). So the label always carries a
+# hash of the resolved install dir, and it must not change with how that dir is spelled.
 ondemand_label() { # ondemand_label <install-dir> -> the Label autodream-now would load
   AUTODREAM_DIR="$1" bash "$REPO/bin/autodream-now.sh" 2020-01-01 --dry-run 2>/dev/null \
     | sed -n '/<key>Label<\/key>/{n;s/.*<string>\(.*\)<\/string>.*/\1/p;}'
 }
 reset_sandbox
-make_plist "$DEFAULT" "$OMP" >/dev/null
-assert_eq "$DEFAULT.ondemand" "$(ondemand_label "$OMP")" "our own install keeps the plain .ondemand label"
+omp_label="$(ondemand_label "$OMP")"
+cc_label="$(ondemand_label "$CC")"
+case "$omp_label" in
+  "$DEFAULT.ondemand."????????) ok "the on-demand label carries a per-install suffix" ;;
+  *) nope "the on-demand label carries a per-install suffix" "label was [$omp_label]" ;;
+esac
+[ "$omp_label" != "$cc_label" ] && ok "two installs with no scheduled job get different on-demand labels" \
+  || nope "two installs with no scheduled job get different on-demand labels" "both were [$omp_label]"
+assert_eq "$omp_label" "$(ondemand_label "$OMP/")" "a trailing slash does not change the on-demand label"
+ln -s "$SANDBOX/omp" "$SANDBOX/omp-link"
+assert_eq "$omp_label" "$(ondemand_label "$SANDBOX/omp-link/autodream")" "a symlinked install dir does not change the on-demand label"
 reset_sandbox
 make_plist "$DEFAULT" "$CC" >/dev/null
-got="$(ondemand_label "$OMP")"
-case "$got" in
-  "$DEFAULT.ondemand."????????) ok "a foreign default-label holder gets this install its own on-demand label" ;;
-  *) nope "a foreign default-label holder gets this install its own on-demand label" "label was [$got]" ;;
-esac
+[ "$(ondemand_label "$OMP")" != "$(ondemand_label "$CC")" ] && ok "a foreign default-label holder does not share this install's on-demand label" \
+  || nope "a foreign default-label holder does not share this install's on-demand label" "labels matched"
 
 # --- row: the -review sibling is skipped -----------------------------------
 reset_sandbox

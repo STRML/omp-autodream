@@ -17,9 +17,9 @@
 #           suffix it
 #   exit 0  label decided
 #   exit 3  the default label is held by a plist running a different install.
-#           stdout still carries that label. That other install builds the same
-#           "<label>.ondemand", so autodream-now adds a per-install suffix on this
-#           status rather than share it. A caller that would WRITE the plist -
+#           stdout still carries that label. autodream-now only borrows it as a
+#           namespace and always adds a per-install hash, so it ignores this
+#           status. A caller that would WRITE the plist -
 #           install.sh - must abort on this status instead of overwriting.
 #
 # Env: LAUNCH_AGENTS_DIR, PLISTBUDDY (tests point these at a sandbox).

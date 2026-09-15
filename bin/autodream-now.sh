@@ -4,7 +4,7 @@
 # ssh sessions die on disconnect, etc). launchd owns the process, so the run
 # survives the caller going away and has no time cap.
 #
-# It bootstraps a TRANSIENT one-shot LaunchAgent (label "<base>.ondemand") that runs
+# It bootstraps a TRANSIENT one-shot LaunchAgent (label "<base>.ondemand.<install hash>") that runs
 # run.sh once and exits. It never touches the scheduled nightly job.
 #
 # Usage:
@@ -89,16 +89,16 @@ DOMAIN="gui/$UID_NUM"
 # in the same namespace. scheduler-label.sh owns that decision for install.sh too;
 # it will not hand back a label belonging to another autodream install (#14). A
 # conflict on the default name is not fatal here - we only borrow the namespace.
-BASE_LABEL="$("$BIN_DIR/scheduler-label.sh" "$AUTODREAM_DIR" 2>/dev/null)" && label_rc=0 || label_rc=$?
+BASE_LABEL="$("$BIN_DIR/scheduler-label.sh" "$AUTODREAM_DIR" 2>/dev/null || true)"
 [ -n "$BASE_LABEL" ] || BASE_LABEL="com.$(id -un | tr -dc 'a-zA-Z0-9').omp-autodream"
-LABEL="${BASE_LABEL}.ondemand"
-# Exit 3 means another install holds the default label, and it builds this same
-# .ondemand label. The bootout below would evict its on-demand run, and its plist lives
-# in its own AUTODREAM_DIR where no scan can see it (Codex review of 1ee66e4). Give this
-# install a suffix of its own, stable per directory so bootout still finds our prior run.
-if [ "$label_rc" -eq 3 ]; then
-  LABEL="${LABEL}.$(printf '%s' "$AUTODREAM_DIR" | shasum -a 1 | cut -c1-8)"
-fi
+# The on-demand label always carries a hash of the resolved install dir. The bootout below
+# evicts whatever holds this label, and another install's on-demand plist lives in its own
+# AUTODREAM_DIR where no scan can see it. Two installs share a base label whenever one
+# holds the default or neither has a scheduled job, so no base-label check can rule the
+# collision out (Codex review of 1ee66e4 and cd309b6). pwd -P keeps the hash the same for
+# a trailing slash or a symlinked path, so bootout still finds this install's prior run.
+INSTALL_REAL="$(cd "$AUTODREAM_DIR" 2>/dev/null && pwd -P)" || INSTALL_REAL="${AUTODREAM_DIR%/}"
+LABEL="${BASE_LABEL}.ondemand.$(printf '%s' "$INSTALL_REAL" | shasum -a 1 | cut -c1-8)"
 PLIST="$AUTODREAM_DIR/${LABEL}.plist"
 
 # ----------------------------------------------------------------------- PATH --

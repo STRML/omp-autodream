@@ -1399,6 +1399,12 @@ test_stats_sidecar_malformed_counted(){
   local stats="$(fdir "$root")/run-stats.txt"
   assert_grep "$stats" 'stats_sidecars_unparseable: 1' "missing transcript_bytes counts as unparseable"
   assert_grep "$stats" 'oversized_total: 1'            "oversized session still counted via the live-size fallback"
+  # The same stub carries no skill keys, so the worker's skill fields are its guess
+  # (Codex review of cd309b6).
+  local fj; fj="$(fdir "$root")/$(hash_of "$root/projects/proj-a/sess1.jsonl").json"
+  assert_eq "$(jq -r 'has("skills_invoked") or has("skills_invoked_count") or has("skills_invoked_counts") or has("skills_authored")' "$fj")" "false" \
+    "a sidecar without skill keys leaves no worker-written skill fields"
+  assert_grep "$stats" 'skills_unmeasured: 1' "and the session is counted as unmeasured"
   rm -rf "$root"
 }
 

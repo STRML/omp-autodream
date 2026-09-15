@@ -39,7 +39,7 @@ bin/run.sh  TARGET_DATE
 | File | Role |
 |---|---|
 | `bin/run.sh` | orchestrator: guard, enumerate+filter, L1 retry loop, changelog, L2 retry loop, notify |
-| `bin/autodream-now.sh` | run NOW via a transient one-shot launchd agent (escapes the ~10-min cap on bg tasks/ssh). `[DATE] [--force] [--watch] [--dry-run]`. RunAtLoad only (no kickstart → no double run); borrows its label namespace from `scheduler-label.sh` and suffixes `.ondemand` |
+| `bin/autodream-now.sh` | run NOW via a transient one-shot launchd agent (escapes the ~10-min cap on bg tasks/ssh). `[DATE] [--force] [--watch] [--dry-run]`. RunAtLoad only (no kickstart → no double run); borrows its label namespace from `scheduler-label.sh` and suffixes `.ondemand.<hash of the resolved install dir>` so two installs never evict each other's run |
 | `bin/scheduler-label.sh` | which launchd label this install owns. Ownership is the `run.sh` a plist invokes, not the label it carries; refuses (exit 3) rather than overwrite a foreign job on our default name (#14). Called by `install.sh` and `autodream-now.sh` |
 | `bin/prune-self-sessions.sh` | self-session predicate (single source of truth): list / `--delete` / `--filter` |
 | `bin/oversized-gate.sh` | recompute the #12 measurement gate over a trailing window from the sidecars/findings on disk (`--days N`, or explicit findings dirs). Recovers dates whose `run-stats.txt` predates the counters; artifacts only, no model calls |

@@ -1575,12 +1575,12 @@ PY
   # on an optional interpreter meant that on a host without python3 the pipeline quietly
   # returned to believing whatever the model wrote — the exact failure this replaced.
   # jq is already a hard dependency of this script, so this cannot silently degrade.
-  # Absent sidecar keys leave the worker values alone, so a findings dir written by an
-  # older runner is not rewritten with invented zeroes.
-  # An absent sidecar is different: compute_session_stats regenerates every sidecar each
-  # run, so a missing one means session-stats.sh failed for that session, and whatever
-  # skill fields the findings JSON carries are the worker's own guess. Those are removed,
-  # never kept, or L2 ranks them as mechanical counts (Codex review of 0129fc0).
+  # compute_session_stats regenerates every sidecar each run, so a sidecar that is missing,
+  # unreadable, or has no skills_invoked key means session-stats.sh did not measure this
+  # session's skills, and whatever skill fields the findings JSON carries are the worker's
+  # own guess. Those are removed and counted, never kept, or L2 ranks them as mechanical
+  # counts (Codex review of 0129fc0 and cd309b6). A present-but-keyless sidecar is the
+  # quieter case: it passes generation's type check and only breaks here.
   SKILLS_ENFORCED=0
   SKILLS_DROPPED=0
   for fjson in "$FINDINGS_DIR"/*.json; do
@@ -1589,7 +1589,7 @@ PY
     jq -e ".findings | arrays" "$fjson" >/dev/null 2>&1 || continue
     sidecar="${fjson%.json}.stats.json"
     skilltmp="$fjson.skills.tmp"
-    if [ ! -s "$sidecar" ]; then
+    if ! jq -e 'type == "object" and has("skills_invoked")' "$sidecar" >/dev/null 2>&1; then
       if jq 'del(.skills_invoked, .skills_invoked_count, .skills_invoked_counts, .skills_authored)' \
           "$fjson" > "$skilltmp" 2>/dev/null && [ -s "$skilltmp" ]; then
         mv "$skilltmp" "$fjson"
@@ -1729,9 +1729,9 @@ PY
     # rather than the sidecar — so it caveats those two keys rather than duplicating
     # a flag onto each of them.
     printf 'stats_sidecars_unparseable: %s\n' "$STATS_SIDECARS_UNPARSEABLE"
-    # Findings JSONs whose skill fields were removed because no sidecar existed. The
-    # aggregator cannot tell that from absence, since gated stubs carry no skill fields
-    # either (Codex review of 1ee66e4).
+    # Findings JSONs whose skill fields were removed because their sidecar was missing,
+    # unreadable, or carried no skills_invoked key. The aggregator cannot tell that from
+    # absence alone (Codex reviews of 1ee66e4 and cd309b6).
     printf 'skills_unmeasured: %s\n' "${SKILLS_DROPPED:-0}"
     printf 'l1_missing_after_retries: %s\n' "$MISSING"
     printf 'l1_err_files: %s\n' "$L1_FAIL"
