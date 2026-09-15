@@ -1585,11 +1585,12 @@ PY
   # returned to believing whatever the model wrote — the exact failure this replaced.
   # jq is already a hard dependency of this script, so this cannot silently degrade.
   # compute_session_stats regenerates every sidecar each run, so a sidecar that is missing,
-  # unreadable, or has no skills_invoked key means session-stats.sh did not measure this
-  # session's skills, and whatever skill fields the findings JSON carries are the worker's
-  # own guess. Those are removed and counted, never kept, or L2 ranks them as mechanical
-  # counts (Codex review of 0129fc0 and cd309b6). A present-but-keyless sidecar is the
-  # quieter case: it passes generation's type check and only breaks here.
+  # unreadable, or lacks any of the four skill keys means session-stats.sh did not measure
+  # this session's skills, and whatever skill fields the findings JSON carries are the
+  # worker's own guess. All four are removed and counted, never kept, or L2 ranks them as
+  # mechanical counts (Codex reviews of 0129fc0, cd309b6 and 33bf9b1). Checking one key
+  # was not enough: copying the keys that exist would leave the worker's guesses for the
+  # rest. A sidecar with missing keys passes generation's type check and only breaks here.
   SKILLS_ENFORCED=0
   SKILLS_DROPPED=0
   for fjson in "$FINDINGS_DIR"/*.json; do
@@ -1598,7 +1599,7 @@ PY
     jq -e ".findings | arrays" "$fjson" >/dev/null 2>&1 || continue
     sidecar="${fjson%.json}.stats.json"
     skilltmp="$fjson.skills.tmp"
-    if ! jq -e 'type == "object" and has("skills_invoked")' "$sidecar" >/dev/null 2>&1; then
+    if ! jq -e 'type == "object" and (["skills_invoked", "skills_invoked_count", "skills_invoked_counts", "skills_authored"] - keys | length == 0)' "$sidecar" >/dev/null 2>&1; then
       if jq 'del(.skills_invoked, .skills_invoked_count, .skills_invoked_counts, .skills_authored)' \
           "$fjson" > "$skilltmp" 2>/dev/null && [ -s "$skilltmp" ]; then
         mv "$skilltmp" "$fjson"
@@ -1620,7 +1621,7 @@ PY
       rm -f "$skilltmp"
     fi
   done
-  log "enforced mechanical skill fields from sidecars on $SKILLS_ENFORCED findings file(s); removed unmeasured skill fields from $SKILLS_DROPPED with no sidecar"
+  log "enforced mechanical skill fields from sidecars on $SKILLS_ENFORCED findings file(s); removed unmeasured skill fields from $SKILLS_DROPPED whose sidecar was missing, unreadable, or incomplete"
 
   # ---- Self-audit stats: runtime telemetry only the runner can see ----
   # The aggregator can't observe its own machinery — which sessions were autodream's
@@ -1739,7 +1740,7 @@ PY
     # a flag onto each of them.
     printf 'stats_sidecars_unparseable: %s\n' "$STATS_SIDECARS_UNPARSEABLE"
     # Findings JSONs whose skill fields were removed because their sidecar was missing,
-    # unreadable, or carried no skills_invoked key. The aggregator cannot tell that from
+    # unreadable, or lacked any of the four skill keys. The aggregator cannot tell that from
     # absence alone (Codex reviews of 1ee66e4 and cd309b6).
     printf 'skills_unmeasured: %s\n' "${SKILLS_DROPPED:-0}"
     printf 'l1_missing_after_retries: %s\n' "$MISSING"

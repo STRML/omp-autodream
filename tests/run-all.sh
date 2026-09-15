@@ -2415,6 +2415,25 @@ test_skill_fields_dropped_without_a_sidecar(){
   rm -rf "$root"
 }
 
+test_skill_fields_dropped_with_a_partial_sidecar(){
+  echo "# a sidecar missing any of the four skill keys is unmeasured, not half-enforced (Codex review of 33bf9b1)"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  # skills_invoked present, skills_invoked_count(s) and skills_authored absent: copying the
+  # one key and keeping the worker's other three would rank guesses as counts.
+  local stub="$root/stats-partial.sh"
+  printf '%s\n' '#!/bin/bash' 'printf %s "{\"transcript_bytes\":10,\"user_message_count\":5,\"tool_call_count\":9,\"skills_invoked\":[\"x\"]}" > "$2"' > "$stub"
+  chmod +x "$stub"
+  export AUTODREAM_STATS_BIN="$stub"
+  run_dream "$root"
+  unset AUTODREAM_STATS_BIN
+  local fj; fj="$(fdir "$root")/$(hash_of "$root/projects/proj-a/sess1.jsonl").json"
+  assert_eq "$(jq -r 'has("skills_invoked") or has("skills_invoked_count") or has("skills_invoked_counts") or has("skills_authored")' "$fj")" "false" \
+    "every skill field is removed when the sidecar lacks any of them"
+  assert_grep "$(fdir "$root")/run-stats.txt" 'skills_unmeasured: 1' "and the session is counted as unmeasured"
+  assert_nogrep "$root/run.out" 'with no sidecar' "the log does not claim the sidecar was missing"
+  rm -rf "$root"
+}
+
 test_skill_fields_are_enforced_from_the_sidecar(){
   echo "# a worker that ignores the precomputed skill stats gets overwritten, not believed"
   local root; root=$(setup_env)
@@ -2602,6 +2621,7 @@ test_a_transient_outage_is_ridden_out_not_deferred
 test_no_curl_does_not_defer_a_healthy_run
 test_skill_fields_are_enforced_from_the_sidecar
 test_skill_fields_dropped_without_a_sidecar
+test_skill_fields_dropped_with_a_partial_sidecar
 test_malformed_worker_output_is_a_failure_with_its_evidence
 test_findings_must_be_an_array_not_merely_present
 test_rounds_used_counts_rounds_that_dispatched
