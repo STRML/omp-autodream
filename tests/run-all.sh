@@ -843,6 +843,16 @@ test_warmup_empty_stdout_is_a_failure_not_ok(){
   rm -rf "$root"
 }
 
+test_warmup_diagnostic_stdout_is_a_failure_not_ok(){
+  echo "# a warmup that exits 0 with a diagnostic instead of the reply is a failure (debate review of e95e2f2)"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  export MOCK_MODE=warmup_diag
+  AUTODREAM_L1_ROUNDS=1 run_dream "$root"
+  unset MOCK_MODE
+  assert_grep "$(fdir "$root")/run-stats.txt" 'l1_warmup: failed' "non-empty stdout that is not the reply records failed"
+  rm -rf "$root"
+}
+
 test_changelog_multi_source(){
   echo "# multi-source changelog: per-harness sections, isolated failures, no log leakage"
   command -v git >/dev/null 2>&1 || { echo "  skip - git not available"; return 0; }
@@ -883,6 +893,31 @@ test_changelog_multi_source(){
   # block files the runner's own progress lines as upstream release notes.
   assert_nogrep "$cw" 'changelog\['          "no runner log lines leak into the report input"
   assert_nogrep "$cw" 'cloning'              "no clone progress leaks into the report input"
+  rm -rf "$root"
+}
+
+test_changelog_refuses_foreign_cache_dir(){
+  echo "# a configured cache path that is a real non-git directory is never deleted (debate review of e95e2f2)"
+  command -v git >/dev/null 2>&1 || { echo "  skip - git not available"; return 0; }
+  local root; root=$(setup_env); mk_session "$root" sess1
+  local a="$root/up-a"; mkdir -p "$a"
+  ( cd "$a" && git init -q && git config user.email t@t.invalid && git config user.name t
+    printf '# Changelog\n\n## 9.9.9\n\n- Alpha in-window\n' > CHANGELOG.md
+    git add CHANGELOG.md
+    GIT_AUTHOR_DATE="2020-01-02T12:00:00" GIT_COMMITTER_DATE="2020-01-02T12:00:00" \
+      git commit -q -m 'alpha release' )
+  local precious="$root/precious"; mkdir -p "$precious"; printf 'keep me\n' > "$precious/notes.txt"
+
+  export AUTODREAM_CHANGELOG=1 AUTODREAM_CHANGELOG_MAX_LINES=abc
+  export AUTODREAM_CHANGELOG_SOURCES="Alpha|$a|CHANGELOG.md|$root/cache/a;Typo|$a|CHANGELOG.md|$precious"
+  run_dream "$root"
+  unset AUTODREAM_CHANGELOG AUTODREAM_CHANGELOG_SOURCES AUTODREAM_CHANGELOG_MAX_LINES
+
+  local cw="$(fdir "$root")/changelog-window.md"
+  assert_file "$precious/notes.txt"          "the non-git directory and its contents survive"
+  assert_grep "$cw" 'is a non-empty directory that is not a git clone' "its section says why it was skipped"
+  assert_grep "$cw" 'Alpha in-window'        "the other source is unaffected"
+  assert_grep "$root/run.out" 'AUTODREAM_CHANGELOG_MAX_LINES=.abc. is not a positive integer; using 400' "a non-numeric cap falls back to the default instead of disabling it"
   rm -rf "$root"
 }
 
@@ -2534,7 +2569,9 @@ test_a_deterministic_failure_trips_the_breaker
 test_a_flaky_worker_does_not_trip_the_breaker
 test_breaker_needs_two_barren_rounds_not_one
 test_warmup_empty_stdout_is_a_failure_not_ok
+test_warmup_diagnostic_stdout_is_a_failure_not_ok
 test_changelog_multi_source
+test_changelog_refuses_foreign_cache_dir
 test_changelog_single_remote_suppresses_defaults
 
 echo

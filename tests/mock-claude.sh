@@ -57,6 +57,8 @@ if [ "$line1" = "ping" ]; then
   printf 'Working...\n' >&2
   case "$mode" in
     l1_incomplete|l1_noisy_fail|l1_hang|l1_exit124|l1_exit137) : ;;
+    # exit 0 with a diagnostic on stdout instead of the requested reply
+    warmup_diag) echo "error: model deepseek/deepseek-flash is not available" ;;
     *) echo ok ;;
   esac
   exit 0

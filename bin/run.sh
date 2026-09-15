@@ -574,8 +574,20 @@ changelog_one() { # $1=name $2=remote $3=path $4=repo $5=out
       return 0
     fi
   else
+    # Only a cache this install owns may be cleared. AUTODREAM_CHANGELOG_SOURCES names the
+    # path, so a typo pointing at a real non-git directory must not be deleted to make room
+    # for a clone (debate review of e95e2f2).
+    case "$repo" in
+      "$AUTODREAM_DIR"/cache/*) rm -rf "$repo" ;;
+      *)
+        if [ -e "$repo" ] && [ -n "$(ls -A "$repo" 2>/dev/null)" ]; then
+          log "changelog[$name]: $repo exists, is not a git repo and is outside $AUTODREAM_DIR/cache; refusing to delete it"
+          printf '## %s\n\nCache path %s is a non-empty directory that is not a git clone; %s changes not checked this run.\n\n' "$name" "$repo" "$name" >> "$out"
+          return 0
+        fi
+        rm -rf "$repo" ;;
+    esac
     log "changelog[$name]: cloning $remote -> $repo..."
-    rm -rf "$repo"
     # blob:none + sparse keeps a monorepo clone cheap — oh-my-pi carries Cargo, bazel and
     # a node_modules tree, and we want one markdown file out of it. Blobs for the path we
     # actually log are fetched on demand. Real remotes only: git ignores --filter on a
@@ -612,6 +624,13 @@ changelog_one() { # $1=name $2=remote $3=path $4=repo $5=out
   # Cap per source. One chatty monorepo must not crowd the other harnesses out of L2's
   # context; the cap is per section, so a quiet source is never truncated for a loud one.
   local cap="${AUTODREAM_CHANGELOG_MAX_LINES:-400}" total
+  # A non-numeric cap made the -gt test below error out as false under set -u without -e,
+  # so the section went out uncapped (debate review of e95e2f2). Fall back to the default.
+  case "$cap" in
+    ''|*[!0-9]*|0)
+      log "changelog[$name]: AUTODREAM_CHANGELOG_MAX_LINES='$cap' is not a positive integer; using 400"
+      cap=400 ;;
+  esac
   total=$(printf '%s\n' "$added" | wc -l | tr -d ' ')
   if [ "${total:-0}" -gt "$cap" ]; then
     added=$(printf '%s\n' "$added" | head -n "$cap")
@@ -1295,7 +1314,11 @@ EOF
       --model "${AUTODREAM_L1_MODEL:-deepseek/deepseek-flash}" \
       --append-system-prompt 'Reply with the single word ok and exit.' 2>"$warmup_errf")
     warmup_rc=$?
-    if [ "$warmup_rc" -eq 0 ] && [ -n "$warmup_out" ]; then
+    # The warmup asks for the single word ok. Anything else on stdout with exit 0 is a
+    # diagnostic, not a reply, and must not read as a healthy provider (debate review of
+    # e95e2f2). Case and surrounding whitespace or punctuation are tolerated.
+    warmup_word=$(printf '%s' "$warmup_out" | tr -d '[:space:][:punct:]' | tr '[:upper:]' '[:lower:]')
+    if [ "$warmup_rc" -eq 0 ] && [ "$warmup_word" = "ok" ]; then
       L1_WARMUP=ok
       log "L1 auth warmup ok"
     else
@@ -1305,7 +1328,7 @@ EOF
       # and it is what every .err file for those six nights failed to say.
       log "L1 auth warmup FAILED (exit $warmup_rc): stdout=[${warmup_out:-<empty>}] stderr=[$(head -c 300 "$warmup_errf" 2>/dev/null | tr '\n' ' ')]"
     fi
-    unset warmup_out warmup_rc warmup_errf
+    unset warmup_out warmup_rc warmup_errf warmup_word
   fi
   # Set when a round could not be dispatched because the host had no route. The run
   # then stops before L2 and writes no report, so the date stays unassembled and a
