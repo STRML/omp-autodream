@@ -147,7 +147,6 @@ newest_of() {
 }
 unreadable_state() { [ -e "$STATE" ] && { [ ! -f "$STATE" ] || [ ! -r "$STATE" ]; }; }
 write_state() { # $1=rows file  $2=watermark date, or empty for none
-  mkdir -p "$(dirname "$STATE")" 2>/dev/null || true
   local t; t=$(mktemp "$STATE.XXXXXX" 2>/dev/null) || return 1
   if ( { [ -z "$2" ] || printf '#last\t%s\n' "$2"; } && cat "$1" ) > "$t" 2>/dev/null \
      && mv -f "$t" "$STATE" 2>/dev/null; then
@@ -181,6 +180,10 @@ cmd_update() {
   [ -s "$report" ] || { echo "question-streaks: no report at $report; nothing to count"; return 0; }
   local date; date=$(basename "$report" .md)
 
+  # The lock lives beside the state, so its directory must exist before the lock is taken.
+  # Otherwise the first update on a new state path reads as a held lock and never creates
+  # the state (Codex review of b72f0e4).
+  mkdir -p "$(dirname "$STATE")" 2>/dev/null || true
   if ! acquire_lock; then
     echo "question-streaks: another run holds $LOCK; skipping this update"
     return 0
@@ -213,10 +216,19 @@ cmd_update() {
   titles_of "$report" > "$tmp/titles" 2>/dev/null || : > "$tmp/titles"
   local n marker; n=$(nlines "$tmp/titles"); marker=$(marker_of "$report")
 
+  # No marker means the report is incomplete, the same test run.sh's report_complete uses.
+  # An L2 run truncated before the Open questions section parses as zero questions, and
+  # counting that clears every streak and advances the watermark. run.sh leaves such a
+  # report in place when it cannot move it aside (Codex review of b72f0e4).
+  if [ -z "$marker" ]; then
+    echo "question-streaks: $date has no open-questions marker, so the report is incomplete; streaks not updated"
+    return 0
+  fi
+
   # The marker is the report's own count. Any disagreement means the format moved and some
   # questions parsed as nothing — refuse to touch state rather than silently dropping a
   # streak or freezing every one of them at its last value.
-  if [ -n "$marker" ] && [ "$marker" -ne "$n" ]; then
+  if [ "$marker" -ne "$n" ]; then
     echo "question-streaks: WARNING $date says $marker open question(s) but $n parsed — the title format changed; streaks not updated"
     # Banner, not just a log line. This feature exists because a signal buried in a place
     # nobody looks gets skimmed, and a parser breakage hidden in the run log is that same

@@ -2782,6 +2782,13 @@ test_question_streaks_state_lives_with_the_install(){
   out=$(qs6 update "$root/2026-03-01.md")
   case "$out" in *"older than the last counted report"*) ok "and an older rebuild after clear all is refused" ;; *) no "and an older rebuild after clear all is refused (got: $out)" ;; esac
 
+  # A state path whose directory does not exist yet. The lock lives beside the state, so
+  # the directory has to exist before the lock is taken, or every update reads as a held
+  # lock and exits without ever creating the state (Codex review of b72f0e4).
+  local nested="$root/new/nested/question-streaks.tsv"
+  AUTODREAM_QUESTION_STATE="$nested" AUTODREAM_NOTIFY_DRYRUN=1 bash "$QS" update "$root/2026-03-04.md" >/dev/null 2>&1
+  assert_eq "$(streak_rows "$nested")" "1" "the first update on a new state directory creates the state"
+
   # The final rename can fail. The whole state is one temp file renamed into place, so a
   # failed rename leaves the old file whole: board and watermark together.
   local st4="$root/w4.tsv"; : > "$st4"
@@ -2901,6 +2908,18 @@ test_question_streaks_reruns_and_mismatch(){
   out=$(qs update "$root/2026-02-03.md")
   case "$out" in *"but 1 parsed"*) ok "a parsed-vs-marker mismatch warns" ;; *) no "a parsed-vs-marker mismatch warns (got: $out)" ;; esac
   assert_eq "$(awk -F'\t' '!/^#/ {print $2}' "$st")" "2" "and refuses to change state"
+
+  # A report with no count marker is incomplete: an L2 run truncated before the Open
+  # questions section, left in place when run.sh could not move it aside. Parsing it as
+  # zero questions cleared every streak and advanced the watermark (Codex review of b72f0e4).
+  printf '# Autodream\n\n## Activity snapshot\n- 7 sessions\n' > "$root/2026-02-05.md"
+  printf '## Open questions for the user\n\n1. **Recurring question?** body cut off mid-' > "$root/2026-02-06.md"
+  cp "$st" "$root/st.before"
+  out=$(qs update "$root/2026-02-05.md")
+  case "$out" in *"no open-questions marker"*) ok "a report truncated before its questions is refused as incomplete" ;; *) no "a report truncated before its questions is refused as incomplete (got: $out)" ;; esac
+  if cmp -s "$st" "$root/st.before"; then ok "and does not clear the board"; else no "and does not clear the board"; fi
+  qs update "$root/2026-02-06.md" >/dev/null
+  if cmp -s "$st" "$root/st.before"; then ok "a report truncated after a question title is refused too"; else no "a report truncated after a question title is refused too"; fi
 
   # clear must not claim success it did not achieve.
   chmod 500 "$root" 2>/dev/null

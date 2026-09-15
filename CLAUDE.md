@@ -551,7 +551,8 @@ Four decisions in it are load-bearing:
 - **A marker promising questions while none parse is a warning, not a zero.** If PROMPT.md
   ever stops emitting bold titles, the quiet failure would freeze every streak at its last
   value and the escalation would never fire again — the same class of bug as a broken
-  sidecar reading as a real measurement.
+  sidecar reading as a real measurement. A report with no marker at all is incomplete and
+  is refused too: a truncated L2 report parses as zero questions and would clear the board.
 
 Three details the Codex review of `232c94c` found, each with a test:
 
