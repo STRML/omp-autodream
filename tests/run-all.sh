@@ -2415,6 +2415,39 @@ test_skill_fields_dropped_without_a_sidecar(){
   rm -rf "$root"
 }
 
+test_shared_drift_check_from_a_worktree(){
+  echo "# check-shared-drift.sh names the repo by its main checkout, so a git worktree still finds the sibling"
+  command -v git >/dev/null 2>&1 || { echo "  skip - git not available"; return 0; }
+  # Physical path: on macOS mktemp hands back /var/..., git reports /private/var/..., and the
+  # sibling path the script prints comes from git.
+  local T; T=$(cd "$(mktemp -d)" && pwd -P)
+  # A worktree gets its own directory name (omp-autodream-pr25), and inferring the sibling
+  # from that name exited 2 and failed the whole suite in every worktree.
+  mkdir -p "$T/omp-autodream/bin" "$T/cc-autodream/bin"
+  cp "$REPO/bin/check-shared-drift.sh" "$T/omp-autodream/bin/"
+  printf 'bin/a.sh\n' > "$T/omp-autodream/shared-with-sibling.txt"
+  printf 'echo same\n' > "$T/omp-autodream/bin/a.sh"
+  printf 'echo same\n' > "$T/cc-autodream/bin/a.sh"
+  ( cd "$T/omp-autodream" && git init -q && git config user.email t@t.invalid && git config user.name t \
+      && git add -A && git commit -q -m init && git worktree add -q "$T/omp-autodream-feature" 2>/dev/null )
+  local out rc
+  out=$(env -u AUTODREAM_SIBLING_REPO bash "$T/omp-autodream-feature/bin/check-shared-drift.sh" 2>&1); rc=$?
+  assert_eq "$rc" "0" "a worktree with a matching sibling exits 0"
+  case "$out" in *"ok — 1 shared file(s) match $T/cc-autodream"*) ok "and it compared against the sibling next to the main checkout" ;;
+    *) no "and it compared against the sibling next to the main checkout (got [$out])" ;; esac
+  printf 'echo drifted\n' > "$T/cc-autodream/bin/a.sh"
+  env -u AUTODREAM_SIBLING_REPO bash "$T/omp-autodream-feature/bin/check-shared-drift.sh" >/dev/null 2>&1; rc=$?
+  assert_eq "$rc" "1" "real drift seen from the worktree still fails"
+  # A checkout with a name the script does not know and no git is a degraded measurement:
+  # say SKIPPED and exit 0, the same contract as a sibling that is not on disk.
+  mkdir -p "$T/elsewhere/bin"; cp "$REPO/bin/check-shared-drift.sh" "$T/elsewhere/bin/"
+  printf 'bin/a.sh\n' > "$T/elsewhere/shared-with-sibling.txt"
+  out=$(env -u AUTODREAM_SIBLING_REPO bash "$T/elsewhere/bin/check-shared-drift.sh" 2>&1); rc=$?
+  assert_eq "$rc" "0" "an unrecognised checkout name skips instead of failing the suite"
+  case "$out" in *SKIPPED*) ok "and says it skipped" ;; *) no "and says it skipped (got [$out])" ;; esac
+  rm -rf "$T"
+}
+
 test_skill_fields_dropped_with_a_partial_sidecar(){
   echo "# a sidecar missing any of the four skill keys is unmeasured, not half-enforced (Codex review of 33bf9b1)"
   local root; root=$(setup_env); mk_session "$root" sess1
@@ -2622,6 +2655,7 @@ test_no_curl_does_not_defer_a_healthy_run
 test_skill_fields_are_enforced_from_the_sidecar
 test_skill_fields_dropped_without_a_sidecar
 test_skill_fields_dropped_with_a_partial_sidecar
+test_shared_drift_check_from_a_worktree
 test_malformed_worker_output_is_a_failure_with_its_evidence
 test_findings_must_be_an_array_not_merely_present
 test_rounds_used_counts_rounds_that_dispatched

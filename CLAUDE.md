@@ -505,7 +505,10 @@ test could ever have caught it.
 date its own incident notes in a comment block. An inline trailing comment is not
 stripped and does count as drift — `sed` cannot tell a `#` in a comment from one in a
 string or a regex, and for files meant to be identical "port the comment too" is the
-right answer anyway. With no sibling on disk it prints SKIPPED and
+right answer anyway. It finds the sibling by the name of the main checkout, not the current directory, so a git
+worktree such as `omp-autodream-pr25` still resolves `../cc-autodream` (a name-based guess
+failed the whole suite in every worktree). With no sibling on disk, or a checkout name it
+does not recognise, it prints SKIPPED and
 exits 0 **loudly**, naming the path it looked for — the same rule as `overlap_measured`
 and `stats_sidecars_unparseable`: a degraded measurement says so rather than reading as a
 pass. It is verified by re-introducing the real regression, not by a fixture.

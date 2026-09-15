@@ -50,13 +50,35 @@ SELF_NAME="$(basename "$REPO_ROOT")"
 
 # The sibling is the other repo of the pair. Auto-detect by name next to this checkout,
 # because that is how they live on this host; override for any other layout.
+# A git worktree has a directory name of its own (omp-autodream-pr25), so name the checkout
+# by its main working tree, which git reports as the parent of the common .git dir. A name
+# that is still unknown is a check that cannot run here, which is a loud skip, not a
+# failure: exiting 2 failed the whole suite in every worktree.
+BASE_DIR="$(dirname "$REPO_ROOT")"
+common_git="$(git -C "$REPO_ROOT" rev-parse --git-common-dir 2>/dev/null)" || common_git=""
+case "$common_git" in
+  '') ;;
+  /*) ;;
+  *) common_git="$REPO_ROOT/$common_git" ;;
+esac
+if [ -n "$common_git" ] && [ "$(basename "$common_git")" = ".git" ]; then
+  main_root="$(cd "$(dirname "$common_git")" 2>/dev/null && pwd)" || main_root=""
+  if [ -n "$main_root" ]; then
+    SELF_NAME="$(basename "$main_root")"
+    BASE_DIR="$(dirname "$main_root")"
+  fi
+fi
 if [ -n "${AUTODREAM_SIBLING_REPO:-}" ]; then
   SIBLING="$AUTODREAM_SIBLING_REPO"
 else
   case "$SELF_NAME" in
-    omp-autodream) SIBLING="$(dirname "$REPO_ROOT")/cc-autodream" ;;
-    cc-autodream)  SIBLING="$(dirname "$REPO_ROOT")/omp-autodream" ;;
-    *) echo "check-shared-drift: cannot infer the sibling for '$SELF_NAME'; set AUTODREAM_SIBLING_REPO" >&2; exit 2 ;;
+    omp-autodream) SIBLING="$BASE_DIR/cc-autodream" ;;
+    cc-autodream)  SIBLING="$BASE_DIR/omp-autodream" ;;
+    *)
+      echo "check-shared-drift: SKIPPED — cannot infer the sibling for '$SELF_NAME'; set AUTODREAM_SIBLING_REPO"
+      echo "  This check has verified nothing."
+      exit 0
+      ;;
   esac
 fi
 
