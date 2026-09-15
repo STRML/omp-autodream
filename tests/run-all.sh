@@ -2733,6 +2733,33 @@ test_question_streaks_state_lives_with_the_install(){
   rmdir "$st.lock" 2>/dev/null
   assert_eq "$rc" "1" "clear fails while an update holds the lock"
   assert_eq "$(wc -l < "$st" | tr -d ' ')" "1" "and leaves the state for that update"
+
+  # An EMPTY board is not a reason to skip the lock: an update holding it may be about to
+  # write the first streak, which clear would then report as cleared (Codex review of 4eea84d).
+  : > "$st"
+  mkdir "$st.lock"
+  AUTODREAM_QUESTION_STATE="$st" bash "$QS" clear all >/dev/null 2>&1; rc=$?
+  rmdir "$st.lock" 2>/dev/null
+  assert_eq "$rc" "1" "clear on an empty board still waits for the lock and fails while it is held"
+
+  # A watermark that exists but cannot be read must refuse the update, not read as absent:
+  # an older rebuild would otherwise count as a new night (Codex review of 4eea84d).
+  local st2="$root/w2.tsv"; : > "$st2"
+  qs2(){ AUTODREAM_QUESTION_STATE="$st2" AUTODREAM_NOTIFY_DRYRUN=1 bash "$QS" "$@" 2>&1; }
+  qs2 update "$root/2026-03-01.md" >/dev/null
+  qs2 update "$root/2026-03-02.md" >/dev/null
+  chmod 000 "$st2.last"
+  qs2 update "$root/2026-03-01.md" >/dev/null
+  chmod 644 "$st2.last"
+  assert_eq "$(wc -l < "$st2" | tr -d ' ')" "0" "an unreadable watermark refuses the update instead of accepting an older report"
+
+  # A watermark that cannot be written must refuse the update too, before state changes, or
+  # the next run has no watermark to refuse an older rebuild with.
+  local st3="$root/w3.tsv"; : > "$st3"
+  mkdir "$st3.last.tmp"
+  AUTODREAM_QUESTION_STATE="$st3" AUTODREAM_NOTIFY_DRYRUN=1 bash "$QS" update "$root/2026-03-01.md" >/dev/null 2>&1
+  rmdir "$st3.last.tmp" 2>/dev/null
+  assert_eq "$(wc -l < "$st3" | tr -d ' ')" "0" "a watermark that cannot be staged leaves state untouched"
   rm -rf "$root"
 }
 

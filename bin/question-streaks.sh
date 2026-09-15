@@ -126,6 +126,11 @@ LOCK="$STATE.lock"
 # state file, and deriving the watermark from that file alone then forgot it, so an older
 # rebuild afterwards counted as a new night (Codex review of 232c94c).
 LAST="$STATE.last"
+# Stage the watermark beside its final path before state changes, so a failed write refuses
+# the update instead of leaving state with no watermark, and the move into place is atomic
+# within one directory (Codex review of 4eea84d).
+stage_last()  { printf '%s\n' "$1" > "$LAST.tmp" 2>/dev/null; }
+commit_last() { mv -f "$LAST.tmp" "$LAST" 2>/dev/null; }
 acquire_lock() {
   local i=0
   while ! mkdir "$LOCK" 2>/dev/null; do
@@ -163,6 +168,12 @@ cmd_update() {
 
   # Refuse to go backwards. Rebuilding an old date would otherwise drop every streak that
   # old report does not mention and rewrite the live state with history.
+  # A watermark that exists but cannot be read is not an absent one. Reading it as absent
+  # let an older rebuild through (Codex review of 4eea84d).
+  if [ -e "$LAST" ] && { [ ! -f "$LAST" ] || [ ! -r "$LAST" ]; }; then
+    echo "question-streaks: cannot read the watermark $LAST; leaving streaks untouched"
+    return 0
+  fi
   local newest; newest=$( { awk -F'\t' 'NF>=4 {print $4}' "$STATE" 2>/dev/null; cat "$LAST" 2>/dev/null; } \
     | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' | sort | tail -1)
   if [ -n "$newest" ] && [ "$date" \< "$newest" ]; then
@@ -193,9 +204,13 @@ cmd_update() {
   fi
 
   if [ "${n:-0}" -eq 0 ]; then
+    if ! stage_last "$date"; then
+      echo "question-streaks: cannot write the watermark $LAST; leaving streaks untouched"
+      return 0
+    fi
     echo "question-streaks: no open questions in $date; clearing $(nlines "$STATE") streak(s)"
     : > "$STATE" 2>/dev/null || echo "question-streaks: could not clear $STATE (continuing)"
-    printf '%s\n' "$date" > "$LAST" 2>/dev/null || true
+    commit_last || echo "question-streaks: could not move the watermark into place at $LAST (continuing)"
     return 0
   fi
 
@@ -220,8 +235,12 @@ cmd_update() {
   done < "$tmp/titles"
 
   mkdir -p "$(dirname "$STATE")" 2>/dev/null || true
-  cp "$tmp/next" "$STATE" 2>/dev/null || { echo "question-streaks: could not write $STATE (continuing)"; return 0; }
-  printf '%s\n' "$date" > "$LAST" 2>/dev/null || true
+  if ! stage_last "$date"; then
+    echo "question-streaks: cannot write the watermark $LAST; leaving streaks untouched"
+    return 0
+  fi
+  cp "$tmp/next" "$STATE" 2>/dev/null || { rm -f "$LAST.tmp"; echo "question-streaks: could not write $STATE (continuing)"; return 0; }
+  commit_last || echo "question-streaks: could not move the watermark into place at $LAST (continuing)"
 
   echo "question-streaks: $n question(s) in $date, $escalated at or past $ESCALATE_AT consecutive"
   [ "$escalated" -eq 0 ] && return 0
@@ -273,15 +292,19 @@ cmd_status() {
 # is still on disk means tomorrow's escalation looks like the feature is broken.
 cmd_clear() {
   local what="${1:?usage: question-streaks.sh clear all|<key>}"
-  [ -s "$STATE" ] || { echo "question-streaks: nothing to clear"; return 0; }
   # Same lock as update. Without it an update that already read the old state writes it
   # back after this clear, and the streak the operator just cleared returns (Codex review
-  # of 232c94c).
+  # of 232c94c). The lock comes BEFORE the empty check: an update holding it may be about
+  # to write the first streak onto an empty board (Codex review of 4eea84d). With no state
+  # directory there is no lock to hold and nothing to clear, so that case stays a no-op
+  # rather than waiting out the lock and failing.
+  [ -d "$(dirname "$STATE")" ] || { echo "question-streaks: nothing to clear"; return 0; }
   if ! acquire_lock; then
     echo "question-streaks: FAILED to clear: another run holds $LOCK" >&2
     return 1
   fi
   trap 'release_lock' RETURN
+  [ -s "$STATE" ] || { echo "question-streaks: nothing to clear"; return 0; }
   if [ "$what" = "all" ]; then
     if : > "$STATE" 2>/dev/null; then echo "question-streaks: cleared all streaks"; return 0; fi
     echo "question-streaks: FAILED to clear $STATE" >&2; return 1

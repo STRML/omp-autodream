@@ -562,9 +562,12 @@ Three details the Codex review of `232c94c` found, each with a test:
   `AUTODREAM_DIR` at both call sites.
 - **The watermark survives an empty board.** The newest counted date lives in
   `question-streaks.tsv.last`, because a question-free report empties the state file and
-  the watermark used to go with it, letting an older rebuild count as a new night.
-- **`clear` takes the same lock as `update`**, and fails loudly when it cannot, so an
-  update that already read the old state cannot write a cleared streak back.
+  the watermark used to go with it, letting an older rebuild count as a new night. A
+  watermark that exists but cannot be read refuses the update, and it is staged to
+  `.last.tmp` before state changes so a failed write refuses too (Codex review of `4eea84d`).
+- **`clear` takes the same lock as `update`**, before its "nothing to clear" check, and
+  fails loudly when it cannot, so an update that already read the old state cannot write a
+  cleared or first streak back.
 
 Threshold is `AUTODREAM_QUESTION_ESCALATE_AT` (default 3). `question-streaks.sh status`
 prints the current streaks; `clear all|<key>` forgets one after you have acted on it.
