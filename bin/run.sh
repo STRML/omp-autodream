@@ -1729,6 +1729,10 @@ PY
     # rather than the sidecar — so it caveats those two keys rather than duplicating
     # a flag onto each of them.
     printf 'stats_sidecars_unparseable: %s\n' "$STATS_SIDECARS_UNPARSEABLE"
+    # Findings JSONs whose skill fields were removed because no sidecar existed. The
+    # aggregator cannot tell that from absence, since gated stubs carry no skill fields
+    # either (Codex review of 1ee66e4).
+    printf 'skills_unmeasured: %s\n' "${SKILLS_DROPPED:-0}"
     printf 'l1_missing_after_retries: %s\n' "$MISSING"
     printf 'l1_err_files: %s\n' "$L1_FAIL"
     # Cached vs. fresh: lets the aggregator distinguish a sub-second "elapsed"

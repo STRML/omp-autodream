@@ -88,11 +88,17 @@ DOMAIN="gui/$UID_NUM"
 # Reuse the base label from OUR installed scheduled job so the transient label sits
 # in the same namespace. scheduler-label.sh owns that decision for install.sh too;
 # it will not hand back a label belonging to another autodream install (#14). A
-# conflict on the default name is not fatal here - we only borrow the namespace,
-# and .ondemand suffixed onto it is a distinct label either way.
-BASE_LABEL="$("$BIN_DIR/scheduler-label.sh" "$AUTODREAM_DIR" 2>/dev/null || true)"
+# conflict on the default name is not fatal here - we only borrow the namespace.
+BASE_LABEL="$("$BIN_DIR/scheduler-label.sh" "$AUTODREAM_DIR" 2>/dev/null)" && label_rc=0 || label_rc=$?
 [ -n "$BASE_LABEL" ] || BASE_LABEL="com.$(id -un | tr -dc 'a-zA-Z0-9').omp-autodream"
 LABEL="${BASE_LABEL}.ondemand"
+# Exit 3 means another install holds the default label, and it builds this same
+# .ondemand label. The bootout below would evict its on-demand run, and its plist lives
+# in its own AUTODREAM_DIR where no scan can see it (Codex review of 1ee66e4). Give this
+# install a suffix of its own, stable per directory so bootout still finds our prior run.
+if [ "$label_rc" -eq 3 ]; then
+  LABEL="${LABEL}.$(printf '%s' "$AUTODREAM_DIR" | shasum -a 1 | cut -c1-8)"
+fi
 PLIST="$AUTODREAM_DIR/${LABEL}.plist"
 
 # ----------------------------------------------------------------------- PATH --

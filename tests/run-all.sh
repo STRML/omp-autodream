@@ -2403,6 +2403,9 @@ test_skill_fields_dropped_without_a_sidecar(){
   assert_eq "$(jq -r 'has("skills_invoked") or has("skills_invoked_count") or has("skills_invoked_counts") or has("skills_authored")' "$fj")" "false" \
     "the unmeasured skill fields are removed rather than believed"
   assert_eq "$(jq -r '.findings | type' "$fj")" "array" "the rest of the findings JSON survives"
+  # Absence alone cannot say why: gated stubs and older findings carry no skill fields
+  # either. The runner records the count (Codex review of 1ee66e4).
+  assert_grep "$(fdir "$root")/run-stats.txt" 'skills_unmeasured: 1' "run-stats counts the session whose skills went unmeasured"
   rm -rf "$root"
 }
 
@@ -2430,6 +2433,7 @@ test_skill_fields_are_enforced_from_the_sidecar(){
     "per-skill counts survive into the findings so 'top 5 by count' can be ranked"
   assert_eq "$(jq -r '.skills_invoked_count' "$(fdir "$root")/$h.json")" "3" \
     "the total counts invocations, not distinct skills"
+  assert_grep "$(fdir "$root")/run-stats.txt" 'skills_unmeasured: 0' "a run with every sidecar present records zero unmeasured, not nothing"
   rm -rf "$root"
 }
 

@@ -178,6 +178,26 @@ mv "$(make_plist "$DEFAULT" "$CC")" "$LA/backup.ondemand.plist"
 run_sut "$OMP"
 assert_eq "3" "$SUT_RC" "a foreign default-label job is a conflict whatever its filename"
 
+# --- row: autodream-now's on-demand label -----------------------------------
+# A second install that holds the default label builds the same "<default>.ondemand"
+# label, so a bootout from this install would evict its on-demand run (Codex review
+# of 1ee66e4). Its plist lives in its own AUTODREAM_DIR, never in LaunchAgents, so the
+# scan above cannot see it; the conflict status is the only signal.
+ondemand_label() { # ondemand_label <install-dir> -> the Label autodream-now would load
+  AUTODREAM_DIR="$1" bash "$REPO/bin/autodream-now.sh" 2020-01-01 --dry-run 2>/dev/null \
+    | sed -n '/<key>Label<\/key>/{n;s/.*<string>\(.*\)<\/string>.*/\1/p;}'
+}
+reset_sandbox
+make_plist "$DEFAULT" "$OMP" >/dev/null
+assert_eq "$DEFAULT.ondemand" "$(ondemand_label "$OMP")" "our own install keeps the plain .ondemand label"
+reset_sandbox
+make_plist "$DEFAULT" "$CC" >/dev/null
+got="$(ondemand_label "$OMP")"
+case "$got" in
+  "$DEFAULT.ondemand."????????) ok "a foreign default-label holder gets this install its own on-demand label" ;;
+  *) nope "a foreign default-label holder gets this install its own on-demand label" "label was [$got]" ;;
+esac
+
 # --- row: the -review sibling is skipped -----------------------------------
 reset_sandbox
 make_review_plist "com.$USER_SLUG.autodream-review" "$CC"
