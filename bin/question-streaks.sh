@@ -252,8 +252,10 @@ cmd_update() {
     [ -n "$title" ] || continue
     local k count first
     k=$(key_of "$title")
-    count=$(awk -F'\t' -v k="$k" '$1==k {print $2}' "$STATE" 2>/dev/null | head -1)
-    first=$(awk -F'\t' -v k="$k" '$1==k {print $3}' "$STATE" 2>/dev/null | head -1)
+    # `""` forces a string compare: keys are hex, so two all-digit keys that differ only in
+    # leading zeros would otherwise compare equal as numbers (Codex review of 5f7ddaa).
+    count=$(awk -F'\t' -v k="$k" '$1"" == k"" {print $2}' "$STATE" 2>/dev/null | head -1)
+    first=$(awk -F'\t' -v k="$k" '$1"" == k"" {print $3}' "$STATE" 2>/dev/null | head -1)
     case "${count:-}" in ''|*[!0-9]*) count=0 ;; esac
     # A rebuild of an already-counted report holds the count where it is; a question that
     # is new even on a rebuild still starts at 1.
@@ -335,13 +337,14 @@ cmd_clear() {
   [ "$(nrows)" -gt 0 ] || { echo "question-streaks: nothing to clear"; return 0; }
   # An unknown key is a failure, not a no-op. Printing "cleared" for a mistyped key leaves
   # the real streak escalating tomorrow (#32). `status` lists the keys.
-  if [ "$what" != "all" ] && ! rows_of | awk -F'\t' -v k="$what" '$1 == k {f=1} END {exit !f}'; then
+  # Keys compare as strings (`""`), or `89709551468` would match the row `089709551468`.
+  if [ "$what" != "all" ] && ! rows_of | awk -F'\t' -v k="$what" '$1"" == k"" {f=1} END {exit !f}'; then
     echo "question-streaks: FAILED to clear: no streak with key $what (status lists the keys)" >&2
     return 1
   fi
   # Forget streaks, keep the watermark: an older rebuild after a clear is still history.
   local tmp; tmp="$(mktemp)" || { echo "question-streaks: FAILED to stage a rewrite of $STATE" >&2; return 1; }
-  rows_of | awk -F'\t' -v k="$what" 'k != "all" && $1 != k' > "$tmp"
+  rows_of | awk -F'\t' -v k="$what" 'k"" != "all" && $1"" != k""' > "$tmp"
   if write_state "$tmp" "$(newest_of)"; then
     rm -f "$tmp"; echo "question-streaks: cleared $what"; return 0
   fi

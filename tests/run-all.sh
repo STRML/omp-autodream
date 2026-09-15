@@ -3239,6 +3239,14 @@ test_question_streaks_reruns_and_mismatch(){
   assert_eq "$krc" "1" "clear with an unknown key fails"
   case "$out" in *"no streak with key deadbeef0000"*) ok "and names the key it could not find" ;; *) no "and names the key it could not find (got: $out)" ;; esac
   if cmp -s "$st" "$root/st.before"; then ok "and leaves the state untouched"; else no "and leaves the state untouched"; fi
+  # Keys are hex, so a key can be all digits. awk compares two numeric-looking strings as
+  # numbers, so `clear 89709551468` matched the row `089709551468` and cleared the wrong
+  # streak (Codex review of 5f7ddaa). Keys compare as strings.
+  printf '#last\t2026-02-02\n089709551468\t2\t2026-02-01\t2026-02-02\tDigits only?\n' > "$root/num.tsv"
+  cp "$root/num.tsv" "$root/num.before"
+  AUTODREAM_QUESTION_STATE="$root/num.tsv" bash "$QS" clear 89709551468 >/dev/null 2>&1; krc=$?
+  assert_eq "$krc" "1" "clear with a key that only equals a row key numerically fails"
+  if cmp -s "$root/num.tsv" "$root/num.before"; then ok "and does not clear the numerically equal streak"; else no "and does not clear the numerically equal streak"; fi
 
   # clear must not claim success it did not achieve.
   chmod 500 "$root" 2>/dev/null
