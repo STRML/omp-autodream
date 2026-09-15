@@ -92,7 +92,6 @@ for d in "${DIRS[@]}"; do
     total_deferred=$((total_deferred + 1))
     continue
   fi
-  dates_measured=$((dates_measured + 1))
 
   sessions=0; oversized=0; errored=0; silent=0; provider=0; unclassified=0
   from_sidecar=0; unmeasurable=0
@@ -135,6 +134,11 @@ for d in "${DIRS[@]}"; do
   total_provider=$((total_provider + provider))
   total_unclassified=$((total_unclassified + unclassified))
   total_unmeasurable=$((total_unmeasurable + unmeasurable))
+  # A date counts as measured only when at least one of its sessions was sized. A list of
+  # transcripts that are all gone says nothing about size (Codex review of cdfdf3b).
+  if [ $((sessions - unmeasurable)) -gt 0 ]; then
+    dates_measured=$((dates_measured + 1))
+  fi
 
   # SHARE includes only sessions whose artifacts leave size as the explanation.
   measured=$((oversized - silent - provider - unclassified))

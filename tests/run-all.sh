@@ -1724,6 +1724,13 @@ provider|503 Service Unavailable
 provider|auth error: token expired
 provider|Authentication failed for provider deepseek
 provider|401 Unauthorized
+provider|provider overload, retry later
+provider|HTTP 5xx from upstream
+provider|rate-limited by provider
+provider|Too Many Requests
+provider|error: invalid-api-key
+provider|unauthorised
+size|context-length exceeded
 size|context length exceeded (HTTP 500)
 size|read 5200 bytes then exited
 size|worker timed out after 600s
@@ -1760,6 +1767,21 @@ test_oversized_gate_script_empty(){
   printf '%s' "$out" > "$root/gate.out"
   assert_grep  "$root/gate.out" 'nothing to measure' "no oversized sessions is not evidence either way"
   assert_nogrep "$root/gate.out" 'GATE CLOSED'       "and must not be reported as a closed gate"
+  rm -rf "$root"
+}
+
+test_oversized_gate_script_unmeasurable_only(){
+  echo "# oversized-gate.sh: a date whose sessions could not be sized is not a measured window (Codex review of cdfdf3b)"
+  local GATE="$REPO/bin/oversized-gate.sh"
+  [ -x "$GATE" ] || { no "oversized-gate.sh executable"; return 0; }
+  local root; root=$(mktemp -d)
+  # A listed transcript that no longer exists and no sidecar: nothing can size it.
+  local d="$root/2020-01-05"; mkdir -p "$d"
+  printf '%s\n' "$root/gone/sess1.jsonl" > "$d/sessions.txt"
+  local out; out=$(AUTODREAM_SLIM_BYTES=100 bash "$GATE" "$d" 2>&1)
+  printf '%s' "$out" > "$root/gate.out"
+  assert_nogrep "$root/gate.out" 'No oversized transcripts' "zero sized sessions is not a result about size"
+  assert_grep   "$root/gate.out" 'No date in this window could be measured' "it says no date was measurable"
   rm -rf "$root"
 }
 
@@ -2198,6 +2220,7 @@ test_oversized_gate_script_stdout_section_boundary
 test_failure_class_provider_matrix
 test_oversized_gate_script_mixed_size_and_provider
 test_oversized_gate_script_empty
+test_oversized_gate_script_unmeasurable_only
 test_oversized_gate_script_args
 test_notify_count
 test_notify_open_command
