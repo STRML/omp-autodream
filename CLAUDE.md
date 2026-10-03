@@ -532,13 +532,17 @@ code has genuinely diverged; measured 2026-09-15 with comments stripped, `run.sh
 by 1009 code lines, `review.sh` by 93, `session-stats.sh` by 70. That is the port doing
 its job, and those files should differ.
 
-Five helpers are byte-identical by intent, and they are listed in
+Four helpers are byte-identical by intent, and they are listed in
 `shared-with-sibling.txt`:
 
 ```
-bin/cookie-cadence.sh   bin/make-notifier.sh   bin/overlap-stats.sh   bin/x-bookmarks.sh
-bin/question-streaks.sh
+bin/cookie-cadence.sh   bin/make-notifier.sh   bin/x-bookmarks.sh   bin/question-streaks.sh
 ```
+
+`bin/overlap-stats.sh` is intentionally not shared for now. This repo's copy excludes
+advisor sidecars (`select(.is_advisor != true)`), which cc-autodream's sidecars have no
+field for. It rejoins the list when the OMP adapter in cc-autodream ports the `is_advisor`
+exclusion (Plan 2), so the two copies re-converge there.
 
 `question-streaks.sh` differs from cc-autodream's copy until STRML/cc-autodream#71 ports
 the PR #25 fixes, so the drift check fails locally until then. CI has no sibling
