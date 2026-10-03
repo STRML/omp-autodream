@@ -76,6 +76,9 @@ classify_failure() {
 provider_is_permanent() {
   local errfile="$1"
   [ -s "$errfile" ] || return 1
+  # The line must also read like an error report, so a transcript that merely talks about
+  # balances cannot defer a date. DeepSeek says "Error code: 402 - Insufficient Balance".
   worker_text_of "$errfile" \
+    | grep -Ei 'error|http|status|code|429|402' \
     | grep -Eiq 'insufficient[[:space:]_-]*(balance|quota|funds)|no[[:space:]_-]+resource[[:space:]_-]+package|credit[[:space:]_-]+balance[[:space:]_-]+is[[:space:]_-]+too[[:space:]_-]+low|"code"[[:space:]]*:[[:space:]]*"?1113"?'
 }

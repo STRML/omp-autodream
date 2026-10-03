@@ -2667,6 +2667,39 @@ test_provider_refusal_defers_without_a_stub(){
   rm -rf "$root"
 }
 
+test_provider_402_and_missing_curl_still_defer(){
+  echo "# DeepSeek's 402 Insufficient Balance defers the date, with or without curl"
+  local root h shim stats
+  root=$(setup_env); mk_session "$root" sess1
+  h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
+  shim=$(shim_curl "$root" 200)
+  export MOCK_MODE=l1_provider_402
+  TEST_CURL_SHIMMED=1   PATH="$shim:$PATH" AUTODREAM_NETCHECK=0 AUTODREAM_SLIM_BYTES=10 AUTODREAM_L1_ROUNDS=1 run_dream "$root"
+  unset MOCK_MODE
+  assert_no_file "$(fdir "$root")/$h.json" "a 402 balance refusal leaves no stub even though classify_failure has no 402 pattern"
+  assert_grep    "$(fdir "$root")/l1-netdown.txt" "^$h 1 provider\$" "the ledger records the verdict"
+  rm -rf "$root"
+  # A host without curl: netdown stays unknown, and the permanent check must still run.
+  root=$(setup_env); mk_session "$root" sess1
+  h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
+  mkdir -p "$root/nocurl"
+  printf '#!/bin/bash\nexit 127\n' > "$root/nocurl/curl"; chmod +x "$root/nocurl/curl"
+  export MOCK_MODE=l1_provider_refusal
+  TEST_CURL_SHIMMED=1   PATH="$root/nocurl:$PATH" AUTODREAM_NETCHECK=0 AUTODREAM_SLIM_BYTES=10 AUTODREAM_L1_ROUNDS=1 run_dream "$root"
+  unset MOCK_MODE
+  assert_no_file "$(fdir "$root")/$h.json" "a permanent refusal leaves no stub when curl cannot answer"
+  rm -rf "$root"
+  # Talking about balances is not a refusal: the match needs an error-shaped line.
+  root=$(setup_env)
+  printf 'worker said: the invoice shows insufficient balance for the Q3 ledger\nworker exit code: 1 after 3s\n' > "$root/talk.err"
+  if bash -c ". \"$REPO/bin/failure-class.sh\"; provider_is_permanent \"$root/talk.err\""; then
+    no "a transcript that mentions insufficient balance was read as a permanent refusal"
+  else
+    ok "a transcript that mentions insufficient balance is not a permanent refusal"
+  fi
+  rm -rf "$root"
+}
+
 test_missing_curl_is_not_read_as_an_outage(){
   echo "# a host without curl must not have every failure classified as a network outage"
   local root; root=$(setup_env); mk_session "$root" sess1
@@ -2989,6 +3022,7 @@ test_network_down_defers_the_date
 test_oversized_gate_script_deferred
 test_route_lost_after_the_precheck_still_defers
 test_provider_refusal_defers_without_a_stub
+test_provider_402_and_missing_curl_still_defer
 test_missing_curl_is_not_read_as_an_outage
 test_a_transient_outage_is_ridden_out_not_deferred
 test_no_curl_does_not_defer_a_healthy_run

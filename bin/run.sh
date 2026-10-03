@@ -1100,8 +1100,8 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
       # stub below used to consume the session permanently. Classify the
       # failure from its own .err; a permanent refusal (no balance or quota) is ledgered as
       # "provider" and defers like an outage. A transient 429 or 5xx keeps its stub.
-      if [ "$netdown" = "false" ] && [ -r "$FAILURE_CLASS" ] \
-         && (. "$FAILURE_CLASS"; [ "$(classify_failure "$errlog")" = "provider" ] && provider_is_permanent "$errlog"); then
+      if [ "$netdown" != "true" ] && [ -r "$FAILURE_CLASS" ] \
+         && (. "$FAILURE_CLASS"; provider_is_permanent "$errlog"); then
         netdown=provider
         printf "provider refusal when this worker failed; no stub, the session is left for a later run\n" >> "$errlog"
       fi
