@@ -1,6 +1,23 @@
 #!/bin/bash
 # Classify one L1 worker failure from its surviving .err artifact.
 
+# Only what the worker itself printed (see classify_failure for the rules).
+worker_text_of() {
+  awk '
+    /^worker exit code: / { after_exit = 1; next }
+    !after_exit {
+      if (in_dump) next
+      if (/^worker wrote output with no usable \.findings key/) { in_dump = 1; next }
+      if (/^worker exceeded AUTODREAM_L1_TIMEOUT=/ || /^worker produced no findings JSON for /) next
+      print
+      next
+    }
+    /^--- worker stdout, last 40 lines ---$/ { in_stdout = 1; next }
+    /^--- an omp log touched during this round/ || /^curl could not be run here/ || /^no route to api\.anthropic\.com/ { exit }
+    in_stdout { print }
+  ' "$1"
+}
+
 classify_failure() {
   local errfile="$1" exit_code worker_text sep code
 
@@ -29,19 +46,7 @@ classify_failure() {
   # session path or a dumped findings JSON can say "quota" or "HTTP 500" without any
   # provider refusing anything. The stdout section ends only at run.sh's next marker, not
   # at any "--- " a worker might print (Codex reviews of b19ec84 and 7eda1a8).
-  worker_text=$(awk '
-    /^worker exit code: / { after_exit = 1; next }
-    !after_exit {
-      if (in_dump) next
-      if (/^worker wrote output with no usable \.findings key/) { in_dump = 1; next }
-      if (/^worker exceeded AUTODREAM_L1_TIMEOUT=/ || /^worker produced no findings JSON for /) next
-      print
-      next
-    }
-    /^--- worker stdout, last 40 lines ---$/ { in_stdout = 1; next }
-    /^--- an omp log touched during this round/ || /^curl could not be run here/ || /^no route to api\.anthropic\.com/ { exit }
-    in_stdout { print }
-  ' "$errfile")
+  worker_text=$(worker_text_of "$errfile")
 
   # Providers and models spell the same words with spaces, hyphens or underscores.
   sep='[[:space:]_-]'
@@ -63,4 +68,17 @@ classify_failure() {
   fi
 
   printf '%s\n' size
+}
+
+# A provider refusal that will not clear by retrying: the account has no balance or quota.
+# Z.ai code 1113 "Insufficient balance or no resource package" refused every worker on
+# 2026-10-01 and 2026-10-02. A transient 429 or 5xx is not this: it keeps its stub.
+provider_is_permanent() {
+  local errfile="$1"
+  [ -s "$errfile" ] || return 1
+  # The line must also read like an error report, so a transcript that merely talks about
+  # balances cannot defer a date. DeepSeek says "Error code: 402 - Insufficient Balance".
+  worker_text_of "$errfile" \
+    | grep -Ei 'error|http|status|code|429|402' \
+    | grep -Eiq 'insufficient[[:space:]_-]*(balance|quota|funds)|no[[:space:]_-]+resource[[:space:]_-]+package|credit[[:space:]_-]+balance[[:space:]_-]+is[[:space:]_-]+too[[:space:]_-]+low|"code"[[:space:]]*:[[:space:]]*"?1113"?'
 }

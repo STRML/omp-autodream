@@ -20,6 +20,12 @@
 #   MOCK_MODE=l1_context_overflow  L1 writes nothing, prints a context-size refusal,
 #                            and exits 7. This must count as size even though the
 #                            diagnostic also starts with "provider error".
+#   MOCK_MODE=l1_provider_refusal  L1 writes nothing, prints the Z.ai insufficient-balance
+#                            429 (code 1113) and exits 1. The network is fine, so this
+#                            must defer the date like an outage and never leave a stub.
+#   MOCK_MODE=l1_provider_402  Same, in DeepSeek's wording: "Error code: 402 - Insufficient
+#                            Balance". classify_failure has no 402 pattern, so this proves
+#                            the permanent check does not depend on it.
 #   MOCK_MODE=l1_exit124     L1 exits 124 immediately; MOCK_MODE=l1_exit137 SIGKILLs
 #                            itself. Both are what GNU timeout returns for a real
 #                            deadline, so they prove classification is not by rc alone.
@@ -108,6 +114,12 @@ if printf '%s' "$line1" | grep -q '^Session transcript'; then
     l1_context_overflow)
       echo "provider error: 400 context_length_exceeded: prompt is too long"
       exit 7 ;;
+    l1_provider_refusal)
+      echo '429 {"type":"error","error":{"type":"rate_limit_error","code":"1113","message":"[1113][Insufficient balance or no resource package. Please recharge.]"}}'
+      exit 1 ;;
+    l1_provider_402)
+      echo "Error code: 402 - {'error': {'message': 'Insufficient Balance', 'type': 'unknown_error'}}"
+      exit 1 ;;
     l1_exit124) exit 124 ;;             # intrinsic 124, no deadline involved. GNU timeout
                                         # propagates a child's own status, so this arrives
                                         # looking exactly like a timeout; only elapsed tells

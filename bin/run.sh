@@ -1095,6 +1095,16 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
       # different cause. Readers take the HIGHEST round recorded for a hash, so the last
       # attempt is the one that counts. Append-only keeps the parallel xargs subshells
       # from racing, same as l1-timeouts.txt.
+      # A reachable network does not mean a working provider. A billing refusal (Z.ai
+      # code 1113, 2026-10-01 and 10-02) answers curl fine, so netdown is false, and the
+      # stub below used to consume the session permanently. Classify the
+      # failure from its own .err; a permanent refusal (no balance or quota) is ledgered as
+      # "provider" and defers like an outage. A transient 429 or 5xx keeps its stub.
+      if [ "$netdown" != "true" ] && [ -r "$FAILURE_CLASS" ] \
+         && (. "$FAILURE_CLASS"; provider_is_permanent "$errlog"); then
+        netdown=provider
+        printf "provider refusal when this worker failed; no stub, the session is left for a later run\n" >> "$errlog"
+      fi
       if [ "$netdown" != "unknown" ]; then
         printf "%s %s %s\n" "$hash" "${AUTODREAM_CURRENT_ROUND:-1}" "$netdown" >> "$FINDINGS_DIR/l1-netdown.txt"
       fi
@@ -1114,8 +1124,8 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
       # this change exists to stop, reintroduced one layer down. Leaving the slot empty
       # is what makes the retry work; the run defers instead of disappearing quietly, so
       # the 2026-06-11 silent-failure concern is answered by the deferral, not the stub.
-      if [ "$netdown" = "true" ]; then
-        echo "FAIL (network down; no stub, left for a later run): $session ($hash) [$(($(date +%s) - t0))s] — see $errlog" >&2
+      if [ "$netdown" = "true" ] || [ "$netdown" = "provider" ]; then
+        echo "FAIL ($([ "$netdown" = "true" ] && echo "network down" || echo "provider refusal"); no stub, left for a later run): $session ($hash) [$(($(date +%s) - t0))s] — see $errlog" >&2
       elif [ "${AUTODREAM_CURRENT_ROUND:-1}" -ge "${AUTODREAM_L1_ROUNDS:-5}" ]; then
         sz=$(wc -c < "$session" 2>/dev/null | tr -d " ")
         lines=$(wc -l < "$session" 2>/dev/null | tr -d " ")
@@ -1292,6 +1302,8 @@ EOF
   # AUTODREAM_L1_ROUNDS is referenced by the dispatcher subshell to decide
   # whether this is the last retry round (gates the metadata-stub fallback).
   export AUTODREAM_L1_ROUNDS
+  # The worker subshell classifies its own failure (a provider refusal must not leave a stub).
+  export FAILURE_CLASS
 
   # Truncate the timeout ledger here rather than where FINDINGS_DIR is created:
   # this point is past the idempotency guard, so a catch-up trigger that no-ops on
@@ -1460,10 +1472,10 @@ EOF
   # that recovered and finished its corpus is not deferred no matter how bad round 1 was.
   if [ "$MISSING" -gt 0 ] && [ "$LAST_ROUND_RUN" -gt 0 ] \
      && [ -s "$FINDINGS_DIR/l1-netdown.txt" ] \
-     && awk -v r="$LAST_ROUND_RUN" '$2 == r && $3 == "true" { found = 1 } END { exit !found }' \
+     && awk -v r="$LAST_ROUND_RUN" '$2 == r && ($3 == "true" || $3 == "provider") { found = 1 } END { exit !found }' \
           "$FINDINGS_DIR/l1-netdown.txt"; then
     NET_DEFERRED=yes
-    log "L1 finished with $MISSING session(s) missing and round $LAST_ROUND_RUN failing with no route — deferring $TARGET_DATE for a later run"
+    log "L1 finished with $MISSING session(s) missing and round $LAST_ROUND_RUN failing with no route or a provider refusal — deferring $TARGET_DATE for a later run"
   fi
   L1_ELAPSED=$(( $(date +%s) - L1_START ))
   L1_OK=$(findings_json_count)
