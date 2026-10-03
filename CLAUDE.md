@@ -140,6 +140,12 @@ Four things changed, and each is a test in `tests/run-all.sh`:
 
 The trap to avoid when reading a future run: `l1_missing_after_retries: 0` and `l1_timed_out: 0` do not rule out the network. Workers that fail instantly leave no timeout, and the last round leaves a metadata stub rather than a missing slot, so both keys read clean through a total outage. That is the reasoning that made the 2026-09-04 self-audit say "this was not the network".
 
+### A billing refusal is not a transcript problem either (2026-10-03)
+
+Z.ai answered every L1 worker with `429 code 1113 Insufficient balance` on 2026-10-01 and 10-02. The network was fine, so `netdown` was false and the final round wrote a stub for every session. The stubs filled the slots, `MISSING` hit zero, L2 published an empty report, and a re-run skipped all of them. Recovery took deleting the stubs by hand.
+
+`provider_is_permanent` in `bin/failure-class.sh` names the refusals that retrying cannot clear: no balance, no quota, no resource package, code 1113. A worker that fails that way is ledgered in `l1-netdown.txt` as `<hash> <round> provider`, gets no stub, and defers the date like an outage. A transient 429 or 5xx is not permanent and keeps its stub, because the oversized gate counts provider failures through those stubs. `test_provider_refusal_defers_without_a_stub` pins it.
+
 ### Six nights of empty stubs, and the retry loop hid it (2026-09-11)
 
 2026-09-05 through 2026-09-10 each lost the whole corpus the same way: every worker

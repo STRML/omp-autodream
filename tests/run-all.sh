@@ -2646,6 +2646,27 @@ test_route_lost_after_the_precheck_still_defers(){
   rm -rf "$root"
 }
 
+test_provider_refusal_defers_without_a_stub(){
+  echo "# a provider refusal on a reachable network defers the date and leaves no stub (Z.ai 1113, 2026-10-01 and 10-02)"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  local shim; shim=$(shim_curl "$root" 200)
+  local h; h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
+  # The route is up, so netdown is false. Without the provider carve-out the final round
+  # wrote a stub, MISSING hit zero, L2 published an empty report, and every later run
+  # skipped the session because its slot was filled.
+  export MOCK_MODE=l1_provider_refusal
+  TEST_CURL_SHIMMED=1   PATH="$shim:$PATH" AUTODREAM_NETCHECK=0 AUTODREAM_SLIM_BYTES=10 AUTODREAM_L1_ROUNDS=1 run_dream "$root"
+  unset MOCK_MODE
+  local stats="$(fdir "$root")/run-stats.txt"
+  assert_no_file "$(fdir "$root")/$h.json"   "no findings stub is written for a provider refusal"
+  assert_no_file "$root/dreams/$DATE.md"     "no report is published on a corpus the provider refused"
+  assert_eq      "$(cat "$root/run.exit")" "1" "the run exits non-zero"
+  assert_grep    "$stats" 'network_deferred: yes' "run-stats records the deferral"
+  assert_grep    "$(fdir "$root")/$h.json.err" 'provider refusal when this worker failed' ".err names the cause"
+  assert_grep    "$(fdir "$root")/l1-netdown.txt" "^$h 1 provider\$" "the ledger records the round and the verdict"
+  rm -rf "$root"
+}
+
 test_missing_curl_is_not_read_as_an_outage(){
   echo "# a host without curl must not have every failure classified as a network outage"
   local root; root=$(setup_env); mk_session "$root" sess1
@@ -2967,6 +2988,7 @@ test_a_flaky_worker_does_not_trip_the_breaker(){
 test_network_down_defers_the_date
 test_oversized_gate_script_deferred
 test_route_lost_after_the_precheck_still_defers
+test_provider_refusal_defers_without_a_stub
 test_missing_curl_is_not_read_as_an_outage
 test_a_transient_outage_is_ridden_out_not_deferred
 test_no_curl_does_not_defer_a_healthy_run
