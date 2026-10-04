@@ -1,5 +1,11 @@
 # omp-autodream
 
+> **Archived 2026-10-03.** This repo is merged into [`STRML/autodream`](https://github.com/STRML/autodream)
+> (formerly `cc-autodream`), which reads Claude Code and OMP sessions in one nightly and writes one report.
+> The OMP session reader is `adapters/omp/` there, and every fix from this repo landed there.
+> To move an install over, follow "Moving from omp-autodream" in that README. Open issues and PRs here
+> are closed; file new ones in the unified repo.
+
 Nightly session review for the **OMP** harness (Oh My Pi). While you sleep it
 reads yesterday's session transcripts and leaves you one short report: the mistakes
 you keep making, where you lost time, and what's worth remembering.
